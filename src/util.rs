@@ -33,6 +33,7 @@ pub struct TransactionStatus {
     pub confirmed: bool,
     pub block_height: Option<usize>,
     pub block_hash: Option<Sha256dHash>,
+    pub confirmed_at: Option<u32>,
 }
 
 impl TransactionStatus {
@@ -41,15 +42,18 @@ impl TransactionStatus {
             confirmed: false,
             block_height: None,
             block_hash: None,
+            confirmed_at: None,
         }
     }
-    pub fn confirmed(header: &HeaderEntry) -> Self {
+    pub fn confirmed(header: &HeaderEntry, timestamp: u32) -> Self {
         TransactionStatus {
             confirmed: true,
             block_height: Some(header.height()),
             block_hash: Some(header.hash().clone()),
+            confirmed_at: Some(timestamp),
         }
     }
+    // pub fn get_header
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,6 +125,10 @@ impl HeaderEntry {
 
     pub fn height(&self) -> usize {
         self.height
+    }
+    
+    pub fn confirmed_at(&self) -> u32 {
+        self.header.time
     }
 }
 

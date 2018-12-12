@@ -650,10 +650,11 @@ impl Query {
             .chain_err(|| "invalid block height for tx")?;
 
         // the block at confirmation height is not the one containing the tx, must've reorged!
+
         if header.hash() != &blockhash {
             Ok(TransactionStatus::unconfirmed())
         } else {
-            Ok(TransactionStatus::confirmed(&header))
+            Ok(TransactionStatus::confirmed(&header, header.confirmed_at()))
         }
     }
 

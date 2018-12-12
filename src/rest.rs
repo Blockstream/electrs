@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::thread;
 use util::{get_script_asm, script_to_address, full_hash, BlockHeaderMeta, FullHash, TransactionStatus};
 
+
 const TX_LIMIT: usize = 25;
 const BLOCK_LIMIT: usize = 10;
 
@@ -117,10 +118,12 @@ impl From<TxnHeight> for TransactionValue {
         } = t;
         let mut value = TransactionValue::from(txn);
         value.status = Some(if height != MEMPOOL_HEIGHT {
+                // fetch the block header at the recorded confirmation height
             TransactionStatus {
                 confirmed: true,
                 block_height: Some(height as usize),
                 block_hash: Some(blockhash),
+                confirmed_at: None,
             }
         } else {
             TransactionStatus::unconfirmed()
@@ -237,6 +240,7 @@ impl From<FundingOutput> for UtxoValue {
                     confirmed: true,
                     block_height: Some(height as usize),
                     block_hash: Some(blockhash),
+                    confirmed_at: None,
                 }
             } else {
                 TransactionStatus::unconfirmed()
@@ -273,6 +277,8 @@ impl From<SpendingInput> for SpendingValue {
                     confirmed: true,
                     block_height: Some(height as usize),
                     block_hash: Some(blockhash),
+                    confirmed_at: None,
+
                 }
             } else {
                 TransactionStatus::unconfirmed()
@@ -363,6 +369,13 @@ fn attach_txs_data(txs: &mut Vec<TransactionValue>, config: &Config, query: &Arc
                 .sum();
             let total_out: u64 = tx.vout.iter().map(|vout| vout.value).sum();
             tx.fee = Some(total_in - total_out);
+        }
+    }
+    
+    if config.prevout_enabled {
+        for mut tx in txs.iter_mut() {
+            let status = query.get_tx_status(&tx.txid).unwrap();
+            tx.status = Some(<TransactionStatus>::from(status));
         }
     }
 }
