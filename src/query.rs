@@ -654,7 +654,7 @@ impl Query {
         if header.hash() != &blockhash {
             Ok(TransactionStatus::unconfirmed())
         } else {
-            Ok(TransactionStatus::confirmed(&header, header.confirmed_at()))
+            Ok(TransactionStatus::confirmed(&header, header.timestamp()))
         }
     }
 

@@ -127,7 +127,7 @@ impl HeaderEntry {
         self.height
     }
     
-    pub fn confirmed_at(&self) -> u32 {
+    pub fn timestamp(&self) -> u32 {
         self.header.time
     }
 }
