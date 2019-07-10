@@ -20,7 +20,7 @@ arraydeque = "0.4"
 arrayref = "0.3"
 base64 = "0.10"
 bincode = "1.0"
-bitcoin-bech32 = "0.9.0"
+bitcoin-bech32 = "0.10.0"
 chan = "0.1"
 chan-signal = "0.3"
 clap = "2.31"
@@ -53,7 +53,8 @@ tiny_http = "0.6"
 url = "1.0"
 
 [dependencies.bitcoin]
-version = "0.18"
+git = "http://github.com/kallewoof/rust-bitcoin"
+branch = "2019-07-signet"
 features = ["serde"]
 
 [dependencies.bitcoin_hashes]
