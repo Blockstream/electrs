@@ -185,6 +185,7 @@ impl Config {
             Network::Bitcoin => 8332,
             Network::Testnet => 18332,
             Network::Regtest => 18443,
+            Network::Signet  => 38332,
 
             #[cfg(feature = "liquid")]
             Network::Liquid => 7041,
@@ -195,6 +196,7 @@ impl Config {
             Network::Bitcoin => 50001,
             Network::Testnet => 60001,
             Network::Regtest => 60401,
+            Network::Signet  => 60801,
 
             #[cfg(feature = "liquid")]
             Network::Liquid => 51000,
@@ -205,6 +207,7 @@ impl Config {
             Network::Bitcoin => 3000,
             Network::Testnet => 3001,
             Network::Regtest => 3002,
+            Network::Signet  => 3003,
 
             #[cfg(feature = "liquid")]
             Network::Liquid => 3000,
@@ -215,6 +218,7 @@ impl Config {
             Network::Bitcoin => 4224,
             Network::Testnet => 14224,
             Network::Regtest => 24224,
+            Network::Signet  => 18224,
 
             #[cfg(feature = "liquid")]
             Network::Liquid => 34224,
@@ -254,6 +258,7 @@ impl Config {
         match network_type {
             Network::Bitcoin => (),
             Network::Testnet => daemon_dir.push("testnet3"),
+            Network::Signet  => daemon_dir.push("signet"),
             Network::Regtest => daemon_dir.push("regtest"),
 
             #[cfg(feature = "liquid")]
