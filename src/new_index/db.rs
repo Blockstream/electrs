@@ -217,13 +217,16 @@ impl DB {
 #[cfg(test)]
 mod tests {
 
+    use crate::config::Config;
     use crate::new_index::db::{DBRow, DB};
+    use std::sync::Arc;
     use tempfile;
 
     #[test]
     fn test_db_iterator() {
+        let config = Arc::new(Config::from_args());
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open(dir.path());
+        let db = DB::open(dir.path(), &config);
         let rows = vec![
             DBRow {
                 key: b"X11".to_vec(),
