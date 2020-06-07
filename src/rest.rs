@@ -660,6 +660,38 @@ fn handle_request(
 
             json_response(prepare_txs(txs, query, config), ttl)
         }
+
+        // Batch Address call to avoid spamming with multiple address GET calls
+        (&Method::POST, Some(script_type @ &"address"), None, None, None, None)
+		| (&Method::POST, Some(script_type @ &"scripthash"), None, None, None, None) => {
+            #[derive(Serialize, Deserialize)]
+            struct Address {
+                address: String,
+                chain_stats: crate::new_index::schema::ScriptStats,
+                mempool_stats: crate::new_index::schema::ScriptStats
+            }
+
+            let mut v :Vec<Address> = Vec::new();
+
+            let s = String::from_utf8(body.to_vec())?;
+
+            for address in s.split(","){
+            	let script_hash = to_scripthash(script_type, address, config.network_type)?;
+            	let stats = query.stats(&script_hash[..]);
+                let address_obj = Address {
+                    address: String::from(address),
+                    chain_stats: stats.0,
+                    mempool_stats: stats.1
+                };
+                v.push(address_obj)
+   			}
+            
+            json_response(
+                json!(v),
+                TTL_SHORT,
+            )
+		}
+
         (&Method::GET, Some(script_type @ &"address"), Some(script_str), None, None, None)
         | (&Method::GET, Some(script_type @ &"scripthash"), Some(script_str), None, None, None) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
