@@ -26,7 +26,7 @@ Note that our indexes are incompatible with electrs's and has to be created sepa
 
 The indexes require 440GB of storage after running compaction, but you'll need to have about 1TB
 of free space available for the initial (non-compacted) indexing process.
-Creating the indexes should take a few hours on a beefy machine with SSD.
+Creating indexes to Bitcoin height 635000 takes approximately 2 hours on a Xeon E3-1245 v6 CPU with solid state storage. 
 
 To deploy with Docker, follow the [instructions here](https://github.com/Blockstream/esplora#how-to-build-the-docker-image).
 
