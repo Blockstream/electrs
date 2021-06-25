@@ -389,6 +389,10 @@ impl Connection {
             "merkle" : merkle}))
     }
 
+    fn unknown_method(&self, method: &str) -> Result<Value> {
+        Ok(json!(format!("unknown method {}", method)))
+    }
+
     fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
         let timer = self
             .stats
@@ -424,7 +428,7 @@ impl Connection {
             #[cfg(feature = "electrum-discovery")]
             "server.add_peer" => self.server_add_peer(&params),
 
-            &_ => bail!("unknown method {} {:?}", method, params),
+            &_ => self.unknown_method(&method),
         };
         timer.observe_duration();
         // TODO: return application errors should be sent to the client
