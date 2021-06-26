@@ -4,6 +4,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
+use serde_json::{Value};
+
 use crate::chain::{Network, OutPoint, Transaction, TxOut};
 use crate::config::Config;
 use crate::daemon::Daemon;
@@ -114,10 +116,15 @@ impl Query {
             .lookup_txn(txid, None)
             .or_else(|| self.mempool().lookup_txn(txid))
     }
+
     pub fn lookup_raw_txn(&self, txid: &Txid) -> Option<Bytes> {
         self.chain
             .lookup_raw_txn(txid, None)
             .or_else(|| self.mempool().lookup_raw_txn(txid))
+    }
+
+    pub fn lookup_raw_txn_verbose(&self, txid: &Txid) -> Result<Value> {
+        self.daemon.gettransaction_raw_verbose(txid)
     }
 
     pub fn lookup_txos(&self, outpoints: &BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {

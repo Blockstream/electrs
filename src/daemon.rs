@@ -509,6 +509,13 @@ impl Daemon {
         )
     }
 
+    pub fn gettransaction_raw_verbose(&self, txid: &Txid) -> Result<Value> {
+        self.request(
+            "getrawtransaction",
+            json!([txid.to_hex(), 1]),
+        )
+    }
+
     pub fn getmempooltx(&self, txhash: &Txid) -> Result<Transaction> {
         let value = self.request(
             "getrawtransaction",
