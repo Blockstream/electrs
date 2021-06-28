@@ -1,5 +1,7 @@
 # Esplora - Electrs backend API
 
+**Important: This is a fork of original electrs server which behaves differently. Make extra sure you're running the same fork when troubleshooting, reporting issues or communicating with others! Please read about the changes below.**
+
 A block chain index engine and HTTP API written in Rust based on [romanz/electrs](https://github.com/romanz/electrs).
 
 Used as the backend for the [Esplora block explorer](https://github.com/Blockstream/esplora) powering [blockstream.info](https://blockstream.info/).
