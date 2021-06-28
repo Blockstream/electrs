@@ -639,10 +639,13 @@ fn handle_request(
             TTL_SHORT,
         ),
 
-        (&Method::GET, Some(&"blocks"), start_height, None, None, None) => {
-            let start_height = start_height.and_then(|height| height.parse::<usize>().ok());
-            blocks(&query, &config, start_height)
+        (&Method::GET, Some(&"blocks"), Some(height), None, None, None) => {
+            blocks(&query, &config, height.parse::<usize>().ok())
         }
+        (&Method::GET, Some(&"blocks"), None, None, None, None) => {
+            blocks(&query, &config, None)
+        }
+
         (&Method::GET, Some(&"block-height"), Some(height), None, None, None) => {
             let height = height.parse::<usize>()?;
             let header = query
