@@ -38,6 +38,8 @@ pub enum Network {
     LiquidTestnet,
     #[cfg(feature = "liquid")]
     LiquidRegtest,
+    #[cfg(feature = "liquid")]
+    LiquidV1Test,
 }
 
 #[cfg(feature = "liquid")]
@@ -60,6 +62,7 @@ impl Network {
         match self {
             Network::Liquid | Network::LiquidRegtest => 0xDAB5_BFFA,
             Network::LiquidTestnet => 0x62DD_0E41,
+            Network::LiquidV1Test => 0xB1FC_3E14,
         }
     }
 
@@ -68,6 +71,7 @@ impl Network {
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => true,
             #[cfg(feature = "liquid")]
+
             Network::LiquidRegtest => true,
             _ => false,
         }
@@ -80,6 +84,8 @@ impl Network {
             Network::Liquid => &address::AddressParams::LIQUID,
             Network::LiquidRegtest => &address::AddressParams::ELEMENTS,
             Network::LiquidTestnet => &LIQUID_TESTNET_PARAMS,
+            Network::LiquidV1Test => &address::AddressParams::ELEMENTS,
+            _ => panic!("the liquid-only address_params() called with non-liquid network"),
         }
     }
 
@@ -88,7 +94,7 @@ impl Network {
         match self {
             Network::Liquid => &*asset::NATIVE_ASSET_ID,
             Network::LiquidTestnet => &*asset::NATIVE_ASSET_ID_TESTNET,
-            Network::LiquidRegtest => &*asset::NATIVE_ASSET_ID_REGTEST,
+            Network::LiquidRegtest | Network::LiquidV1Test => &*asset::NATIVE_ASSET_ID_REGTEST,
         }
     }
 
@@ -96,7 +102,7 @@ impl Network {
     pub fn pegged_asset(self) -> Option<&'static AssetId> {
         match self {
             Network::Liquid => Some(&*asset::NATIVE_ASSET_ID),
-            Network::LiquidTestnet | Network::LiquidRegtest => None,
+            Network::LiquidTestnet | Network::LiquidRegtest | Network::LiquidV1Test => None,
         }
     }
 
@@ -114,6 +120,7 @@ impl Network {
             "liquid".to_string(),
             "liquidtestnet".to_string(),
             "liquidregtest".to_string(),
+            "liquidv1test".to_string(),
         ];
     }
 }
@@ -180,6 +187,8 @@ impl From<&str> for Network {
             "liquidtestnet" => Network::LiquidTestnet,
             #[cfg(feature = "liquid")]
             "liquidregtest" => Network::LiquidRegtest,
+            #[cfg(feature = "liquid")]
+            "liquidv1test" => Network::LiquidV1Test,
 
             _ => panic!("unsupported Bitcoin network: {:?}", network_name),
         }

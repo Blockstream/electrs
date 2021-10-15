@@ -236,8 +236,9 @@ impl Config {
             .map(|s| s.parse().expect("invalid parent network"))
             .unwrap_or_else(|| match network_type {
                 Network::Liquid => BNetwork::Bitcoin,
-                // XXX liquid testnet/regtest don't have a parent chain
-                Network::LiquidTestnet | Network::LiquidRegtest => BNetwork::Regtest,
+                // XXX liquid testnet/regtest/liquidv1test don't have a parent chain
+                Network::LiquidTestnet | Network::LiquidRegtest | Network::LiquidV1Test => BNetwork::Regtest,
+                _ => panic!("unknown liquid network, --parent-network is required"),
             });
 
         #[cfg(feature = "liquid")]
@@ -256,7 +257,7 @@ impl Config {
             #[cfg(feature = "liquid")]
             Network::Liquid => 7041,
             #[cfg(feature = "liquid")]
-            Network::LiquidTestnet | Network::LiquidRegtest => 7040,
+            Network::LiquidTestnet | Network::LiquidRegtest | Network::LiquidV1Test=> 7040,
         };
         let default_electrum_port = match network_type {
             #[cfg(not(feature = "liquid"))]
@@ -274,6 +275,8 @@ impl Config {
             Network::LiquidTestnet => 51301,
             #[cfg(feature = "liquid")]
             Network::LiquidRegtest => 51401,
+            #[cfg(feature = "liquid")]
+            Network::LiquidV1Test => 51402,
         };
         let default_http_port = match network_type {
             #[cfg(not(feature = "liquid"))]
@@ -291,6 +294,8 @@ impl Config {
             Network::LiquidTestnet => 3001,
             #[cfg(feature = "liquid")]
             Network::LiquidRegtest => 3002,
+            #[cfg(feature = "liquid")]
+            Network::LiquidV1Test => 3003,
         };
         let default_monitoring_port = match network_type {
             #[cfg(not(feature = "liquid"))]
@@ -308,6 +313,8 @@ impl Config {
             Network::LiquidTestnet => 44324,
             #[cfg(feature = "liquid")]
             Network::LiquidRegtest => 44224,
+            #[cfg(feature = "liquid")]
+            Network::LiquidV1Test => 44225,
         };
 
         let daemon_rpc_addr: SocketAddr = str_to_socketaddr(
@@ -357,6 +364,8 @@ impl Config {
             Network::LiquidTestnet => daemon_dir.push("liquidtestnet"),
             #[cfg(feature = "liquid")]
             Network::LiquidRegtest => daemon_dir.push("liquidregtest"),
+            #[cfg(feature = "liquid")]
+            Network::LiquidV1Test => daemon_dir.push("liquidv1test"),
         }
         let blocks_dir = m
             .value_of("blocks_dir")
