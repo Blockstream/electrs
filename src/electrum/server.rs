@@ -285,9 +285,14 @@ impl Connection {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
         let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..]);
 
+        let chain_funded_sum = chain_stats.funded_txo_sum as i64;
+        let chain_spent_sum = chain_stats.spent_txo_sum as i64;
+        let mempool_funded_sum = mempool_stats.funded_txo_sum as i64;
+        let mempool_spent_sum = mempool_stats.spent_txo_sum as i64;
+
         Ok(json!({
-            "confirmed": chain_stats.funded_txo_sum - chain_stats.spent_txo_sum,
-            "unconfirmed": mempool_stats.funded_txo_sum as i64 - mempool_stats.spent_txo_sum as i64,
+            "confirmed": chain_funded_sum - chain_spent_sum,
+            "unconfirmed": mempool_funded_sum - mempool_spent_sum,
         }))
     }
 
