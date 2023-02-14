@@ -7,7 +7,7 @@ extern crate electrs;
 use error_chain::ChainedError;
 use std::process;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use electrs::{
     config::Config,
@@ -103,7 +103,7 @@ fn run_server(config: Arc<Config>) -> Result<()> {
     let electrum_server = ElectrumRPC::start(Arc::clone(&config), Arc::clone(&query), &metrics);
 
     loop {
-        if let Err(err) = signal.wait(Duration::from_secs(5), true) {
+        if let Err(err) = signal.wait(Instant::now() + Duration::from_secs(5), true) {
             info!("stopping server: {}", err);
             rest_server.stop();
             // the electrum server is stopped when dropped

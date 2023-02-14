@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Lines, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64;
 use bitcoin::hashes::hex::{FromHex, ToHex};
@@ -132,7 +132,7 @@ fn tcp_connect(addr: SocketAddr, signal: &Waiter) -> Result<TcpStream> {
             Ok(conn) => return Ok(conn),
             Err(err) => {
                 warn!("failed to connect daemon at {}: {}", addr, err);
-                signal.wait(Duration::from_secs(3), false)?;
+                signal.wait(Instant::now() + Duration::from_secs(3), false)?;
                 continue;
             }
         }
@@ -326,7 +326,7 @@ impl Daemon {
                 info.headers,
                 info.verificationprogress * 100.0
             );
-            signal.wait(Duration::from_secs(5), false)?;
+            signal.wait(Instant::now() + Duration::from_secs(5), false)?;
         }
         Ok(daemon)
     }
@@ -398,7 +398,8 @@ impl Daemon {
             match self.handle_request_batch(method, params_list) {
                 Err(Error(ErrorKind::Connection(msg), _)) => {
                     warn!("reconnecting to bitcoind: {}", msg);
-                    self.signal.wait(Duration::from_secs(3), false)?;
+                    self.signal
+                        .wait(Instant::now() + Duration::from_secs(3), false)?;
                     let mut conn = self.conn.lock().unwrap();
                     *conn = conn.reconnect()?;
                     continue;
