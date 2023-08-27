@@ -294,7 +294,7 @@ impl Mempool {
             }
         };
         // Add new transactions
-        self.add(to_add);
+        self.add(to_add)?;
         // Remove missing transactions
         self.remove(to_remove);
 
@@ -314,15 +314,17 @@ impl Mempool {
         Ok(())
     }
 
-    pub fn add_by_txid(&mut self, daemon: &Daemon, txid: &Txid) {
+    pub fn add_by_txid(&mut self, daemon: &Daemon, txid: &Txid) -> Result<()> {
         if self.txstore.get(txid).is_none() {
             if let Ok(tx) = daemon.getmempooltx(&txid) {
-                self.add(vec![tx])
+                self.add(vec![tx])?;
             }
         }
+
+        Ok(())
     }
 
-    fn add(&mut self, txs: Vec<Transaction>) {
+    fn add(&mut self, txs: Vec<Transaction>) -> Result<()> {
         self.delta
             .with_label_values(&["add"])
             .observe(txs.len() as f64);
@@ -341,13 +343,13 @@ impl Mempool {
             Err(err) => {
                 warn!("lookup txouts failed: {}", err);
                 // TODO: should we remove txids from txstore?
-                return;
+                return Ok(());
             }
         };
         for txid in txids {
             let tx = self.txstore.get(&txid).expect("missing mempool tx");
             let txid_bytes = full_hash(&txid[..]);
-            let prevouts = extract_tx_prevouts(&tx, &txos, false);
+            let prevouts = extract_tx_prevouts(&tx, &txos, false)?;
 
             // Get feeinfo for caching and recent tx overview
             let feeinfo = TxFeeInfo::new(&tx, &prevouts, self.config.network_type);
@@ -418,6 +420,8 @@ impl Mempool {
                 &mut self.asset_issuance,
             );
         }
+
+        Ok(())
     }
 
     pub fn lookup_txo(&self, outpoint: &OutPoint) -> Result<TxOut> {

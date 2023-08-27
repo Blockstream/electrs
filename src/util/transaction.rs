@@ -1,4 +1,5 @@
 use crate::chain::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid};
+use crate::errors;
 use crate::util::BlockId;
 
 use std::collections::HashMap;
@@ -74,23 +75,35 @@ pub fn is_spendable(txout: &TxOut) -> bool {
     return !txout.is_fee() && !txout.script_pubkey.is_provably_unspendable();
 }
 
+/// Extract the previous TxOuts of a Transaction's TxIns
+///
+/// # Errors
+///
+/// This function MUST NOT return an error variant when allow_missing is true.
+/// If allow_missing is false, it will return an error when any Outpoint is
+/// missing from the keys of the txos argument's HashMap.
 pub fn extract_tx_prevouts<'a>(
     tx: &Transaction,
     txos: &'a HashMap<OutPoint, TxOut>,
     allow_missing: bool,
-) -> HashMap<u32, &'a TxOut> {
+) -> Result<HashMap<u32, &'a TxOut>, errors::Error> {
     tx.input
         .iter()
         .enumerate()
         .filter(|(_, txi)| has_prevout(txi))
         .filter_map(|(index, txi)| {
-            Some((
+            Some(Ok((
                 index as u32,
-                txos.get(&txi.previous_output).or_else(|| {
-                    assert!(allow_missing, "missing outpoint {:?}", txi.previous_output);
-                    None
-                })?,
-            ))
+                match (allow_missing, txos.get(&txi.previous_output)) {
+                    (_, Some(txo)) => txo,
+                    (true, None) => return None,
+                    (false, None) => {
+                        return Some(Err(
+                            format!("missing outpoint {:?}", txi.previous_output).into()
+                        ));
+                    }
+                },
+            )))
         })
         .collect()
 }

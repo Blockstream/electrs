@@ -133,7 +133,8 @@ impl TransactionValue {
         txos: &HashMap<OutPoint, TxOut>,
         config: &Config,
     ) -> Self {
-        let prevouts = extract_tx_prevouts(&tx, &txos, true);
+        let prevouts =
+            extract_tx_prevouts(&tx, &txos, true).expect("Cannot Err when allow_missing is true");
         let vins: Vec<TxInValue> = tx
             .input
             .iter()
@@ -490,7 +491,7 @@ fn prepare_txs(
     txs: Vec<(Transaction, Option<BlockId>)>,
     query: &Query,
     config: &Config,
-) -> Vec<TransactionValue> {
+) -> Result<Vec<TransactionValue>, errors::Error> {
     let outpoints = txs
         .iter()
         .flat_map(|(tx, _)| {
@@ -501,11 +502,12 @@ fn prepare_txs(
         })
         .collect();
 
-    let prevouts = query.lookup_txos(&outpoints);
+    let prevouts = query.lookup_txos(&outpoints)?;
 
-    txs.into_iter()
+    Ok(txs
+        .into_iter()
         .map(|(tx, blockid)| TransactionValue::new(tx, blockid, &prevouts, config))
-        .collect()
+        .collect())
 }
 
 #[tokio::main]
@@ -597,6 +599,38 @@ pub fn start(config: Arc<Config>, query: Arc<Query>) -> Handle {
         thread: thread::spawn(move || {
             run_server(config, query, rx);
         }),
+    }
+}
+
+/// This enum is used to discern between a txid or a usize that is used
+/// for pagination on the /api/address|scripthash/:address/txs/chain
+/// endpoint.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum AddressPaginator {
+    Txid(Txid),
+    Skip(usize),
+}
+
+impl FromStr for AddressPaginator {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // 1) Deal with Options in if else statement
+        //    to utilize filter for usize.
+        // 2) 64 length usize doesn't exist,
+        //    and from_hex is expensive.
+        if s.len() == 64 {
+            Txid::from_hex(s)
+                .ok()
+                .and_then(|txid| Some(Self::Txid(txid)))
+        } else {
+            s.parse::<usize>()
+                .ok()
+                .filter(|&skip| skip != 0) // Don't allow 0 for Skip
+                .and_then(|skip| Some(Self::Skip(skip)))
+        }
+        // 3) Convert the return value of the if else statement into a Result.
+        .ok_or("Invalid AddressPaginator".to_string())
     }
 }
 
@@ -759,7 +793,7 @@ fn handle_request(
             // XXX orphraned blocks alway get TTL_SHORT
             let ttl = ttl_by_depth(confirmed_blockid.map(|b| b.height), query);
 
-            json_response(prepare_txs(txs, query, config), ttl)
+            json_maybe_error_response(prepare_txs(txs, query, config), ttl)
         }
         (&Method::GET, Some(script_type @ &"address"), Some(script_str), None, None, None)
         | (&Method::GET, Some(script_type @ &"scripthash"), Some(script_str), None, None, None) => {
@@ -810,7 +844,7 @@ fn handle_request(
                     .map(|(tx, blockid)| (tx, Some(blockid))),
             );
 
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_maybe_error_response(prepare_txs(txs, query, config), TTL_SHORT)
         }
 
         (
@@ -819,7 +853,7 @@ fn handle_request(
             Some(script_str),
             Some(&"txs"),
             Some(&"chain"),
-            last_seen_txid,
+            address_paginator,
         )
         | (
             &Method::GET,
@@ -827,23 +861,23 @@ fn handle_request(
             Some(script_str),
             Some(&"txs"),
             Some(&"chain"),
-            last_seen_txid,
+            address_paginator,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
-            let last_seen_txid = last_seen_txid.and_then(|txid| Txid::from_hex(txid).ok());
+            let address_paginator = address_paginator.and_then(|ap| ap.parse::<AddressPaginator>().ok());
 
             let txs = query
                 .chain()
                 .history(
                     &script_hash[..],
-                    last_seen_txid.as_ref(),
+                    address_paginator.as_ref(),
                     CHAIN_TXS_PER_PAGE,
                 )
                 .into_iter()
                 .map(|(tx, blockid)| (tx, Some(blockid)))
                 .collect();
 
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_maybe_error_response(prepare_txs(txs, query, config), TTL_SHORT)
         }
         (
             &Method::GET,
@@ -870,7 +904,7 @@ fn handle_request(
                 .map(|tx| (tx, None))
                 .collect();
 
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_maybe_error_response(prepare_txs(txs, query, config), TTL_SHORT)
         }
 
         (
@@ -913,9 +947,9 @@ fn handle_request(
             let blockid = query.chain().tx_confirming_block(&hash);
             let ttl = ttl_by_depth(blockid.as_ref().map(|b| b.height), query);
 
-            let tx = prepare_txs(vec![(tx, blockid)], query, config).remove(0);
+            let tx = prepare_txs(vec![(tx, blockid)], query, config).map(|mut v| v.remove(0));
 
-            json_response(tx, ttl)
+            json_maybe_error_response(tx, ttl)
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(out_type @ &"hex"), None, None)
         | (&Method::GET, Some(&"tx"), Some(hash), Some(out_type @ &"raw"), None, None) => {
@@ -1100,7 +1134,7 @@ fn handle_request(
                     .map(|(tx, blockid)| (tx, Some(blockid))),
             );
 
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_maybe_error_response(prepare_txs(txs, query, config), TTL_SHORT)
         }
 
         #[cfg(feature = "liquid")]
@@ -1122,7 +1156,7 @@ fn handle_request(
                 .map(|(tx, blockid)| (tx, Some(blockid)))
                 .collect();
 
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_maybe_error_response(prepare_txs(txs, query, config), TTL_SHORT)
         }
 
         #[cfg(feature = "liquid")]
@@ -1136,7 +1170,7 @@ fn handle_request(
                 .map(|tx| (tx, None))
                 .collect();
 
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_maybe_error_response(prepare_txs(txs, query, config), TTL_SHORT)
         }
 
         #[cfg(feature = "liquid")]
@@ -1185,6 +1219,26 @@ fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Body>, Htt
         .header("Cache-Control", format!("public, max-age={:}", ttl))
         .body(Body::from(value))
         .unwrap())
+}
+
+fn json_maybe_error_response<T: Serialize>(
+    value: Result<T, errors::Error>,
+    ttl: u32,
+) -> Result<Response<Body>, HttpError> {
+    let response = Response::builder()
+        .header("Content-Type", "application/json")
+        .header("Cache-Control", format!("public, max-age={:}", ttl));
+    Ok(match value {
+        Ok(v) => response
+            .body(Body::from(serde_json::to_string(&v)?))
+            .expect("Valid http response"),
+        Err(e) => response
+            .status(500)
+            .body(Body::from(serde_json::to_string(
+                &json!({ "error": e.to_string() }),
+            )?))
+            .expect("Valid http response"),
+    })
 }
 
 fn blocks(
@@ -1354,7 +1408,8 @@ impl From<address::AddressError> for HttpError {
 
 #[cfg(test)]
 mod tests {
-    use crate::rest::HttpError;
+    use crate::rest::{AddressPaginator, HttpError};
+    use bitcoin::{Txid, hashes::hex::FromHex};
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -1418,5 +1473,68 @@ mod tests {
             .ok_or(HttpError::from("notexist absent or not a u64".to_string()));
 
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_address_paginator() {
+        // Each vector is (result, expected, assert_reason)
+        let vectors = [
+            (
+                "".parse::<AddressPaginator>(),
+                Err("Invalid AddressPaginator".to_string()),
+                "fails both Txid from_hex and usize parse",
+            ),
+            (
+                "0".parse::<AddressPaginator>(),
+                Err("Invalid AddressPaginator".to_string()),
+                "skipping 0 is pointless, so fails",
+            ),
+            (
+                "18446744073709551615".parse::<AddressPaginator>(),
+                Ok(AddressPaginator::Skip(18446744073709551615)),
+                "valid usize (u64::MAX)",
+            ),
+            (
+                "1".parse::<AddressPaginator>(),
+                Ok(AddressPaginator::Skip(1)),
+                "valid usize",
+            ),
+            (
+                "0000000000000000000000000000000000000000000000000000000000000001"
+                    .parse::<AddressPaginator>(),
+                Ok(AddressPaginator::Txid(
+                    Txid::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                        .unwrap(),
+                )),
+                "64 length is always treated as Txid",
+            ),
+            (
+                "0000000000000000000000000000000000000000000018446744073709551615"
+                    .parse::<AddressPaginator>(),
+                Ok(AddressPaginator::Txid(
+                    Txid::from_hex("0000000000000000000000000000000000000000000018446744073709551615")
+                        .unwrap(),
+                )),
+                "64 length is always treated as Txid",
+            ),
+            (
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .parse::<AddressPaginator>(),
+                Ok(AddressPaginator::Txid(
+                    Txid::from_hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                        .unwrap(),
+                )),
+                "valid Txid",
+            ),
+            (
+                "ffffffxfffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .parse::<AddressPaginator>(),
+                Err("Invalid AddressPaginator".to_string()),
+                "fails both Txid from_hex and usize parse",
+            ),
+        ];
+        for vector in vectors {
+            assert_eq!(vector.0, vector.1, "{}", vector.2);
+        }
     }
 }
