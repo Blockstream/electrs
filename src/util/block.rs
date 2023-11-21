@@ -256,22 +256,29 @@ pub struct BlockStatus {
     pub in_best_chain: bool,
     pub height: Option<usize>,
     pub next_best: Option<BlockHash>,
+    pub best_tip_hash: BlockHash,
 }
 
 impl BlockStatus {
-    pub fn confirmed(height: usize, next_best: Option<BlockHash>) -> BlockStatus {
+    pub fn confirmed(
+        height: usize,
+        next_best: Option<BlockHash>,
+        best_tip_hash: BlockHash,
+    ) -> BlockStatus {
         BlockStatus {
             in_best_chain: true,
             height: Some(height),
             next_best,
+            best_tip_hash,
         }
     }
 
-    pub fn orphaned() -> BlockStatus {
+    pub fn orphaned(best_tip_hash: BlockHash) -> BlockStatus {
         BlockStatus {
             in_best_chain: false,
             height: None,
             next_best: None,
+            best_tip_hash,
         }
     }
 }

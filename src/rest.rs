@@ -673,7 +673,8 @@ fn handle_request(
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"status"), None, None) => {
             let hash = BlockHash::from_hex(hash)?;
-            let status = query.chain().get_block_status(&hash);
+            let best_tip_hash = query.chain().best_hash();
+            let status = query.chain().get_block_status(&hash, &best_tip_hash);
             let ttl = ttl_by_depth(status.height, query);
             json_response(status, ttl)
         }

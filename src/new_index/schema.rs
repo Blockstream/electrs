@@ -889,7 +889,7 @@ impl ChainQuery {
             .map(BlockId::from)
     }
 
-    pub fn get_block_status(&self, hash: &BlockHash) -> BlockStatus {
+    pub fn get_block_status(&self, hash: &BlockHash, best_tip_hash: &BlockHash) -> BlockStatus {
         // TODO differentiate orphaned and non-existing blocks? telling them apart requires
         // an additional db read.
 
@@ -897,16 +897,18 @@ impl ChainQuery {
 
         // header_by_blockhash only returns blocks that are part of the best chain,
         // or None for orphaned blocks.
-        headers
-            .header_by_blockhash(hash)
-            .map_or_else(BlockStatus::orphaned, |header| {
+        headers.header_by_blockhash(hash).map_or_else(
+            || BlockStatus::orphaned(*best_tip_hash),
+            |header| {
                 BlockStatus::confirmed(
                     header.height(),
                     headers
                         .header_by_height(header.height() + 1)
                         .map(|h| *h.hash()),
+                    *best_tip_hash,
                 )
-            })
+            },
+        )
     }
 
     #[cfg(not(feature = "liquid"))]
