@@ -561,7 +561,7 @@ pub fn start(config: Arc<Config>, query: Arc<Query>) -> Handle {
 
     Handle {
         tx,
-        thread: thread::spawn(move || {
+        thread: crate::util::spawn_thread("rest-server", move || {
             run_server(config, query, rx);
         }),
     }

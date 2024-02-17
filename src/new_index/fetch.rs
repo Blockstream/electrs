@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
 use std::thread;
 
 use crate::chain::{Block, BlockHash};
@@ -46,12 +45,12 @@ pub struct BlockEntry {
 type SizedBlock = (Block, u32);
 
 pub struct Fetcher<T> {
-    receiver: Receiver<T>,
+    receiver: crossbeam_channel::Receiver<T>,
     thread: thread::JoinHandle<()>,
 }
 
 impl<T> Fetcher<T> {
-    fn from(receiver: Receiver<T>, thread: thread::JoinHandle<()>) -> Self {
+    fn from(receiver: crossbeam_channel::Receiver<T>, thread: thread::JoinHandle<()>) -> Self {
         Fetcher { receiver, thread }
     }
 

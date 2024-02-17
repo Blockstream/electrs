@@ -17,8 +17,10 @@ pub use self::transaction::{
 };
 
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
-use std::thread;
+use std::sync::atomic::AtomicUsize;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Mutex;
+use std::thread::{self, ThreadId};
 
 use crate::chain::BlockHeader;
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
@@ -38,26 +40,38 @@ pub fn full_hash(hash: &[u8]) -> FullHash {
 }
 
 pub struct SyncChannel<T> {
-    tx: SyncSender<T>,
-    rx: Receiver<T>,
+    tx: Option<crossbeam_channel::Sender<T>>,
+    rx: Option<crossbeam_channel::Receiver<T>>,
 }
 
 impl<T> SyncChannel<T> {
     pub fn new(size: usize) -> SyncChannel<T> {
-        let (tx, rx) = sync_channel(size);
-        SyncChannel { tx, rx }
+        let (tx, rx) = crossbeam_channel::bounded(size);
+        SyncChannel {
+            tx: Some(tx),
+            rx: Some(rx),
+        }
     }
 
-    pub fn sender(&self) -> SyncSender<T> {
-        self.tx.clone()
+    pub fn sender(&self) -> crossbeam_channel::Sender<T> {
+        self.tx.as_ref().expect("No Sender").clone()
     }
 
-    pub fn receiver(&self) -> &Receiver<T> {
-        &self.rx
+    pub fn receiver(&self) -> &crossbeam_channel::Receiver<T> {
+        self.rx.as_ref().expect("No Receiver")
     }
 
-    pub fn into_receiver(self) -> Receiver<T> {
-        self.rx
+    pub fn into_receiver(self) -> crossbeam_channel::Receiver<T> {
+        self.rx.expect("No Receiver")
+    }
+
+    /// This drops the sender and receiver, causing all other methods to panic.
+    ///
+    /// Use only when you know that the channel will no longer be used.
+    /// ie. shutdown.
+    pub fn close(&mut self) -> Option<crossbeam_channel::Receiver<T>> {
+        self.tx.take();
+        self.rx.take()
     }
 }
 
@@ -85,15 +99,58 @@ impl<T> Channel<T> {
     }
 }
 
-pub fn spawn_thread<F, T>(name: &str, f: F) -> thread::JoinHandle<T>
+/// This static HashMap contains all the threads spawned with [`spawn_thread`] with their name
+#[inline]
+pub fn with_spawned_threads<F>(f: F)
+where
+    F: FnOnce(&mut HashMap<ThreadId, String>),
+{
+    lazy_static! {
+        static ref SPAWNED_THREADS: Mutex<HashMap<ThreadId, String>> = Mutex::new(HashMap::new());
+    }
+    let mut lock = match SPAWNED_THREADS.lock() {
+        Ok(threads) => threads,
+        // There's no possible broken state
+        Err(threads) => {
+            warn!("SPAWNED_THREADS is in a poisoned state! Be wary of incorrect logs!");
+            threads.into_inner()
+        }
+    };
+    f(&mut lock)
+}
+
+pub fn spawn_thread<F, T>(prefix: &str, do_work: F) -> thread::JoinHandle<T>
 where
     F: FnOnce() -> T,
     F: Send + 'static,
     T: Send + 'static,
 {
+    static THREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let counter = THREAD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(f)
+        .name(format!("{}-{}", prefix, counter))
+        .spawn(move || {
+            let thread = std::thread::current();
+            let name = thread.name().unwrap();
+            let id = thread.id();
+
+            trace!("[THREAD] GETHASHMAP INSERT | {name} {id:?}");
+            with_spawned_threads(|threads| {
+                threads.insert(id, name.to_owned());
+            });
+            trace!("[THREAD] START WORK        | {name} {id:?}");
+
+            let result = do_work();
+
+            trace!("[THREAD] FINISHED WORK     | {name} {id:?}");
+            trace!("[THREAD] GETHASHMAP REMOVE | {name} {id:?}");
+            with_spawned_threads(|threads| {
+                threads.remove(&id);
+            });
+            trace!("[THREAD] HASHMAP REMOVED   | {name} {id:?}");
+
+            result
+        })
         .unwrap()
 }
 

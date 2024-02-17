@@ -105,6 +105,20 @@ fn run_server(config: Arc<Config>) -> Result<()> {
     loop {
         if let Err(err) = signal.wait(Duration::from_secs(5), true) {
             info!("stopping server: {}", err);
+
+            electrs::util::spawn_thread("shutdown-thread-checker", || {
+                let mut counter = 40;
+                let interval_ms = 500;
+
+                while counter > 0 {
+                    electrs::util::with_spawned_threads(|threads| {
+                        debug!("Threads during shutdown: {:?}", threads);
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                    counter -= 1;
+                }
+            });
+
             rest_server.stop();
             // the electrum server is stopped when dropped
             break;
@@ -133,4 +147,7 @@ fn main() {
         error!("server failed: {}", e.display_chain());
         process::exit(1);
     }
+    electrs::util::with_spawned_threads(|threads| {
+        debug!("Threads before closing: {:?}", threads);
+    });
 }

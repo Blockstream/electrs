@@ -102,7 +102,7 @@ impl AssetRegistry {
     }
 
     pub fn spawn_sync(asset_db: Arc<RwLock<AssetRegistry>>) -> thread::JoinHandle<()> {
-        thread::spawn(move || loop {
+        crate::util::spawn_thread("asset-registry", move || loop {
             if let Err(e) = asset_db.write().unwrap().fs_sync() {
                 error!("registry fs_sync failed: {:?}", e);
             }
