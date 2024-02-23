@@ -564,7 +564,7 @@ impl Connection {
                                     "event": "rpc response",
                                     "method": method,
                                     "payload_size": reply.to_string().as_bytes().len(),
-                                    "duration_ms": start_time.elapsed().as_millis(),
+                                    "duration_µs": start_time.elapsed().as_micros(),
                                     "id": id,
                                 })
                             );
