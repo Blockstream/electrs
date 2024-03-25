@@ -420,7 +420,6 @@ impl Mempool {
             .get(&outpoint.txid)
             .and_then(|tx| tx.output.get(outpoint.vout as usize).cloned())
     }
-
     #[instrument(skip_all, name="Mempool::lookup_txos")]
     pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self
