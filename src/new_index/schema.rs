@@ -17,9 +17,12 @@ use elements::{
     AssetId,
 };
 
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    convert::TryInto,
+};
 
 use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
@@ -596,9 +599,13 @@ impl ChainQuery {
         let history_iter = self
             .history_iter_scan(b'H', scripthash, start_height)
             .map(TxHistoryRow::from_row)
-            .filter_map(|history| {
-                self.tx_confirming_block(&history.get_txid())
-                    .map(|b| (history, b))
+            .map(|history| {
+                let height = history.key.confirmed_height;
+                (
+                    history,
+                    self.blockid_by_height(height as usize)
+                        .expect("missing blockheader for valid utxo cache entry"),
+                )
             });
 
         let mut utxos = init_utxos;
