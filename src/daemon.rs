@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{BufRead, BufReader, Lines, Write};
@@ -8,8 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::prelude::{Engine, BASE64_STANDARD};
+use error_chain::ChainedError;
 use hex::FromHex;
-use itertools::Itertools;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde_json::{from_str, from_value, Value};
 
 #[cfg(not(feature = "liquid"))]
@@ -291,6 +293,7 @@ impl Counter {
 
 pub struct Daemon {
     daemon_dir: PathBuf,
+    daemon_parallelism: usize,
     blocks_dir: PathBuf,
     network: Network,
     conn: Mutex<Connection>,
@@ -307,6 +310,7 @@ impl Daemon {
         daemon_dir: &PathBuf,
         blocks_dir: &PathBuf,
         daemon_rpc_addr: SocketAddr,
+        daemon_parallelism: usize,
         cookie_getter: Arc<dyn CookieGetter>,
         network: Network,
         signal: Waiter,
@@ -314,6 +318,7 @@ impl Daemon {
     ) -> Result<Daemon> {
         let daemon = Daemon {
             daemon_dir: daemon_dir.clone(),
+            daemon_parallelism,
             blocks_dir: blocks_dir.clone(),
             network,
             conn: Mutex::new(Connection::new(
@@ -367,6 +372,7 @@ impl Daemon {
     pub fn reconnect(&self) -> Result<Daemon> {
         Ok(Daemon {
             daemon_dir: self.daemon_dir.clone(),
+            daemon_parallelism: self.daemon_parallelism,
             blocks_dir: self.blocks_dir.clone(),
             network: self.network,
             conn: Mutex::new(self.conn.lock().unwrap().reconnect()?),
@@ -411,33 +417,18 @@ impl Daemon {
         Ok(result)
     }
 
-    #[instrument(skip_all, name="Daemon::handle_request_batch")]
-    fn handle_request_batch(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
+    #[instrument(skip_all, name="Daemon::handle_request")]
+    fn handle_request(&self, method: &str, params: &Value) -> Result<Value> {
         let id = self.message_id.next();
-        let chunks = params_list
-            .iter()
-            .map(|params| json!({"method": method, "params": params, "id": id}))
-            .chunks(50_000); // Max Amount of batched requests
-        let mut results = vec![];
-        for chunk in &chunks {
-            let reqs = chunk.collect();
-            let mut replies = self.call_jsonrpc(method, &reqs)?;
-            if let Some(replies_vec) = replies.as_array_mut() {
-                for reply in replies_vec {
-                    results.push(parse_jsonrpc_reply(reply.take(), method, id)?)
-                }
-            } else {
-                bail!("non-array replies: {:?}", replies);
-            }
-        }
-
-        Ok(results)
+        let req = json!({"method": method, "params": params, "id": id});
+        let reply = self.call_jsonrpc(method, &req)?;
+        parse_jsonrpc_reply(reply, method, id)
     }
 
-    #[instrument(skip_all, name="Daemon::retry_request_batch")]
-    fn retry_request_batch(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
+    #[instrument(skip_all, name="Daemon::retry_request")]
+    fn retry_request(&self, method: &str, params: &Value) -> Result<Value> {
         loop {
-            match self.handle_request_batch(method, params_list) {
+            match self.handle_request(method, &params) {
                 Err(Error(ErrorKind::Connection(msg), _)) => {
                     warn!("reconnecting to bitcoind: {}", msg);
                     self.signal.wait(Duration::from_secs(3), false)?;
@@ -452,14 +443,33 @@ impl Daemon {
 
     #[instrument(skip_all, name="Daemon::request")]
     fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let mut values = self.retry_request_batch(method, &[params])?;
-        assert_eq!(values.len(), 1);
-        Ok(values.remove(0))
+        self.retry_request(method, &params)
     }
-
+    
     #[instrument(skip_all, name="Daemon::requests")]
     fn requests(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
-        self.retry_request_batch(method, params_list)
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.daemon_parallelism)
+            .thread_name(|i| format!("rpc-requests-{}", i))
+            .build()
+            .unwrap();
+
+        thread_pool.install(|| {
+            params_list
+                .par_iter()
+                .map(|params| {
+                    // Store a local per-thread Daemon, each with its own TCP connection. These will get initialized as
+                    // necessary for the threads managed by rayon, and get destroyed when the thread pool is dropped.
+                    thread_local!(static DAEMON_INSTANCE: OnceCell<Daemon> = OnceCell::new());
+
+                    DAEMON_INSTANCE.with(|daemon| {
+                        daemon
+                            .get_or_init(|| self.retry_reconnect())
+                            .retry_request(method, params)
+                    })
+                })
+                .collect()
+        })
     }
 
     // bitcoind JSONRPC API:
@@ -536,12 +546,7 @@ impl Daemon {
             .collect();
 
         let values = self.requests("getrawtransaction", &params_list)?;
-        let mut txs = vec![];
-        for value in values {
-            txs.push(tx_from_value(value)?);
-        }
-        assert_eq!(txhashes.len(), txs.len());
-        Ok(txs)
+        values.into_iter().map(tx_from_value).collect()
     }
 
     #[instrument(skip_all, name="Daemon::gettransaction_raw")]
