@@ -445,7 +445,7 @@ impl Daemon {
     fn request(&self, method: &str, params: Value) -> Result<Value> {
         self.retry_request(method, &params)
     }
-    
+
     #[instrument(skip_all, name="Daemon::requests")]
     fn requests(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
         let thread_pool = rayon::ThreadPoolBuilder::new()

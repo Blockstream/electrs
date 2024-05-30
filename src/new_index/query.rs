@@ -75,7 +75,8 @@ impl Query {
     #[instrument(skip_all, name="query::Query::broadcast_raw")]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.daemon.broadcast_raw(txhex)?;
-        self.mempool
+        let _ = self
+            .mempool
             .write()
             .unwrap()
             .add_by_txid(&self.daemon, &txid);
