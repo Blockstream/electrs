@@ -12,8 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tracing::instrument;
-
-use crate::chain::{deserialize, Network, OutPoint, Transaction, TxOut, Txid};
+use crate::chain::{deserialize, BlockHash, Network, OutPoint, Transaction, TxOut, Txid};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
@@ -506,9 +505,14 @@ impl Mempool {
             .map_or_else(|| vec![], |entries| self._history(entries, limit))
     }
 
-    /// Sync our local view of the mempool with the bitcoind RPC.
+    /// Sync our local view of the mempool with the bitcoind Daemon RPC. If the chain tip moves before
+    /// the mempool is fetched in full, syncing is aborted and an Ok(false) is returned.
     #[instrument(skip_all, name="Mempool::update")]
-    pub fn update(mempool: &Arc<RwLock<Mempool>>, daemon: &Daemon) -> Result<()> {
+    pub fn update(
+        mempool: &Arc<RwLock<Mempool>>,
+        daemon: &Daemon,
+        tip: &BlockHash,
+    ) -> Result<bool> {
         let _timer = mempool.read().unwrap().latency.with_label_values(&["update"]).start_timer();
 
         // Continuously attempt to fetch mempool transactions until we're able to get them in full
@@ -535,6 +539,13 @@ impl Mempool {
                 .filter(|&txid| !fetched_txs.contains_key(txid) && !indexed_txids.contains(txid))
                 .collect::<Vec<_>>();
             let new_txs = daemon.gettransactions_available(&new_txids)?;
+
+            // Abort if the chain tip moved while fetching transactions
+            if daemon.getbestblockhash()? != *tip {
+                warn!("chain tip moved while updating mempool");
+                return Ok(false);
+            }
+
             let fetched_count = new_txs.len();
             fetched_txs.extend(&mut new_txs.into_iter().map(|tx| (tx.txid(), tx)));
 
@@ -566,7 +577,7 @@ impl Mempool {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 
