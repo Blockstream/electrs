@@ -260,7 +260,7 @@ impl Connection {
         Ok(if status == "HTTP/1.1 200 OK" {
             contents
         } else if status == "HTTP/1.1 500 Internal Server Error" {
-            warn!("HTTP status: {}", status);
+            debug!("RPC HTTP 500 error: {}", contents);
             contents // the contents should have a JSONRPC error field
         } else {
             bail!(
@@ -429,8 +429,8 @@ impl Daemon {
     fn retry_request(&self, method: &str, params: &Value) -> Result<Value> {
         loop {
             match self.handle_request(method, &params) {
-                Err(Error(ErrorKind::Connection(msg), _)) => {
-                    warn!("reconnecting to bitcoind: {}", msg);
+                Err(e @ Error(ErrorKind::Connection(_), _)) => {
+                    warn!("reconnecting to bitcoind: {}", e.display_chain());
                     self.signal.wait(Duration::from_secs(3), false)?;
                     let mut conn = self.conn.lock().unwrap();
                     *conn = conn.reconnect()?;
