@@ -1,6 +1,7 @@
 use rocksdb;
 
 use std::path::Path;
+#[cfg(feature = "tracing-enabled")]
 use tracing::instrument;
 
 use crate::config::Config;
@@ -107,7 +108,7 @@ impl DB {
         db
     }
 
-    #[instrument(skip(self))]
+    #[cfg_attr(feature = "tracing-enabled", instrument(skip(self)))]
     pub fn full_compaction(&self) {
         // TODO: make sure this doesn't fail silently
         debug!("starting full compaction on {:?}", self.db);
@@ -115,7 +116,7 @@ impl DB {
         debug!("finished full compaction on {:?}", self.db);
     }
 
-    #[instrument(skip(self))]
+    #[cfg_attr(feature = "tracing-enabled", instrument(skip(self)))]
     pub fn enable_auto_compaction(&self) {
         let opts = [("disable_auto_compactions", "false")];
         self.db.set_options(&opts).unwrap();
@@ -181,7 +182,7 @@ impl DB {
         self.db.write_opt(batch, &opts).unwrap();
     }
 
-    #[instrument(skip(self))]
+    #[cfg_attr(feature = "tracing-enabled", instrument(skip(self)))]
     pub fn flush(&self) {
         self.db.flush().unwrap();
     }
@@ -190,7 +191,7 @@ impl DB {
         self.db.put(key, value).unwrap();
     }
 
-    #[instrument(skip(self, key, value))]
+    #[cfg_attr(feature = "tracing-enabled", instrument(skip(self, key, value)))]
     pub fn put_sync(&self, key: &[u8], value: &[u8]) {
         let mut opts = rocksdb::WriteOptions::new();
         opts.set_sync(true);

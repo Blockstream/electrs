@@ -16,10 +16,12 @@ use electrs::{
     errors::*,
     metrics::Metrics,
     new_index::{precache, ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
-    otlp_trace,
     rest,
     signal::Waiter,
 };
+
+#[cfg(feature = "tracing-enabled")]
+use electrs::otlp_trace;
 
 #[cfg(feature = "liquid")]
 use electrs::elements::AssetRegistry;
@@ -148,10 +150,26 @@ fn run_server(config: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+#[cfg_attr(feature = "tracing-enabled", tokio::main)]
+#[cfg_attr(not(feature = "tracing-enabled"), allow(dead_code))]
+async fn main_async() {
+    #[cfg(feature = "tracing-enabled")]
     let _tracing_guard = otlp_trace::init_tracing("electrs");
 
+    let config = Arc::new(Config::from_args());
+    if let Err(e) = run_server(config) {
+        error!("server failed: {}", e.display_chain());
+        process::exit(1);
+    }
+}
+
+#[cfg(feature = "tracing-enabled")]
+fn main() {
+    main_async();
+}
+
+#[cfg(not(feature = "tracing-enabled"))]
+fn main() {
     let config = Arc::new(Config::from_args());
     if let Err(e) = run_server(config) {
         error!("server failed: {}", e.display_chain());
