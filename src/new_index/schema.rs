@@ -20,6 +20,7 @@ use elements::{
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use tracing::instrument;
 
 use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
@@ -220,6 +221,7 @@ impl Indexer {
         self.duration.with_label_values(&[name]).start_timer()
     }
 
+    #[instrument(skip_all, name="schema::Indexer::headers_to_add")]
     fn headers_to_add(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
         let added_blockhashes = self.store.added_blockhashes.read().unwrap();
         new_headers
@@ -229,6 +231,7 @@ impl Indexer {
             .collect()
     }
 
+    #[instrument(skip_all, name="schema::Indexer::headers_to_index")]
     fn headers_to_index(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
         let indexed_blockhashes = self.store.indexed_blockhashes.read().unwrap();
         new_headers
@@ -238,6 +241,7 @@ impl Indexer {
             .collect()
     }
 
+    #[instrument(skip_all, name="schema::start_auto_compactions")]
     fn start_auto_compactions(&self, db: &DB) {
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
@@ -248,6 +252,7 @@ impl Indexer {
         db.enable_auto_compaction();
     }
 
+    #[instrument(skip_all, name="schema::get_new_headers")]
     fn get_new_headers(&self, daemon: &Daemon, tip: &BlockHash) -> Result<Vec<HeaderEntry>> {
         let headers = self.store.indexed_headers.read().unwrap();
         let new_headers = daemon.get_new_headers(&headers, &tip)?;
@@ -259,6 +264,7 @@ impl Indexer {
         Ok(result)
     }
 
+    #[instrument(skip_all, name="schema::update")]
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
@@ -306,6 +312,7 @@ impl Indexer {
         Ok(tip)
     }
 
+    #[instrument(skip_all, name="schema::add")]
     fn add(&self, blocks: &[BlockEntry]) {
         // TODO: skip orphaned blocks?
         let rows = {
@@ -324,6 +331,7 @@ impl Indexer {
             .extend(blocks.iter().map(|b| b.entry.hash()));
     }
 
+    #[instrument(skip_all, name="schema::index")]
     fn index(&self, blocks: &[BlockEntry]) {
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
@@ -375,9 +383,8 @@ impl ChainQuery {
         self.duration.with_label_values(&[name]).start_timer()
     }
 
+    #[instrument(skip_all, name="sdchema::Indexer::get_block_txids")]
     pub fn get_block_txids(&self, hash: &BlockHash) -> Option<Vec<Txid>> {
-        let _timer = self.start_timer("get_block_txids");
-
         if self.light_mode {
             // TODO fetch block as binary from REST API instead of as hex
             let mut blockinfo = self.daemon.getblock_raw(hash, 1).ok()?;
@@ -390,6 +397,7 @@ impl ChainQuery {
         }
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::get_block_meta")]
     pub fn get_block_meta(&self, hash: &BlockHash) -> Option<BlockMeta> {
         let _timer = self.start_timer("get_block_meta");
 
@@ -404,6 +412,7 @@ impl ChainQuery {
         }
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::get_block_raw")]
     pub fn get_block_raw(&self, hash: &BlockHash) -> Option<Vec<u8>> {
         let _timer = self.start_timer("get_block_raw");
 
@@ -432,16 +441,19 @@ impl ChainQuery {
         }
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::get_block_header")]
     pub fn get_block_header(&self, hash: &BlockHash) -> Option<BlockHeader> {
         let _timer = self.start_timer("get_block_header");
         Some(self.header_by_hash(hash)?.header().clone())
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::get_mtp")]
     pub fn get_mtp(&self, height: usize) -> u32 {
         let _timer = self.start_timer("get_block_mtp");
         self.store.indexed_headers.read().unwrap().get_mtp(height)
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::get_block_with_meta")]
     pub fn get_block_with_meta(&self, hash: &BlockHash) -> Option<BlockHeaderMeta> {
         let _timer = self.start_timer("get_block_with_meta");
         let header_entry = self.header_by_hash(hash)?;
@@ -452,12 +464,15 @@ impl ChainQuery {
         })
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::history_iter_scan")]
     pub fn history_iter_scan(&self, code: u8, hash: &[u8], start_height: usize) -> ScanIterator {
         self.store.history_db.iter_scan_from(
             &TxHistoryRow::filter(code, &hash[..]),
             &TxHistoryRow::prefix_height(code, &hash[..], start_height as u32),
         )
     }
+
+    #[instrument(skip_all, name="schema::ChainQuery::history_iter_scan_reverse")]
     fn history_iter_scan_reverse(&self, code: u8, hash: &[u8]) -> ReverseScanIterator {
         self.store.history_db.iter_scan_reverse(
             &TxHistoryRow::filter(code, &hash[..]),
@@ -465,6 +480,7 @@ impl ChainQuery {
         )
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::history")]
     pub fn history(
         &self,
         scripthash: &[u8],
@@ -475,6 +491,7 @@ impl ChainQuery {
         self._history(b'H', scripthash, last_seen_txid, limit)
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::_history")]
     fn _history(
         &self,
         code: u8,
@@ -509,11 +526,13 @@ impl ChainQuery {
             .collect()
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::history_txids")]
     pub fn history_txids(&self, scripthash: &[u8], limit: usize) -> Vec<(Txid, BlockId)> {
         // scripthash lookup
         self._history_txids(b'H', scripthash, limit)
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::_history_txids")]
     fn _history_txids(&self, code: u8, hash: &[u8], limit: usize) -> Vec<(Txid, BlockId)> {
         let _timer = self.start_timer("history_txids");
         self.history_iter_scan(code, hash, 0)
@@ -525,6 +544,7 @@ impl ChainQuery {
     }
 
     // TODO: avoid duplication with stats/stats_delta?
+    #[instrument(skip_all, name="schema::ChainQuery::utxo")]
     pub fn utxo(&self, scripthash: &[u8], limit: usize) -> Result<Vec<Utxo>> {
         let _timer = self.start_timer("utxo");
 
@@ -585,6 +605,7 @@ impl ChainQuery {
             .collect())
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::utxo_delta")]
     fn utxo_delta(
         &self,
         scripthash: &[u8],
@@ -630,6 +651,7 @@ impl ChainQuery {
         Ok((utxos, lastblock, processed_items))
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::stats")]
     pub fn stats(&self, scripthash: &[u8]) -> ScriptStats {
         let _timer = self.start_timer("stats");
 
@@ -664,6 +686,7 @@ impl ChainQuery {
         newstats
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::stats_delta")]
     fn stats_delta(
         &self,
         scripthash: &[u8],
@@ -731,6 +754,7 @@ impl ChainQuery {
         (stats, lastblock)
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::address_search")]
     pub fn address_search(&self, prefix: &str, limit: usize) -> Vec<String> {
         let _timer_scan = self.start_timer("address_search");
         self.store
@@ -741,6 +765,7 @@ impl ChainQuery {
             .collect()
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::header_by_hash")]
     fn header_by_hash(&self, hash: &BlockHash) -> Option<HeaderEntry> {
         self.store
             .indexed_headers
@@ -750,6 +775,7 @@ impl ChainQuery {
             .cloned()
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::height_by_hash")]
     // Get the height of a blockhash, only if its part of the best chain
     pub fn height_by_hash(&self, hash: &BlockHash) -> Option<usize> {
         self.store
@@ -760,6 +786,7 @@ impl ChainQuery {
             .map(|header| header.height())
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::header_by_height")]
     pub fn header_by_height(&self, height: usize) -> Option<HeaderEntry> {
         self.store
             .indexed_headers
@@ -769,6 +796,7 @@ impl ChainQuery {
             .cloned()
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::hash_by_height")]
     pub fn hash_by_height(&self, height: usize) -> Option<BlockHash> {
         self.store
             .indexed_headers
@@ -778,6 +806,7 @@ impl ChainQuery {
             .map(|entry| *entry.hash())
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::blockid_by_height")]
     pub fn blockid_by_height(&self, height: usize) -> Option<BlockId> {
         self.store
             .indexed_headers
@@ -787,6 +816,7 @@ impl ChainQuery {
             .map(BlockId::from)
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::blockid_by_hash")]
     // returns None for orphaned blocks
     pub fn blockid_by_hash(&self, hash: &BlockHash) -> Option<BlockId> {
         self.store
@@ -797,14 +827,18 @@ impl ChainQuery {
             .map(BlockId::from)
     }
 
+
+    #[instrument(skip_all, name="schema::ChainQuery::bests_height")]
     pub fn best_height(&self) -> usize {
         self.store.indexed_headers.read().unwrap().len() - 1
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::best_hash")]
     pub fn best_hash(&self) -> BlockHash {
         *self.store.indexed_headers.read().unwrap().tip()
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::best_header")]
     pub fn best_header(&self) -> HeaderEntry {
         let headers = self.store.indexed_headers.read().unwrap();
         headers
@@ -815,6 +849,7 @@ impl ChainQuery {
 
     // TODO: can we pass txids as a "generic iterable"?
     // TODO: should also use a custom ThreadPoolBuilder?
+    #[instrument(skip_all, name="schema::ChainQuery::lookup_txns")]
     pub fn lookup_txns(&self, txids: &[(Txid, BlockId)]) -> Result<Vec<Transaction>> {
         let _timer = self.start_timer("lookup_txns");
         txids
@@ -826,6 +861,7 @@ impl ChainQuery {
             .collect::<Result<Vec<Transaction>>>()
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::lookup_txn")]
     pub fn lookup_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Transaction> {
         let _timer = self.start_timer("lookup_txn");
         self.lookup_raw_txn(txid, blockhash).map(|rawtx| {
@@ -835,6 +871,7 @@ impl ChainQuery {
         })
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::lookup_raw_txn")]
     pub fn lookup_raw_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Bytes> {
         let _timer = self.start_timer("lookup_raw_txn");
 
@@ -854,16 +891,19 @@ impl ChainQuery {
         }
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::lookup_txo")]
     pub fn lookup_txo(&self, outpoint: &OutPoint) -> Option<TxOut> {
         let _timer = self.start_timer("lookup_txo");
         lookup_txo(&self.store.txstore_db, outpoint)
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::lookup_txos")]
     pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self.start_timer("lookup_txos");
         lookup_txos(&self.store.txstore_db, outpoints)
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::lookup_spend")]
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
         let _timer = self.start_timer("lookup_spend");
         self.store
@@ -879,6 +919,8 @@ impl ChainQuery {
                 })
             })
     }
+
+    #[instrument(skip_all, name="schema::ChainQuery::tx_confirming_blocks")]
     pub fn tx_confirming_block(&self, txid: &Txid) -> Option<BlockId> {
         let _timer = self.start_timer("tx_confirming_block");
         let headers = self.store.indexed_headers.read().unwrap();
@@ -895,6 +937,7 @@ impl ChainQuery {
             .map(BlockId::from)
     }
 
+    #[instrument(skip_all, name="schema::ChainQuery::get_block_status")]
     pub fn get_block_status(&self, hash: &BlockHash) -> BlockStatus {
         // TODO differentiate orphaned and non-existing blocks? telling them apart requires
         // an additional db read.
@@ -916,6 +959,7 @@ impl ChainQuery {
     }
 
     #[cfg(not(feature = "liquid"))]
+    #[instrument(skip_all, name="schema::ChainQuery::get_merkleblock_proof")]
     pub fn get_merkleblock_proof(&self, txid: &Txid) -> Option<MerkleBlock> {
         let _timer = self.start_timer("get_merkleblock_proof");
         let blockid = self.tx_confirming_block(txid)?;
@@ -930,6 +974,7 @@ impl ChainQuery {
     }
 
     #[cfg(feature = "liquid")]
+    #[instrument(skip_all, name="schema::ChainQuery::asset_history")]
     pub fn asset_history(
         &self,
         asset_id: &AssetId,
@@ -940,11 +985,13 @@ impl ChainQuery {
     }
 
     #[cfg(feature = "liquid")]
+    #[instrument(skip_all, name="schema::ChainQuery::assets_history_txids")]
     pub fn asset_history_txids(&self, asset_id: &AssetId, limit: usize) -> Vec<(Txid, BlockId)> {
         self._history_txids(b'I', &asset_id.into_inner()[..], limit)
     }
 }
 
+#[instrument(skip_all, name="schema::ChainQuery::load_blockhashes")]
 fn load_blockhashes(db: &DB, prefix: &[u8]) -> HashSet<BlockHash> {
     db.iter_scan(prefix)
         .map(BlockRow::from_row)
@@ -952,6 +999,7 @@ fn load_blockhashes(db: &DB, prefix: &[u8]) -> HashSet<BlockHash> {
         .collect()
 }
 
+#[instrument(skip_all, name="schema::ChainQuery::load_blockheaders")]
 fn load_blockheaders(db: &DB) -> HashMap<BlockHash, BlockHeader> {
     db.iter_scan(&BlockRow::header_filter())
         .map(BlockRow::from_row)
@@ -963,6 +1011,7 @@ fn load_blockheaders(db: &DB) -> HashMap<BlockHash, BlockHeader> {
         .collect()
 }
 
+#[instrument(skip_all, name="schema::add_blocks")]
 fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRow> {
     // persist individual transactions:
     //      T{txid} → {rawtx}
@@ -995,6 +1044,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
         .collect()
 }
 
+
 fn add_transaction(
     tx: &Transaction,
     blockhash: FullHash,
@@ -1015,6 +1065,7 @@ fn add_transaction(
     }
 }
 
+#[instrument(skip_all, name="schema::get_previous_txos")]
 fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
     block_entries
         .iter()
@@ -1028,6 +1079,7 @@ fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
         .collect()
 }
 
+#[instrument(skip_all, name = "schema::lookup_txos")]
 fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
     let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
     txstore_db
@@ -1049,6 +1101,7 @@ fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
         .map(|val| deserialize(&val).expect("failed to parse TxOut"))
 }
 
+#[instrument(skip_all, name="schema::index_blocks")]
 fn index_blocks(
     block_entries: &[BlockEntry],
     previous_txos_map: &HashMap<OutPoint, TxOut>,
@@ -1069,7 +1122,9 @@ fn index_blocks(
         .collect()
 }
 
+
 // TODO: return an iterator?
+#[instrument(skip_all, name="schema::index_transaction")]
 fn index_transaction(
     tx: &Transaction,
     confirmed_height: u32,
@@ -1144,6 +1199,7 @@ fn index_transaction(
     );
 }
 
+#[instrument(skip_all, name="schema::addr_search_row")]
 fn addr_search_row(spk: &Script, network: Network) -> Option<DBRow> {
     spk.to_address_str(network).map(|address| DBRow {
         key: [b"a", address.as_bytes()].concat(),
@@ -1598,6 +1654,7 @@ impl UtxoCacheRow {
     }
 }
 
+#[instrument(skip_all, name="schema::make_utxo_cache")]
 // keep utxo cache with just the block height (the hash/timestamp are read later from the headers to reconstruct BlockId)
 // and use a (txid,vout) tuple instead of OutPoints (they don't play nicely with bincode serialization)
 fn make_utxo_cache(utxos: &UtxoMap) -> CachedUtxoMap {
@@ -1612,6 +1669,7 @@ fn make_utxo_cache(utxos: &UtxoMap) -> CachedUtxoMap {
         .collect()
 }
 
+#[instrument(skip_all, name="schema::from_utxo_cache")]
 fn from_utxo_cache(utxos_cache: CachedUtxoMap, chain: &ChainQuery) -> UtxoMap {
     utxos_cache
         .into_iter()

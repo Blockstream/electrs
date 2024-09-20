@@ -16,6 +16,7 @@ use electrs::{
     errors::*,
     metrics::Metrics,
     new_index::{precache, ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
+    otlp_trace,
     rest,
     signal::Waiter,
 };
@@ -147,7 +148,10 @@ fn run_server(config: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    let _tracing_guard = otlp_trace::init_tracing("electrs");
+
     let config = Arc::new(Config::from_args());
     if let Err(e) = run_server(config) {
         error!("server failed: {}", e.display_chain());

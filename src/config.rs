@@ -378,7 +378,7 @@ impl Config {
         } else {
             stderrlog::Timestamp::Off
         });
-        log.init().expect("logging initialization failed");
+
         let config = Config {
             log,
             network_type,

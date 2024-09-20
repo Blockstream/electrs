@@ -35,3 +35,4 @@ pub mod util;
 
 #[cfg(feature = "liquid")]
 pub mod elements;
+pub mod otlp_trace;
