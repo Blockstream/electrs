@@ -14,8 +14,8 @@ edition = "2018"
 [features]
 liquid = [ "elements" ]
 electrum-discovery = [ "electrum-client"]
-tracing-enabled = [
-    "tracing",
+tracing = [
+    "dep:tracing",
     "tracing-subscriber",
     "opentelemetry",
     "tracing-opentelemetry",

@@ -36,5 +36,5 @@ pub mod util;
 #[cfg(feature = "liquid")]
 pub mod elements;
 
-#[cfg(feature = "tracing-enabled")]
+#[cfg(feature = "tracing")]
 pub mod otlp_trace;

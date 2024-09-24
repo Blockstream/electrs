@@ -13,10 +13,10 @@ use std::io;
 use std::io::prelude::*;
 use std::str::FromStr;
 
-#[cfg(feature = "tracing-enabled")]
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
-#[cfg_attr(feature = "tracing-enabled", instrument(skip_all, name="precache::precache"))]
+#[cfg_attr(feature = "tracing", instrument(skip_all, name="precache::precache"))]
 pub fn precache(chain: &ChainQuery, scripthashes: Vec<FullHash>) {
     let total = scripthashes.len();
     info!("Pre-caching stats and utxo set for {} scripthashes", total);
@@ -40,7 +40,7 @@ pub fn precache(chain: &ChainQuery, scripthashes: Vec<FullHash>) {
     });
 }
 
-#[cfg_attr(feature = "tracing-enabled", instrument(skip_all, name="precache::scripthashes_from_file"))]
+#[cfg_attr(feature = "tracing", instrument(skip_all, name="precache::scripthashes_from_file"))]
 pub fn scripthashes_from_file(path: String) -> Result<Vec<FullHash>> {
     let reader =
         io::BufReader::new(File::open(path).chain_err(|| "cannot open precache scripthash file")?);

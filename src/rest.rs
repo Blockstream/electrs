@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 use std::fs;
 use std::str::FromStr;
 
-#[cfg(feature = "tracing-enabled")]
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 #[cfg(feature = "liquid")]
@@ -582,7 +582,7 @@ impl Handle {
     }
 }
 
-#[cfg_attr(feature = "tracing-enabled", instrument(skip_all, name="rest::handle_request"))]
+#[cfg_attr(feature = "tracing", instrument(skip_all, name="rest::handle_request"))]
 fn handle_request(
     method: Method,
     uri: hyper::Uri,
@@ -1158,7 +1158,7 @@ fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Body>, Htt
         .unwrap())
 }
 
-#[cfg_attr(feature = "tracing-enabled", instrument(skip_all, name="rest::blocks"))]
+#[cfg_attr(feature = "tracing", instrument(skip_all, name="rest::blocks"))]
 fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Body>, HttpError> {
     let mut values = Vec::new();
     let mut current_hash = match start_height {
