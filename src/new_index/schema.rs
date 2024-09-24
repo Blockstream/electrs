@@ -2,10 +2,12 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::VarInt;
+use bitcoin_slices::SliceCache;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use hex::FromHex;
 use itertools::Itertools;
+use prometheus::IntCounter;
 use rayon::prelude::*;
 
 #[cfg(not(feature = "liquid"))]
@@ -17,9 +19,12 @@ use elements::{
     AssetId,
 };
 
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    sync::Mutex,
+};
 
 use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
@@ -198,6 +203,11 @@ pub struct ChainQuery {
     light_mode: bool,
     duration: HistogramVec,
     network: Network,
+
+    /// By default 1GB of cached transactions, `Txid -> Transaction`
+    txs_cache: Mutex<SliceCache<Txid>>,
+    cache_hit: IntCounter,
+    cache_miss: IntCounter,
 }
 
 // TODO: &[Block] should be an iterator / a queue.
@@ -360,6 +370,9 @@ impl ChainQuery {
                 HistogramOpts::new("query_duration", "Index query duration (in seconds)"),
                 &["name"],
             ),
+            txs_cache: Mutex::new(SliceCache::new(config.tx_cache_size << 20)),
+            cache_hit: metrics.counter(MetricOpts::new("tx_cache_hit", "Tx cache Hit")),
+            cache_miss: metrics.counter(MetricOpts::new("tx_cache_miss", "Tx cache Miss")),
         }
     }
 
@@ -838,7 +851,16 @@ impl ChainQuery {
     pub fn lookup_raw_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Bytes> {
         let _timer = self.start_timer("lookup_raw_txn");
 
-        if self.light_mode {
+        if let Ok(cache) = self.txs_cache.lock() {
+            if let Some(bytes) = cache.get(txid) {
+                self.cache_hit.inc();
+                return Some(bytes.to_vec());
+            } else {
+                self.cache_miss.inc();
+            }
+        }
+
+        let result = if self.light_mode {
             let queried_blockhash =
                 blockhash.map_or_else(|| self.tx_confirming_block(txid).map(|b| b.hash), |_| None);
             let blockhash = blockhash.or_else(|| queried_blockhash.as_ref())?;
@@ -848,9 +870,35 @@ impl ChainQuery {
                 .gettransaction_raw(txid, blockhash, false)
                 .ok()?;
             let txhex = txval.as_str().expect("valid tx from bitcoind");
-            Some(Bytes::from_hex(txhex).expect("valid tx from bitcoind"))
+            let vec = Bytes::from_hex(txhex).expect("valid tx from bitcoind");
+
+            Some(vec)
         } else {
             self.store.txstore_db.get(&TxRow::key(&txid[..]))
+        };
+        if let Some(result) = result.as_ref() {
+            self.add_txs_to_cache(&[(*txid, result)]);
+        }
+        result
+    }
+
+    pub fn txs_cache_miss(&self, txids: &[Txid]) -> Vec<Txid> {
+        let mut result = vec![];
+        if let Ok(cache) = self.txs_cache.lock() {
+            for txid in txids {
+                if !cache.contains(txid) {
+                    result.push(*txid);
+                }
+            }
+        }
+        result
+    }
+
+    pub fn add_txs_to_cache<T: AsRef<[u8]>>(&self, txs: &[(Txid, T)]) {
+        if let Ok(mut cache) = self.txs_cache.lock() {
+            for (txid, tx) in txs {
+                let _ = cache.insert(*txid, &tx.as_ref());
+            }
         }
     }
 

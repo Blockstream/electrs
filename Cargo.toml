@@ -57,6 +57,7 @@ tokio = { version = "1", features = ["sync", "macros"] }
 
 # optional dependencies for electrum-discovery
 electrum-client = { version = "0.8", optional = true }
+bitcoin_slices = { version = "0.8.0", features = ["slice_cache"] }
 
 
 [dev-dependencies]

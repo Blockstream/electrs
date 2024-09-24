@@ -309,6 +309,18 @@ impl Mempool {
             txids.push(txid);
             self.txstore.insert(txid, tx);
         }
+
+        // Populate tx cache
+        let txid_misses = self.chain.txs_cache_miss(&txids);
+        let mut tx_misses = vec![];
+        for txid in txid_misses {
+            if let Some(tx) = self.txstore.get(&txid) {
+                let bytes = serialize(tx);
+                tx_misses.push((txid, bytes));
+            }
+        }
+        self.chain.add_txs_to_cache(&tx_misses);
+
         // Phase 2: index history and spend edges (can fail if some txos cannot be found)
         let txos = match self.lookup_txos(self.get_prevouts(&txids)) {
             Ok(txos) => txos,
