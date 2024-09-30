@@ -20,7 +20,7 @@ use electrs::{
     signal::Waiter,
 };
 
-#[cfg(feature = "tracing")]
+#[cfg(feature = "otlp-tracing")]
 use electrs::otlp_trace;
 
 #[cfg(feature = "liquid")]
@@ -150,10 +150,10 @@ fn run_server(config: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "tracing", tokio::main)]
-#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+#[cfg_attr(feature = "otlp-tracing", tokio::main)]
+#[cfg_attr(not(feature = "otlp-tracing"), allow(dead_code))]
 async fn main_async() {
-    #[cfg(feature = "tracing")]
+    #[cfg(feature = "otlp-tracing")]
     let _tracing_guard = otlp_trace::init_tracing("electrs");
 
     let config = Arc::new(Config::from_args());
@@ -163,12 +163,12 @@ async fn main_async() {
     }
 }
 
-#[cfg(feature = "tracing")]
+#[cfg(feature = "otlp-tracing")]
 fn main() {
     main_async();
 }
 
-#[cfg(not(feature = "tracing"))]
+#[cfg(not(feature = "otlp-tracing"))]
 fn main() {
     let config = Arc::new(Config::from_args());
     if let Err(e) = run_server(config) {

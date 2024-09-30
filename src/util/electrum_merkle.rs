@@ -3,10 +3,10 @@ use crate::errors::*;
 use crate::new_index::ChainQuery;
 use bitcoin::hashes::{sha256d::Hash as Sha256dHash, Hash};
 
-#[cfg(feature = "tracing")]
+
 use tracing::instrument;
 
-#[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum_merkle::get_tx_merkleproof"))]
+#[instrument(skip_all, name="electrum_merkle::get_tx_merkleproof")]
 pub fn get_tx_merkle_proof(
     chain: &ChainQuery,
     tx_hash: &Txid,
@@ -25,7 +25,7 @@ pub fn get_tx_merkle_proof(
     Ok((branch, pos))
 }
 
-#[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum_merkle::get_header_merkle_proof"))]
+#[instrument(skip_all, name="electrum_merkle::get_header_merkle_proof")]
 pub fn get_header_merkle_proof(
     chain: &ChainQuery,
     height: usize,
@@ -54,7 +54,7 @@ pub fn get_header_merkle_proof(
     let header_hashes = header_hashes.into_iter().map(Sha256dHash::from).collect();
     Ok(create_merkle_branch_and_root(header_hashes, height))
 }
-#[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum_merkle::get_id_from_pos"))]
+#[instrument(skip_all, name="electrum_merkle::get_id_from_pos")]
 pub fn get_id_from_pos(
     chain: &ChainQuery,
     height: usize,

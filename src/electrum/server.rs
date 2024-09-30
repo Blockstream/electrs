@@ -13,7 +13,7 @@ use error_chain::ChainedError;
 use hex::{self, DisplayHex};
 use serde_json::{from_str, Value};
 
-#[cfg(feature = "tracing")]
+
 use tracing::instrument;
 
 #[cfg(not(feature = "liquid"))]
@@ -72,7 +72,7 @@ fn bool_from_value_or(val: Option<&Value>, name: &str, default: bool) -> Result<
 }
 
 // TODO: implement caching and delta updates
-#[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::get_status_hash"))]
+#[instrument(skip_all, name="electrum::server::get_status_hash")]
 fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<FullHash> {
     if txs.is_empty() {
         None
@@ -207,7 +207,7 @@ impl Connection {
         Ok(json!(&self.query.mempool().backlog_stats().fee_histogram))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_block_header"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_block_header")]
     fn blockchain_block_header(&self, params: &[Value]) -> Result<Value> {
         let height = usize_from_value(params.get(0), "height")?;
         let cp_height = usize_from_value_or(params.get(1), "cp_height", 0)?;
@@ -231,7 +231,7 @@ impl Connection {
         }))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::serer::blockchain_block_headers"))]
+    #[instrument(skip_all, name="electrum::serer::blockchain_block_headers")]
     fn blockchain_block_headers(&self, params: &[Value]) -> Result<Value> {
         let start_height = usize_from_value(params.get(0), "start_height")?;
         let count = MAX_HEADERS.min(usize_from_value(params.get(1), "count")?);
@@ -267,7 +267,7 @@ impl Connection {
         }))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_estimatefee"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_estimatefee")]
     fn blockchain_estimatefee(&self, params: &[Value]) -> Result<Value> {
         let conf_target = usize_from_value(params.get(0), "blocks_count")?;
         let fee_rate = self
@@ -278,14 +278,14 @@ impl Connection {
         Ok(json!(fee_rate / 100_000f64))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_relayfee"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_relayfee")]
     fn blockchain_relayfee(&self) -> Result<Value> {
         let relayfee = self.query.get_relayfee()?;
         // convert from sat/b to BTC/kB, as expected by Electrum clients
         Ok(json!(relayfee / 100_000f64))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_scripthash_subscribe"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_scripthash_subscribe")]
     fn blockchain_scripthash_subscribe(&mut self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
 
@@ -300,7 +300,7 @@ impl Connection {
     }
 
     #[cfg(not(feature = "liquid"))]
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_scripthash_get_balance"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_scripthash_get_balance")]
     fn blockchain_scripthash_get_balance(&self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
         let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..]);
@@ -311,7 +311,7 @@ impl Connection {
         }))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_scripthash_get_history"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_scripthash_get_history")]
     fn blockchain_scripthash_get_history(&self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
         let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
@@ -330,7 +330,7 @@ impl Connection {
             .collect::<Vec<_>>()))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_scripthash_listunspent"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_scripthash_listunspent")]
     fn blockchain_scripthash_listunspent(&self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
         let utxos = self.query.utxo(&script_hash[..])?;
@@ -359,7 +359,7 @@ impl Connection {
         )))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_transaction_broadcast"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_transaction_broadcast")]
     fn blockchain_transaction_broadcast(&self, params: &[Value]) -> Result<Value> {
         let tx = params.get(0).chain_err(|| "missing tx")?;
         let tx = tx.as_str().chain_err(|| "non-string tx")?.to_string();
@@ -370,7 +370,7 @@ impl Connection {
         Ok(json!(txid))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_transaction_get"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_transaction_get")]
     fn blockchain_transaction_get(&self, params: &[Value]) -> Result<Value> {
         let tx_hash = Txid::from(hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?);
         let verbose = match params.get(1) {
@@ -390,7 +390,7 @@ impl Connection {
         Ok(json!(rawtx.to_lower_hex_string()))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_transaction_get_merkle"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_transaction_get_merkle")]
     fn blockchain_transaction_get_merkle(&self, params: &[Value]) -> Result<Value> {
         let txid = Txid::from(hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?);
         let height = usize_from_value(params.get(1), "height")?;
@@ -411,7 +411,7 @@ impl Connection {
         }))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all, name="electrum::server::blockchain_transaction_id_from_pos"))]
+    #[instrument(skip_all, name="electrum::server::blockchain_transaction_id_from_pos")]
     fn blockchain_transaction_id_from_pos(&self, params: &[Value]) -> Result<Value> {
         let height = usize_from_value(params.get(0), "height")?;
         let tx_pos = usize_from_value(params.get(1), "tx_pos")?;
@@ -429,7 +429,7 @@ impl Connection {
         }))
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip(self, params, id), name="electrum::server::handle_command"))]
+    #[instrument(skip(self, params, id), name="electrum::server::handle_command")]
     fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
         let timer = self
             .stats
@@ -484,7 +484,7 @@ impl Connection {
         })
     }
 
-    #[cfg_attr(feature = "tracing",  instrument(skip_all, name="electrum::server::update_subscriptions"))]
+    #[instrument(skip_all, name="electrum::server::update_subscriptions")]
     fn update_subscriptions(&mut self) -> Result<Vec<Value>> {
         let timer = self
             .stats
@@ -542,7 +542,7 @@ impl Connection {
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracing",  instrument(skip_all, name="electrum::server::handle_replies"))]
+    #[instrument(skip_all, name="electrum::server::handle_replies")]
     fn handle_replies(&mut self, receiver: Receiver<Message>) -> Result<()> {
         let empty_params = json!([]);
         loop {
@@ -608,7 +608,7 @@ impl Connection {
     }
 
 
-    #[cfg_attr(feature = "tracing",  instrument(skip_all, name="electrum::server::parse_requests"))]
+    #[instrument(skip_all, name="electrum::server::parse_requests")]
     fn parse_requests(mut reader: BufReader<TcpStream>, tx: &SyncSender<Message>) -> Result<()> {
         loop {
             let mut line = Vec::<u8>::new();
@@ -671,7 +671,7 @@ impl Connection {
     }
 }
 
-#[cfg_attr(feature = "tracing",  instrument(skip_all, name="electrum::server::get_history"))]
+#[instrument(skip_all, name="electrum::server::get_history")]
 fn get_history(
     query: &Query,
     scripthash: &[u8],
