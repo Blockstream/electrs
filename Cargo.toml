@@ -17,7 +17,6 @@ liquid = [ "elements" ]
 electrum-discovery = [ "electrum-client"]
 default = ["no-otlp-tracing"]
 otlp-tracing = [
-    "tracing",
     "tracing/max_level_trace",
     "tracing-subscriber",
     "opentelemetry",
@@ -26,7 +25,6 @@ otlp-tracing = [
     "opentelemetry-semantic-conventions"
 ]
 no-otlp-tracing = [
-    "tracing",
     "tracing/max_level_off"
 ]
 bench = []
