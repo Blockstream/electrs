@@ -255,11 +255,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: start_index
-          in: query
-          required: false
-          schema:
-            type: integer
       responses:
         '200':
           description: Transactions for a given block
@@ -561,24 +556,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TxStatus'
-  /tx/{txid}/hex:
-    get:
-      tags:
-        - tx
-      summary: Returns the raw transaction data in hexadecimal
-      parameters:
-        - name: txid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Raw transaction data
-          content:
-            application/octet-stream:
-              schema:
-                type: string
   /tx/{txid}/raw:
     get:
       tags:
@@ -764,7 +741,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/MempoolTx'
+                  $ref: '#/components/schemas/MempoolTransaction'
   /fee-estimates:
     get:
       summary: Returns an JSON object with key value pairs of Blocks to Fees for confirmation.
@@ -821,6 +798,7 @@ components:
           type: integer
         next_best: 
           type: string
+          nullable: true
     Transaction:
       type: object
       properties:
@@ -898,14 +876,12 @@ components:
     ScriptHash:
       type: object
       properties:
-        address: 
+        scripthash: 
           type: string
         chain_stats:
           $ref: '#/components/schemas/ChainStats'
         mempool_stats:
           $ref: '#/components/schemas/MempoolStats'        
-        scripthash: 
-          type: string
     Address:
       type: object
       properties:
@@ -940,6 +916,17 @@ components:
         spent_txo_sum: 
           type: integer
         tx_count:
+          type: integer
+    MempoolTransaction:
+      type: object
+      properties:
+        txid:
+          type: string
+        fee:
+          type: integer
+        vsize:
+          type: integer
+        value:
           type: integer
     Utxo:
       type: object
@@ -989,14 +976,3 @@ components:
             type: array
             items: 
               type: number
-    MempoolTx:
-      type: object
-      properties: 
-        txid: 
-          type: string
-        fee:
-          type: integer
-        vsize: 
-          type: integer
-        value:  
-          type: integer
