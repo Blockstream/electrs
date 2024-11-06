@@ -6,3 +6,5 @@ target
 *.pyc
 result
 .direnv
+.vscode/
+openapitools.json
