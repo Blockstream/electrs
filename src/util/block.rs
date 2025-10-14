@@ -173,7 +173,7 @@ impl HeaderList {
     }
 
     #[trace]
-    pub fn apply(&mut self, new_headers: Vec<HeaderEntry>) {
+    pub fn apply(&mut self, new_headers: Vec<HeaderEntry>) -> Vec<HeaderEntry> {
         // new_headers[i] -> new_headers[i - 1] (i.e. new_headers.last() is the tip)
         for i in 1..new_headers.len() {
             assert_eq!(new_headers[i - 1].height() + 1, new_headers[i].height());
@@ -193,14 +193,14 @@ impl HeaderList {
                 assert_eq!(entry.header().prev_blockhash, expected_prev_blockhash);
                 height
             }
-            None => return,
+            None => return vec![],
         };
         debug!(
             "applying {} new headers from height {}",
             new_headers.len(),
             new_height
         );
-        let _removed = self.headers.split_off(new_height); // keep [0..new_height) entries
+        let orphaned = self.headers.split_off(new_height); // Keep [0..new_height), return orphaned
         for new_header in new_headers {
             let height = new_header.height();
             assert_eq!(height, self.headers.len());
@@ -208,6 +208,7 @@ impl HeaderList {
             self.headers.push(new_header);
             self.heights.insert(self.tip, height);
         }
+        orphaned
     }
 
     #[trace]

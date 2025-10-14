@@ -206,6 +206,13 @@ impl DB {
         self.db.put_opt(key, value, &opts).unwrap();
     }
 
+    pub fn write_batch(&self, batch: rocksdb::WriteBatch) {
+        let mut opts = rocksdb::WriteOptions::new();
+        opts.set_sync(true);
+        opts.disable_wal(false);
+        self.db.write_opt(batch, &opts).unwrap();
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         self.db.get(key).unwrap().map(|v| v.to_vec())
     }
