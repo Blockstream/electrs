@@ -117,6 +117,8 @@ impl TestRunner {
             asset_db_path: None, // XXX
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
+            #[cfg(feature = "liquid")]
+            initial_issuance_prevtx: None,
             db_block_cache_mb: 8,
             db_parallelism: 2,
             db_write_buffer_size_mb: 256,
