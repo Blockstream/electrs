@@ -217,8 +217,8 @@ fn test_rest() -> Result<()> {
         .send("[]")?;
     assert_eq!(empty_package_resp.status(), 400);
 
-    // bitcoin 28.0 only tests - submitpackage
-    #[cfg(all(not(feature = "liquid"), feature = "bitcoind_28_0"))]
+    // submitpackage tests (non-Elements only)
+    #[cfg(not(feature = "liquid"))]
     {
         // Test with a real transaction package - create parent-child transactions
         // submitpackage requires between 2 and 25 transactions with proper dependencies
