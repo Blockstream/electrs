@@ -1,6 +1,8 @@
-use bitcoind::bitcoincore_rpc::RpcApi;
 use serde_json::Value;
 use std::collections::HashSet;
+
+#[cfg(feature = "liquid")]
+use elementsd::bitcoincore_rpc::RpcApi;
 
 use electrs::chain::Txid;
 
@@ -91,7 +93,7 @@ fn test_rest() -> Result<()> {
     assert_eq!(found[0].as_str(), Some(addr1.to_string().as_str()));
 
     // Test GET /blocks/tip/hash
-    let bestblockhash = tester.node_client().get_best_block_hash()?;
+    let bestblockhash = tester.get_best_block_hash()?;
     let res = get_plain("/blocks/tip/hash")?;
     assert_eq!(res, bestblockhash.to_string());
 
@@ -100,7 +102,7 @@ fn test_rest() -> Result<()> {
     assert_eq!(res, bestblockhash.to_string());
 
     // Test GET /blocks/tip/height
-    let bestblockheight = tester.node_client().get_block_count()?;
+    let bestblockheight = tester.get_block_count()?;
     let res = get_plain("/blocks/tip/height")?;
     assert_eq!(
         res.parse::<u64>().expect("tip block height as an int"),
@@ -134,10 +136,7 @@ fn test_rest() -> Result<()> {
 
     let res = get_json(&format!("/block/{}", blockhash))?;
     assert_eq!(res["id"].as_str(), Some(blockhash.to_string().as_str()));
-    assert_eq!(
-        res["height"].as_u64(),
-        Some(tester.node_client().get_block_count()?)
-    );
+    assert_eq!(res["height"].as_u64(), Some(tester.get_block_count()?));
     assert_eq!(res["tx_count"].as_u64(), Some(2));
 
     // Test GET /block/:hash/txs

@@ -11,15 +11,16 @@ use serde_json::json;
 use serde_json::Value;
 
 #[cfg(not(feature = "liquid"))]
-use bitcoind::{self as noded, BitcoinD as NodeD};
+use corepc_node::{self as noded, client::client_sync as nclient, Client, Node as NodeD};
 #[cfg(feature = "liquid")]
-use elementsd::{self as noded, ElementsD as NodeD};
+use elementsd::{self as noded, bitcoincore_rpc as nclient, ElementsD as NodeD};
 
-use noded::bitcoincore_rpc::{self, RpcApi};
+#[cfg(feature = "liquid")]
+use nclient::{Client, RpcApi};
 
 use electrs::{
     chain::{Address, BlockHash, Network, Txid},
-    config::Config,
+    config::{Config, RpcLogging},
     daemon::Daemon,
     electrum::RPC as ElectrumRPC,
     metrics::Metrics,
@@ -27,7 +28,6 @@ use electrs::{
     rest,
     signal::Waiter,
 };
-use electrs::config::RpcLogging;
 
 pub struct TestRunner {
     config: Arc<Config>,
@@ -144,7 +144,11 @@ impl TestRunner {
             &metrics,
         )?);
 
-        let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config, &metrics));
+        let store = Arc::new(Store::open(
+            &config.db_path.join("newindex"),
+            &config,
+            &metrics,
+        ));
 
         let fetch_from = if !env::var("JSONRPC_IMPORT").is_ok() && !cfg!(feature = "liquid") {
             // run the initial indexing from the blk files then switch to using the jsonrpc,
@@ -199,7 +203,7 @@ impl TestRunner {
         })
     }
 
-    pub fn node_client(&self) -> &bitcoincore_rpc::Client {
+    pub fn node_client(&self) -> &Client {
         #[cfg(not(feature = "liquid"))]
         return &self.node.client;
         #[cfg(feature = "liquid")]
@@ -274,6 +278,25 @@ impl TestRunner {
         let uc_addr = serde_json::from_value(info["unconfidential"].take())?;
         Ok((c_addr, uc_addr))
     }
+
+    // Utility functions to iron out some differences between `elementsd` which
+    // internally uses `bitcoincore-rpc` and `corepc-node` which uses `corerpc-client`
+
+    pub fn get_best_block_hash(&self) -> Result<BlockHash> {
+        let bestblockhash = self.node_client().get_best_block_hash()?;
+        #[cfg(not(feature = "liquid"))] // from corepc_types::GetBestBlockHash to bitcoin::BlockHash
+        let bestblockhash = bestblockhash.0.parse().unwrap();
+        #[cfg(feature = "liquid")] // from bitcoin::BlockHash to elements::BlockHash
+        let bestblockhash = BlockHash::from_raw_hash(bestblockhash.to_raw_hash());
+        Ok(bestblockhash)
+    }
+
+    pub fn get_block_count(&self) -> Result<u64> {
+        let blockcount = self.node_client().get_block_count()?;
+        #[cfg(not(feature = "liquid"))]
+        let blockcount = blockcount.0;
+        Ok(blockcount)
+    }
 }
 
 pub fn init_rest_tester() -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
@@ -298,23 +321,22 @@ pub fn init_electrum_tester() -> Result<(ElectrumRPC, net::SocketAddr, TestRunne
 }
 
 #[cfg(not(feature = "liquid"))]
-fn raw_new_address(
-    client: &bitcoincore_rpc::Client,
-) -> bitcoincore_rpc::Result<Address<bitcoin::address::NetworkChecked>> {
-    Ok(client.get_new_address(None, None)?.assume_checked())
+fn raw_new_address(client: &Client) -> nclient::Result<Address<bitcoin::address::NetworkChecked>> {
+    Ok(client
+        .get_new_address(None, None)?
+        .address()
+        .unwrap()
+        .assume_checked())
 }
 
 // Returns the confidential address
 #[cfg(feature = "liquid")]
-fn raw_new_address(client: &bitcoincore_rpc::Client) -> bitcoincore_rpc::Result<Address> {
+fn raw_new_address(client: &Client) -> nclient::Result<Address> {
     // Must use raw call() because get_new_address() returns a bitcoin::Address and not an elements::Address
     Ok(client.call::<Address>("getnewaddress", &[])?)
 }
 
-fn generate(
-    client: &bitcoincore_rpc::Client,
-    num_blocks: u32,
-) -> bitcoincore_rpc::Result<Vec<BlockHash>> {
+fn generate(client: &Client, num_blocks: u32) -> nclient::Result<Vec<BlockHash>> {
     let addr = raw_new_address(client)?;
     client.call(
         "generatetoaddress",
@@ -352,7 +374,7 @@ error_chain::error_chain! {
             display("Electrs error: {:?}", e)
         }
 
-        BitcoindRpc(e: bitcoind::bitcoincore_rpc::Error) {
+        BitcoindRpc(e: nclient::Error) {
             description("Bitcoind RPC error")
             display("Bitcoind RPC error: {:?}", e)
         }
@@ -382,8 +404,8 @@ impl From<electrs::errors::Error> for Error {
         Error::from(ErrorKind::Electrs(e))
     }
 }
-impl From<bitcoind::bitcoincore_rpc::Error> for Error {
-    fn from(e: bitcoind::bitcoincore_rpc::Error) -> Self {
+impl From<nclient::Error> for Error {
+    fn from(e: nclient::Error) -> Self {
         Error::from(ErrorKind::BitcoindRpc(e))
     }
 }

@@ -78,7 +78,7 @@ zmq = "0.10.0"
 electrs_macros = { path = "electrs_macros", default-features = false }
 
 [dev-dependencies]
-bitcoind = { version = "0.36", features = ["25_0"] }
+corepc-node = { version = "0.10", features = ["download", "25_2"] }
 elementsd = { version = "0.11", features = ["22_1_1"] }
 electrumd = { version = "0.1.0", features = ["4_5_4"] }
 ureq = { version = "3.1", default-features = false, features = ["json"] }

@@ -4,7 +4,6 @@ use std::net::TcpStream;
 
 use common::Result;
 
-use bitcoind::bitcoincore_rpc::RpcApi;
 use electrumd::jsonrpc::serde_json::json;
 use electrumd::ElectrumD;
 
@@ -12,6 +11,9 @@ use electrs::chain::Address;
 
 #[cfg(not(feature = "liquid"))]
 use bitcoin::address;
+
+#[cfg(feature = "liquid")]
+use elementsd::bitcoincore_rpc::RpcApi;
 
 /// Test the Electrum RPC server using an headless Electrum wallet
 /// This only runs on Bitcoin (non-Liquid) mode.
