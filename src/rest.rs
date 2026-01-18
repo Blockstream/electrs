@@ -17,13 +17,17 @@ use bitcoin::consensus::encode;
 
 use bitcoin::hashes::FromSliceError as HashError;
 use bitcoin::hex::{self, DisplayHex, FromHex, HexToBytesIter};
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Response, Server, StatusCode};
-use hyperlocal::UnixServerExt;
+use http_body_util::{BodyExt, Full};
+use hyper::server::conn::http1::Builder as ServerBuilder;
+use hyper::{body::Bytes, service::service_fn, Method, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use hyper_util::server::graceful::GracefulShutdown;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::oneshot;
 
-use std::fs;
+use std::pin::pin;
 use std::str::FromStr;
+use std::{fs, time};
 
 use electrs_macros::trace;
 
@@ -502,61 +506,80 @@ fn prepare_txs(
         .collect()
 }
 
+fn spawn_conn(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    query: Arc<Query>,
+    config: Arc<Config>,
+    graceful: &GracefulShutdown,
+) {
+    let io = TokioIo::new(stream);
+    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let query = Arc::clone(&query);
+        let config = Arc::clone(&config);
+
+        async move {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            let body = req.into_body().collect().await?.to_bytes();
+
+            let mut resp =
+                handle_request(method, uri, body, &query, &config).unwrap_or_else(|err| {
+                    warn!("{:?}", err);
+                    Response::builder()
+                        .status(err.0)
+                        .header("Content-Type", "text/plain")
+                        .body(Full::new(Bytes::from(err.1)))
+                        .unwrap()
+                });
+            if let Some(ref origins) = config.cors {
+                resp.headers_mut()
+                    .insert("Access-Control-Allow-Origin", origins.parse().unwrap());
+            }
+            Ok::<_, hyper::Error>(resp)
+        }
+    });
+
+    let conn = ServerBuilder::new().serve_connection(io, service);
+    let conn = graceful.watch(conn);
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!("connection error: {}", e);
+        }
+    });
+}
+
 #[tokio::main]
 async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receiver<()>) {
     let addr = &config.http_addr;
     let socket_file = &config.http_socket_file;
 
-    let config = Arc::clone(&config);
-    let query = Arc::clone(&query);
+    let graceful = GracefulShutdown::new();
+    let mut signal = pin!(async {
+        rx.await.ok();
+    });
 
-    let make_service_fn_inn = || {
-        let query = Arc::clone(&query);
-        let config = Arc::clone(&config);
-
-        async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                let query = Arc::clone(&query);
-                let config = Arc::clone(&config);
-
-                async move {
-                    let method = req.method().clone();
-                    let uri = req.uri().clone();
-                    let body = hyper::body::to_bytes(req.into_body()).await?;
-
-                    let mut resp = handle_request(method, uri, body, &query, &config)
-                        .unwrap_or_else(|err| {
-                            warn!("{:?}", err);
-                            Response::builder()
-                                .status(err.0)
-                                .header("Content-Type", "text/plain")
-                                .body(Body::from(err.1))
-                                .unwrap()
-                        });
-                    if let Some(ref origins) = config.cors {
-                        resp.headers_mut()
-                            .insert("Access-Control-Allow-Origin", origins.parse().unwrap());
-                    }
-                    Ok::<_, hyper::Error>(resp)
-                }
-            }))
-        }
-    };
-
-    let server = match socket_file {
+    match socket_file {
         None => {
-            info!("REST server running on {}", addr);
-
             let socket = create_socket(&addr);
             socket.listen(511).expect("setting backlog failed");
+            socket
+                .set_nonblocking(true)
+                .expect("set_nonblocking failed");
+            let listener =
+                TcpListener::from_std(socket.into()).expect("TcpListener::from_std failed");
+            info!("REST server running on {}", addr);
 
-            Server::from_tcp(socket.into())
-                .expect("Server::from_tcp failed")
-                .serve(make_service_fn(move |_| make_service_fn_inn()))
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _)) => spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful),
+                            Err(e) => warn!("accept error: {}", e),
+                        }
+                    }
+                    _ = &mut signal => break,
+                }
+            }
         }
         Some(path) => {
             if let Ok(meta) = fs::metadata(&path) {
@@ -566,20 +589,31 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
                 }
             }
 
+            let listener = UnixListener::bind(path).expect("UnixListener::bind failed");
             info!("REST server running on unix socket {}", path.display());
 
-            Server::bind_unix(path)
-                .expect("Server::bind_unix failed")
-                .serve(make_service_fn(move |_| make_service_fn_inn()))
-                .with_graceful_shutdown(async {
-                    rx.await.ok();
-                })
-                .await
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _)) => spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful),
+                            Err(e) => warn!("accept error: {}", e),
+                        }
+                    }
+                    _ = &mut signal => break,
+                }
+            }
         }
-    };
+    }
 
-    if let Err(e) = server {
-        eprintln!("server error: {}", e);
+    // Wait for all connections to shutdown gracefully
+    tokio::select! {
+        _ = graceful.shutdown() => {
+            debug!("all connections gracefully closed");
+        }
+        _ = tokio::time::sleep(time::Duration::from_secs(10)) => {
+            warn!("timed out waiting for connections to close");
+        }
     }
 }
 
@@ -610,10 +644,10 @@ impl Handle {
 fn handle_request(
     method: Method,
     uri: hyper::Uri,
-    body: hyper::body::Bytes,
+    body: Bytes,
     query: &Query,
     config: &Config,
-) -> Result<Response<Body>, HttpError> {
+) -> Result<Response<Full<Bytes>>, HttpError> {
     // TODO it looks hyper does not have routing and query parsing :(
     let path: Vec<&str> = uri.path().split('/').skip(1).collect();
     let query_params = match uri.query() {
@@ -701,7 +735,7 @@ fn handle_request(
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/octet-stream")
                 .header("Cache-Control", format!("public, max-age={:}", TTL_LONG))
-                .body(Body::from(raw))
+                .body(Full::new(Bytes::from(raw)))
                 .unwrap())
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txid"), Some(index), None) => {
@@ -920,8 +954,8 @@ fn handle_request(
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
 
             let (content_type, body) = match *out_type {
-                "raw" => ("application/octet-stream", Body::from(rawtx)),
-                "hex" => ("text/plain", Body::from(rawtx.to_lower_hex_string())),
+                "raw" => ("application/octet-stream", Bytes::from(rawtx)),
+                "hex" => ("text/plain", Bytes::from(rawtx.to_lower_hex_string())),
                 _ => unreachable!(),
             };
             let ttl = ttl_by_depth(query.get_tx_status(&hash).block_height, query);
@@ -930,7 +964,7 @@ fn handle_request(
                 .status(StatusCode::OK)
                 .header("Content-Type", content_type)
                 .header("Cache-Control", format!("public, max-age={:}", ttl))
-                .body(body)
+                .body(Full::new(body))
                 .unwrap())
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"status"), None, None) => {
@@ -1060,8 +1094,8 @@ fn handle_request(
                             HttpError::from(format!("Invalid transaction hex for item {}", index))
                         })?
                         .filter(|r| r.is_err())
-						.next()
-						.transpose()
+                        .next()
+                        .transpose()
                         .map_err(|_| {
                             HttpError::from(format!("Invalid transaction hex for item {}", index))
                         })
@@ -1114,7 +1148,7 @@ fn handle_request(
                 .header("Cache-Control", "no-store")
                 .header("Content-Type", "application/json")
                 .header("X-Total-Results", total_num.to_string())
-                .body(Body::from(serde_json::to_string(&assets)?))
+                .body(Full::new(Bytes::from(serde_json::to_string(&assets)?)))
                 .unwrap())
         }
 
@@ -1216,29 +1250,33 @@ fn handle_request(
     }
 }
 
-fn http_message<T>(status: StatusCode, message: T, ttl: u32) -> Result<Response<Body>, HttpError>
+fn http_message<T>(
+    status: StatusCode,
+    message: T,
+    ttl: u32,
+) -> Result<Response<Full<Bytes>>, HttpError>
 where
-    T: Into<Body>,
+    T: Into<Bytes>,
 {
     Ok(Response::builder()
         .status(status)
         .header("Content-Type", "text/plain")
         .header("Cache-Control", format!("public, max-age={:}", ttl))
-        .body(message.into())
+        .body(Full::new(message.into()))
         .unwrap())
 }
 
-fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Body>, HttpError> {
+fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Full<Bytes>>, HttpError> {
     let value = serde_json::to_string(&value)?;
     Ok(Response::builder()
         .header("Content-Type", "application/json")
         .header("Cache-Control", format!("public, max-age={:}", ttl))
-        .body(Body::from(value))
+        .body(Full::new(Bytes::from(value)))
         .unwrap())
 }
 
 #[trace]
-fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Body>, HttpError> {
+fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Full<Bytes>>, HttpError> {
     let mut values = Vec::new();
     let mut current_hash = match start_height {
         Some(height) => *query
