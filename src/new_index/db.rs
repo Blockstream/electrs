@@ -135,11 +135,11 @@ impl DB {
         self.db.set_options(&opts).unwrap();
     }
 
-    pub fn raw_iterator(&self) -> rocksdb::DBRawIterator {
+    pub fn raw_iterator(&self) -> rocksdb::DBRawIterator<'_> {
         self.db.raw_iterator()
     }
 
-    pub fn iter_scan(&self, prefix: &[u8]) -> ScanIterator {
+    pub fn iter_scan(&self, prefix: &[u8]) -> ScanIterator<'_> {
         ScanIterator {
             prefix: prefix.to_vec(),
             iter: self.db.prefix_iterator(prefix),
@@ -147,7 +147,7 @@ impl DB {
         }
     }
 
-    pub fn iter_scan_from(&self, prefix: &[u8], start_at: &[u8]) -> ScanIterator {
+    pub fn iter_scan_from(&self, prefix: &[u8], start_at: &[u8]) -> ScanIterator<'_> {
         let iter = self.db.iterator(rocksdb::IteratorMode::From(
             start_at,
             rocksdb::Direction::Forward,
@@ -159,7 +159,7 @@ impl DB {
         }
     }
 
-    pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator {
+    pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator<'_> {
         let mut iter = self.db.raw_iterator();
         iter.seek_for_prev(prefix_max);
 

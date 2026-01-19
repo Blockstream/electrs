@@ -40,7 +40,7 @@ impl AssetRegistry {
         start_index: usize,
         limit: usize,
         sorting: AssetSorting,
-    ) -> (usize, Vec<AssetEntry>) {
+    ) -> (usize, Vec<AssetEntry<'_>>) {
         let mut assets: Vec<AssetEntry> = self
             .assets_cache
             .iter()
