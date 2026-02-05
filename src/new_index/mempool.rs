@@ -35,6 +35,8 @@ pub struct Mempool {
     config: Arc<Config>,
     txstore: HashMap<Txid, Transaction>,
     feeinfo: HashMap<Txid, TxFeeInfo>,
+    // Map txid -> scripthashes touched, to prune efficiently on eviction.
+    tx_scripthashes: HashMap<Txid, Vec<FullHash>>,
     history: HashMap<FullHash, Vec<TxHistoryInfo>>, // ScriptHash -> {history_entries}
     edges: HashMap<OutPoint, (Txid, u32)>,          // OutPoint -> (spending_txid, spending_vin)
     recent: ArrayDeque<TxOverview, RECENT_TXS_SIZE, Wrapping>, // The N most recent txs to enter the mempool
@@ -71,6 +73,7 @@ impl Mempool {
             config,
             txstore: HashMap::new(),
             feeinfo: HashMap::new(),
+            tx_scripthashes: HashMap::new(),
             history: HashMap::new(),
             edges: HashMap::new(),
             recent: ArrayDeque::new(),
@@ -300,7 +303,8 @@ impl Mempool {
             .latency
             .with_label_values(&["update_backlog_stats"])
             .start_timer();
-        self.backlog_stats = (BacklogStats::new(&self.feeinfo), Instant::now());
+        let feeinfo: Vec<&TxFeeInfo> = self.feeinfo.values().collect();
+        self.backlog_stats = (BacklogStats::from_feeinfo_slice(&feeinfo), Instant::now());
     }
 
     #[trace]
@@ -354,6 +358,7 @@ impl Mempool {
 
             let prevouts = extract_tx_prevouts(&tx, &txos, false);
             let txid_bytes = full_hash(&txid[..]);
+            let mut tx_scripthashes = Vec::with_capacity(tx.input.len() + tx.output.len()); // best-effort capacity hint
 
             // Get feeinfo for caching and recent tx overview
             let feeinfo = TxFeeInfo::new(&tx, &prevouts, self.config.network_type);
@@ -410,11 +415,15 @@ impl Mempool {
 
             // Index funding/spending history entries and spend edges
             for (scripthash, entry) in funding.chain(spending) {
+                tx_scripthashes.push(scripthash);
                 self.history
                     .entry(scripthash)
                     .or_insert_with(Vec::new)
                     .push(entry);
             }
+            tx_scripthashes.sort_unstable();
+            tx_scripthashes.dedup();
+            self.tx_scripthashes.insert(txid, tx_scripthashes);
             for (i, txi) in tx.input.iter().enumerate() {
                 self.edges.insert(txi.previous_output, (txid, i as u32));
             }
@@ -469,21 +478,31 @@ impl Mempool {
         let _timer = self.latency.with_label_values(&["remove"]).start_timer();
 
         for txid in &to_remove {
-            self.txstore
+            let tx = self
+                .txstore
                 .remove(*txid)
                 .unwrap_or_else(|| panic!("missing mempool tx {}", txid));
 
-            self.feeinfo.remove(*txid).or_else(|| {
-                warn!("missing mempool tx feeinfo {}", txid);
-                None
+            self.feeinfo.remove(*txid).unwrap_or_else(|| {
+                panic!("missing mempool tx feeinfo {}", txid);
             });
-        }
 
-        // TODO: make it more efficient (currently it takes O(|mempool|) time)
-        self.history.retain(|_scripthash, entries| {
-            entries.retain(|entry| !to_remove.contains(&entry.get_txid()));
-            !entries.is_empty()
-        });
+            let scripthashes = self
+                .tx_scripthashes
+                .remove(*txid)
+                .unwrap_or_else(|| panic!("missing tx_scripthashes for {}", txid));
+            prune_history_entries(&mut self.history, &scripthashes, txid);
+
+            for txin in tx.input {
+                assert!(
+                    self.edges.remove(&txin.previous_output).is_some(),
+                    "missing mempool edge for outpoint {}:{} (tx {})",
+                    txin.previous_output.txid,
+                    txin.previous_output.vout,
+                    txid
+                );
+            }
+        }
 
         #[cfg(feature = "liquid")]
         asset::remove_mempool_tx_assets(
@@ -491,9 +510,6 @@ impl Mempool {
             &mut self.asset_history,
             &mut self.asset_issuance,
         );
-
-        self.edges
-            .retain(|_outpoint, (txid, _vin)| !to_remove.contains(txid));
     }
 
     #[cfg(feature = "liquid")]
@@ -637,6 +653,32 @@ impl Mempool {
     }
 }
 
+fn prune_history_entries(
+    history: &mut HashMap<FullHash, Vec<TxHistoryInfo>>,
+    scripthashes: &[FullHash],
+    txid: &Txid,
+) {
+    for scripthash in scripthashes {
+        let entries = history
+            .get_mut(scripthash)
+            .unwrap_or_else(|| panic!("missing history bucket for {:?}", scripthash));
+
+        let before = entries.len();
+        entries.retain(|entry| entry.get_txid() != *txid);
+        let removed = before - entries.len();
+        assert!(
+            removed > 0,
+            "tx {} not found in history bucket {:?}",
+            txid,
+            scripthash
+        );
+
+        if entries.is_empty() {
+            history.remove(scripthash);
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct BacklogStats {
     pub count: u32,
@@ -656,10 +698,9 @@ impl BacklogStats {
     }
 
     #[trace]
-    fn new(feeinfo: &HashMap<Txid, TxFeeInfo>) -> Self {
-        let (count, vsize, total_fee) = feeinfo
-            .values()
-            .fold((0, 0, 0), |(count, vsize, fee), feeinfo| {
+    fn from_feeinfo_slice(fees: &[&TxFeeInfo]) -> Self {
+        let (count, vsize, total_fee) =
+            fees.iter().fold((0, 0, 0), |(count, vsize, fee), feeinfo| {
                 (count + 1, vsize + feeinfo.vsize, fee + feeinfo.fee)
             });
 
@@ -667,7 +708,7 @@ impl BacklogStats {
             count,
             vsize,
             total_fee,
-            fee_histogram: make_fee_histogram(feeinfo.values().collect()),
+            fee_histogram: make_fee_histogram(fees.iter().copied().collect()),
         }
     }
 }

@@ -33,7 +33,8 @@
 
           src = craneLib.cleanCargoSource ./.;
 
-          nativeBuildInputs = with pkgs; [ rustToolchain clang ]; # required only at build time
+          # Build-time deps; include libclang so rocksdb-sys/bindgen can find a shared libclang.
+          nativeBuildInputs = with pkgs; [ rustToolchain clang libclang ];
           buildInputs = with pkgs; [ ]; # also required at runtime
 
           envVars =
