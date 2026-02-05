@@ -5,6 +5,7 @@ use electrs_macros::trace;
 
 const VSIZE_BIN_WIDTH: u64 = 50_000; // in vbytes
 
+#[derive(Clone)]
 pub struct TxFeeInfo {
     pub fee: u64,           // in satoshis
     pub vsize: u64,         // in virtual bytes (= weight/4)
