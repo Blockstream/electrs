@@ -9,36 +9,51 @@ use electrumd::jsonrpc::serde_json::json;
 use electrumd::ElectrumD;
 
 use electrs::chain::Address;
+use electrs::electrum::RPC as ElectrumRPC;
 
 #[cfg(not(feature = "liquid"))]
 use bitcoin::address;
 
-/// Test the Electrum RPC server using an headless Electrum wallet
-/// This only runs on Bitcoin (non-Liquid) mode.
-#[cfg_attr(not(feature = "liquid"), test)]
-#[cfg_attr(feature = "liquid", allow(dead_code))]
-fn test_electrum() -> Result<()> {
-    // Spawn an Electrs Electrum RPC server
-    let (electrum_server, electrum_addr, mut tester) = common::init_electrum_tester().unwrap();
+struct WalletTester {
+    electrum_server: ElectrumRPC,
+    electrum_wallet: ElectrumD,
+    tester: common::TestRunner,
+}
 
-    // Spawn an headless Electrum wallet RPC daemon, connected to Electrs
-    let mut electrum_wallet_conf = electrumd::Conf::default();
-    let server_arg = format!("{}:t", electrum_addr.to_string());
-    electrum_wallet_conf.args = if std::env::var_os("RUST_LOG").is_some() {
-        vec!["-v", "--server", &server_arg]
-    } else {
-        vec!["--server", &server_arg]
-    };
-    electrum_wallet_conf.view_stdout = true;
-    let electrum_wallet = ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
+impl WalletTester {
+    fn new() -> Result<Self> {
+        let (electrum_server, electrum_addr, tester) = common::init_electrum_tester().unwrap();
 
-    let notify_wallet = || {
-        electrum_server.notify();
+        let mut electrum_wallet_conf = electrumd::Conf::default();
+        let server_arg = format!("{}:t", electrum_addr);
+        electrum_wallet_conf.args = if std::env::var_os("RUST_LOG").is_some() {
+            vec!["-v", "--server", &server_arg]
+        } else {
+            vec!["--server", &server_arg]
+        };
+        electrum_wallet_conf.view_stdout = true;
+        let electrum_wallet =
+            ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
+
+        log::info!(
+            "Electrum wallet version: {:?}",
+            electrum_wallet.call("version", &json!([]))?
+        );
+
+        Ok(WalletTester {
+            electrum_server,
+            electrum_wallet,
+            tester,
+        })
+    }
+
+    fn notify_wallet(&self) {
+        self.electrum_server.notify();
         std::thread::sleep(std::time::Duration::from_millis(200));
-    };
+    }
 
-    let assert_balance = |confirmed: f64, unconfirmed: f64| {
-        let balance = electrum_wallet.call("getbalance", &json!([])).unwrap();
+    fn assert_balance(&self, confirmed: f64, unconfirmed: f64) {
+        let balance = self.electrum_wallet.call("getbalance", &json!([])).unwrap();
         log::info!("balance: {}", balance);
 
         assert_eq!(
@@ -53,15 +68,16 @@ fn test_electrum() -> Result<()> {
         } else {
             assert!(balance["unconfirmed"].is_null())
         }
-    };
+    }
 
-    let newaddress = || -> Address {
+    fn newaddress(&self) -> Address {
         #[cfg(not(feature = "liquid"))]
         type ParseAddrType = Address<address::NetworkUnchecked>;
         #[cfg(feature = "liquid")]
         type ParseAddrType = Address;
 
-        let addr = electrum_wallet
+        let addr = self
+            .electrum_wallet
             .call("createnewaddress", &json!([]))
             .unwrap()
             .as_str()
@@ -73,37 +89,55 @@ fn test_electrum() -> Result<()> {
         let addr = addr.assume_checked();
 
         addr
-    };
+    }
+}
 
-    log::info!(
-        "Electrum wallet version: {:?}",
-        electrum_wallet.call("version", &json!([]))?
-    );
+/// Test balance tracking with confirmed and unconfirmed transactions
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_balance() -> Result<()> {
+    let mut wt = WalletTester::new()?;
 
-    // Send some funds and verify that the balance checks out
-    let addr1 = newaddress();
-    let addr2 = newaddress();
+    let addr1 = wt.newaddress();
+    let addr2 = wt.newaddress();
 
-    assert_balance(0.0, 0.0);
+    wt.assert_balance(0.0, 0.0);
 
-    let txid1 = tester.send(&addr1, "0.1 BTC".parse().unwrap())?;
-    notify_wallet();
-    assert_balance(0.0, 0.1);
+    wt.tester.send(&addr1, "0.1 BTC".parse().unwrap())?;
+    wt.notify_wallet();
+    wt.assert_balance(0.0, 0.1);
 
-    tester.mine()?;
-    notify_wallet();
-    assert_balance(0.1, 0.0);
+    wt.tester.mine()?;
+    wt.notify_wallet();
+    wt.assert_balance(0.1, 0.0);
 
-    let txid2 = tester.send(&addr2, "0.2 BTC".parse().unwrap())?;
-    notify_wallet();
-    assert_balance(0.1, 0.2);
+    wt.tester.send(&addr2, "0.2 BTC".parse().unwrap())?;
+    wt.notify_wallet();
+    wt.assert_balance(0.1, 0.2);
 
-    tester.mine()?;
-    notify_wallet();
-    assert_balance(0.3, 0.0);
+    wt.tester.mine()?;
+    wt.notify_wallet();
+    wt.assert_balance(0.3, 0.0);
 
-    // Verify that the transaction history checks out
-    let history = electrum_wallet.call("onchain_history", &json!([]))?;
+    Ok(())
+}
+
+/// Test transaction history via onchain_history
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_history() -> Result<()> {
+    let mut wt = WalletTester::new()?;
+
+    let addr1 = wt.newaddress();
+    let addr2 = wt.newaddress();
+
+    let txid1 = wt.tester.send(&addr1, "0.1 BTC".parse().unwrap())?;
+    wt.tester.mine()?;
+    let txid2 = wt.tester.send(&addr2, "0.2 BTC".parse().unwrap())?;
+    wt.tester.mine()?;
+    wt.notify_wallet();
+
+    let history = wt.electrum_wallet.call("onchain_history", &json!([]))?;
     log::debug!("history = {:#?}", history);
     assert_eq!(
         history["transactions"][0]["txid"].as_str(),
@@ -119,37 +153,47 @@ fn test_electrum() -> Result<()> {
     assert_eq!(history["transactions"][1]["height"].as_u64(), Some(103));
     assert_eq!(history["transactions"][1]["bc_value"].as_str(), Some("0.2"));
 
-    // Send an outgoing payment
-    electrum_wallet.call(
+    Ok(())
+}
+
+/// Test sending an outgoing payment
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_payment() -> Result<()> {
+    let mut wt = WalletTester::new()?;
+
+    let addr1 = wt.newaddress();
+    wt.tester.send(&addr1, "0.3 BTC".parse().unwrap())?;
+    wt.tester.mine()?;
+    wt.notify_wallet();
+    wt.assert_balance(0.3, 0.0);
+
+    wt.electrum_wallet.call(
         "broadcast",
-        &json!([electrum_wallet.call(
+        &json!([wt.electrum_wallet.call(
             "payto",
             &json!({
-                "destination": tester.node_client().get_new_address(None, None)?,
+                "destination": wt.tester.node_client().get_new_address(None, None)?,
                 "amount": 0.16,
                 "fee": 0.001,
             }),
         )?]),
     )?;
-    notify_wallet();
-    assert_balance(0.139, 0.0);
+    wt.notify_wallet();
+    wt.assert_balance(0.139, 0.0);
 
-    tester.mine()?;
-    notify_wallet();
-    assert_balance(0.139, 0.0);
+    wt.tester.mine()?;
+    wt.notify_wallet();
+    wt.assert_balance(0.139, 0.0);
 
     Ok(())
 }
 
 /// Test the Electrum RPC server using a raw TCP socket
-/// This only runs on Bitcoin (non-Liquid) mode.
 #[cfg_attr(not(feature = "liquid"), test)]
 #[cfg_attr(feature = "liquid", allow(dead_code))]
-#[ignore = "must be launched singularly, otherwise conflict with the other server"]
 fn test_electrum_raw() {
-    // Spawn an Electrs Electrum RPC server
     let (_electrum_server, electrum_addr, mut _tester) = common::init_electrum_tester().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1000));
 
     let mut stream = TcpStream::connect(electrum_addr).unwrap();
     let write = "{\"jsonrpc\": \"2.0\", \"method\": \"server.version\", \"id\": 0}";
