@@ -73,7 +73,8 @@ fn header_from_value(value: Value) -> Result<BlockHeader> {
 fn block_from_value(value: Value) -> Result<Block> {
     let block_hex = value.as_str().chain_err(|| "non-string block")?;
     let block_bytes = Vec::from_hex(block_hex).chain_err(|| "non-hex block")?;
-    Ok(deserialize(&block_bytes).chain_err(|| format!("failed to parse block {}", block_hex))?)
+    Ok(crate::chain::deserialize_block(&block_bytes)
+        .chain_err(|| format!("failed to parse block {}", block_hex))?)
 }
 
 fn tx_from_value(value: Value) -> Result<Transaction> {

@@ -24,12 +24,18 @@ impl ScriptToAsm for elements::Script {}
 pub trait ScriptToAddr {
     fn to_address_str(&self, network: Network) -> Option<String>;
 }
-#[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+#[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
 impl ScriptToAddr for bitcoin::Script {
     fn to_address_str(&self, network: Network) -> Option<String> {
         bitcoin::Address::from_script(self, bitcoin::Network::from(network))
             .map(|s| s.to_string())
             .ok()
+    }
+}
+#[cfg(feature = "dogecoin")]
+impl ScriptToAddr for bitcoin::Script {
+    fn to_address_str(&self, network: Network) -> Option<String> {
+        crate::util::dogecoin::script_to_dogecoin_address(self, network)
     }
 }
 #[cfg(feature = "litecoin")]

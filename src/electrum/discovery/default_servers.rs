@@ -3,7 +3,7 @@ use crate::electrum::discovery::{DiscoveryManager, Service};
 
 pub fn add_default_servers(discovery: &DiscoveryManager, network: Network) {
     match network {
-        #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+        #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
         Network::Bitcoin => {
             discovery
                 .add_default_server(
@@ -402,7 +402,7 @@ pub fn add_default_servers(discovery: &DiscoveryManager, network: Network) {
                 )
                 .ok();
         }
-        #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+        #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
         Network::Testnet => {
             discovery
                 .add_default_server(
@@ -462,6 +462,12 @@ pub fn add_default_servers(discovery: &DiscoveryManager, network: Network) {
                     vec![Service::Tcp(50001), Service::Ssl(50002)],
                 )
                 .ok();
+        }
+
+        #[cfg(feature = "dogecoin")]
+        Network::Dogecoin => {
+            // Dogecoin Electrum servers are relatively scarce;
+            // add known public servers as they become available.
         }
 
         _ => (),

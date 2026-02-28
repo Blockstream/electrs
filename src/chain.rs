@@ -1,4 +1,4 @@
-#[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+#[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
 // use regular Bitcoin data structures
 pub use bitcoin::{
     address, blockdata::block::Header as BlockHeader, blockdata::script, consensus::deserialize,
@@ -8,6 +8,14 @@ pub use bitcoin::{
 
 // Litecoin uses the same Bitcoin data structures (same serialization format)
 #[cfg(feature = "litecoin")]
+pub use bitcoin::{
+    address, blockdata::block::Header as BlockHeader, blockdata::script, consensus::deserialize,
+    hash_types::TxMerkleNode, Address, Block, BlockHash, OutPoint, ScriptBuf as Script, Sequence,
+    Transaction, TxIn, TxOut, Txid,
+};
+
+// Dogecoin uses the same Bitcoin data structures, but blocks need AuxPoW-aware deserialization
+#[cfg(feature = "dogecoin")]
 pub use bitcoin::{
     address, blockdata::block::Header as BlockHeader, blockdata::script, consensus::deserialize,
     hash_types::TxMerkleNode, Address, Block, BlockHash, OutPoint, ScriptBuf as Script, Sequence,
@@ -33,15 +41,15 @@ pub use confidential::Value;
 
 #[derive(Debug, Copy, Clone, PartialEq, Hash, Serialize, Ord, PartialOrd, Eq)]
 pub enum Network {
-    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
     Bitcoin,
-    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
     Testnet,
-    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
     Testnet4,
-    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
     Regtest,
-    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
     Signet,
 
     #[cfg(feature = "liquid")]
@@ -57,10 +65,17 @@ pub enum Network {
     LitecoinTestnet,
     #[cfg(feature = "litecoin")]
     LitecoinRegtest,
+
+    #[cfg(feature = "dogecoin")]
+    Dogecoin,
+    #[cfg(feature = "dogecoin")]
+    DogecoinTestnet,
+    #[cfg(feature = "dogecoin")]
+    DogecoinRegtest,
 }
 
 impl Network {
-    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
     pub fn magic(self) -> u32 {
         u32::from_le_bytes(BNetwork::from(self).magic().to_bytes())
     }
@@ -82,14 +97,25 @@ impl Network {
         }
     }
 
+    #[cfg(feature = "dogecoin")]
+    pub fn magic(self) -> u32 {
+        match self {
+            Network::Dogecoin => 0xC0C0_C0C0,
+            Network::DogecoinTestnet => 0xFCC1_B7DC,
+            Network::DogecoinRegtest => 0xDAB5_BFFA,
+        }
+    }
+
     pub fn is_regtest(self) -> bool {
         match self {
-            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
             Network::Regtest => true,
             #[cfg(feature = "liquid")]
             Network::LiquidRegtest => true,
             #[cfg(feature = "litecoin")]
             Network::LitecoinRegtest => true,
+            #[cfg(feature = "dogecoin")]
+            Network::DogecoinRegtest => true,
             _ => false,
         }
     }
@@ -132,7 +158,7 @@ impl Network {
     }
 
     pub fn names() -> Vec<String> {
-        #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+        #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
         return vec![
             "mainnet".to_string(),
             "testnet".to_string(),
@@ -154,16 +180,25 @@ impl Network {
             "litecointestnet".to_string(),
             "litecoinregtest".to_string(),
         ];
+
+        #[cfg(feature = "dogecoin")]
+        return vec![
+            "dogecoin".to_string(),
+            "dogecointestnet".to_string(),
+            "dogecoinregtest".to_string(),
+        ];
     }
 }
 
 pub fn genesis_hash(network: Network) -> BlockHash {
-    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
     return bitcoin_genesis_hash(network.into());
     #[cfg(feature = "liquid")]
     return liquid_genesis_hash(network);
     #[cfg(feature = "litecoin")]
     return litecoin_genesis_hash(network);
+    #[cfg(feature = "dogecoin")]
+    return dogecoin_genesis_hash(network);
 }
 
 pub fn bitcoin_genesis_hash(network: BNetwork) -> bitcoin::BlockHash {
@@ -232,18 +267,60 @@ pub fn litecoin_genesis_hash(network: Network) -> BlockHash {
     }
 }
 
+#[cfg(feature = "dogecoin")]
+pub fn dogecoin_genesis_hash(network: Network) -> BlockHash {
+    lazy_static! {
+        static ref DOGECOIN_GENESIS: BlockHash =
+            "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691"
+                .parse()
+                .unwrap();
+        static ref DOGECOIN_TESTNET_GENESIS: BlockHash =
+            "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e"
+                .parse()
+                .unwrap();
+        static ref DOGECOIN_REGTEST_GENESIS: BlockHash =
+            "3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5"
+                .parse()
+                .unwrap();
+    }
+
+    match network {
+        Network::Dogecoin => *DOGECOIN_GENESIS,
+        Network::DogecoinTestnet => *DOGECOIN_TESTNET_GENESIS,
+        Network::DogecoinRegtest => *DOGECOIN_REGTEST_GENESIS,
+    }
+}
+
+/// Deserialize a block from raw bytes, handling network-specific block formats.
+/// For Dogecoin, this skips AuxPoW data. For all other networks, this is a
+/// straightforward call to the standard deserialize function.
+#[cfg(not(any(feature = "liquid", feature = "dogecoin")))]
+pub fn deserialize_block(data: &[u8]) -> Result<Block, bitcoin::consensus::encode::Error> {
+    bitcoin::consensus::deserialize(data)
+}
+
+#[cfg(feature = "liquid")]
+pub fn deserialize_block(data: &[u8]) -> Result<Block, elements::encode::Error> {
+    elements::encode::deserialize(data)
+}
+
+#[cfg(feature = "dogecoin")]
+pub fn deserialize_block(data: &[u8]) -> Result<Block, bitcoin::consensus::encode::Error> {
+    crate::util::dogecoin::deserialize_dogecoin_block(data)
+}
+
 impl From<&str> for Network {
     fn from(network_name: &str) -> Self {
         match network_name {
-            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
             "mainnet" => Network::Bitcoin,
-            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
             "testnet" => Network::Testnet,
-            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
             "testnet4" => Network::Testnet4,
-            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
             "regtest" => Network::Regtest,
-            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
             "signet" => Network::Signet,
 
             #[cfg(feature = "liquid")]
@@ -260,12 +337,19 @@ impl From<&str> for Network {
             #[cfg(feature = "litecoin")]
             "litecoinregtest" => Network::LitecoinRegtest,
 
+            #[cfg(feature = "dogecoin")]
+            "dogecoin" => Network::Dogecoin,
+            #[cfg(feature = "dogecoin")]
+            "dogecointestnet" => Network::DogecoinTestnet,
+            #[cfg(feature = "dogecoin")]
+            "dogecoinregtest" => Network::DogecoinRegtest,
+
             _ => panic!("unsupported network: {:?}", network_name),
         }
     }
 }
 
-#[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+#[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
 impl From<Network> for BNetwork {
     fn from(network: Network) -> Self {
         match network {
@@ -278,7 +362,7 @@ impl From<Network> for BNetwork {
     }
 }
 
-#[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+#[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
 impl From<BNetwork> for Network {
     fn from(network: BNetwork) -> Self {
         match network {

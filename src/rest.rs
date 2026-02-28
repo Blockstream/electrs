@@ -1274,7 +1274,7 @@ fn to_scripthash(
 }
 
 fn address_to_scripthash(addr: &str, network: Network) -> Result<FullHash, HttpError> {
-    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin", feature = "dogecoin")))]
     {
         let addr = address::Address::from_str(addr)?;
         let is_expected_net = addr.is_valid_for_network(network.into());
@@ -1299,6 +1299,14 @@ fn address_to_scripthash(addr: &str, network: Network) -> Result<FullHash, HttpE
     {
         let script_bytes = crate::util::litecoin_addr::parse_litecoin_address(addr, network)
             .ok_or_else(|| HttpError::from("Invalid Litecoin address".to_string()))?;
+        let script = Script::from(script_bytes);
+        Ok(compute_script_hash(&script))
+    }
+
+    #[cfg(feature = "dogecoin")]
+    {
+        let script_bytes = crate::util::dogecoin::parse_dogecoin_address(addr, network)
+            .ok_or_else(|| HttpError::from("Invalid Dogecoin address".to_string()))?;
         let script = Script::from(script_bytes);
         Ok(compute_script_hash(&script))
     }

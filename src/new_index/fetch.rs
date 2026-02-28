@@ -3,9 +3,9 @@ use rayon::prelude::*;
 #[cfg(feature = "liquid")]
 use crate::elements::ebcompact::*;
 #[cfg(not(feature = "liquid"))]
-use bitcoin::consensus::encode::{deserialize, Decodable};
+use bitcoin::consensus::encode::Decodable;
 #[cfg(feature = "liquid")]
-use elements::encode::{deserialize, Decodable};
+use elements::encode::Decodable;
 
 use std::collections::HashMap;
 use std::fs;
@@ -284,7 +284,12 @@ fn parse_blocks(blob: Vec<u8>, magic: u32) -> Result<Vec<SizedBlock>> {
     Ok(pool.install(|| {
         slices
             .into_par_iter()
-            .map(|(slice, size)| (deserialize(slice).expect("failed to parse Block"), size))
+            .map(|(slice, size)| {
+                (
+                    crate::chain::deserialize_block(slice).expect("failed to parse Block"),
+                    size,
+                )
+            })
             .collect()
     }))
 }
