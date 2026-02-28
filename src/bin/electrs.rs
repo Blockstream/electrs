@@ -4,13 +4,8 @@ extern crate log;
 
 extern crate electrs;
 
-use crossbeam_channel::{self as channel};
-use error_chain::ChainedError;
-use std::{env, process, thread};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use bitcoin::hex::DisplayHex;
-use rand::{rng, RngCore};
+use crossbeam_channel::{self as channel};
 use electrs::{
     config::Config,
     daemon::Daemon,
@@ -21,6 +16,11 @@ use electrs::{
     rest,
     signal::Waiter,
 };
+use error_chain::ChainedError;
+use rand::{rng, RngCore};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use std::{env, process, thread};
 
 #[cfg(feature = "otlp-tracing")]
 use electrs::otlp_trace;

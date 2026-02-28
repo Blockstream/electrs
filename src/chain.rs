@@ -1,4 +1,13 @@
-#[cfg(not(feature = "liquid"))] // use regular Bitcoin data structures
+#[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+// use regular Bitcoin data structures
+pub use bitcoin::{
+    address, blockdata::block::Header as BlockHeader, blockdata::script, consensus::deserialize,
+    hash_types::TxMerkleNode, Address, Block, BlockHash, OutPoint, ScriptBuf as Script, Sequence,
+    Transaction, TxIn, TxOut, Txid,
+};
+
+// Litecoin uses the same Bitcoin data structures (same serialization format)
+#[cfg(feature = "litecoin")]
 pub use bitcoin::{
     address, blockdata::block::Header as BlockHeader, blockdata::script, consensus::deserialize,
     hash_types::TxMerkleNode, Address, Block, BlockHash, OutPoint, ScriptBuf as Script, Sequence,
@@ -24,15 +33,15 @@ pub use confidential::Value;
 
 #[derive(Debug, Copy, Clone, PartialEq, Hash, Serialize, Ord, PartialOrd, Eq)]
 pub enum Network {
-    #[cfg(not(feature = "liquid"))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
     Bitcoin,
-    #[cfg(not(feature = "liquid"))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
     Testnet,
-    #[cfg(not(feature = "liquid"))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
     Testnet4,
-    #[cfg(not(feature = "liquid"))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
     Regtest,
-    #[cfg(not(feature = "liquid"))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
     Signet,
 
     #[cfg(feature = "liquid")]
@@ -41,10 +50,17 @@ pub enum Network {
     LiquidTestnet,
     #[cfg(feature = "liquid")]
     LiquidRegtest,
+
+    #[cfg(feature = "litecoin")]
+    Litecoin,
+    #[cfg(feature = "litecoin")]
+    LitecoinTestnet,
+    #[cfg(feature = "litecoin")]
+    LitecoinRegtest,
 }
 
 impl Network {
-    #[cfg(not(feature = "liquid"))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
     pub fn magic(self) -> u32 {
         u32::from_le_bytes(BNetwork::from(self).magic().to_bytes())
     }
@@ -57,12 +73,23 @@ impl Network {
         }
     }
 
+    #[cfg(feature = "litecoin")]
+    pub fn magic(self) -> u32 {
+        match self {
+            Network::Litecoin => 0xDBB6_C0FB,
+            Network::LitecoinTestnet => 0xFCC1_B7DC,
+            Network::LitecoinRegtest => 0xDAB5_BFFA,
+        }
+    }
+
     pub fn is_regtest(self) -> bool {
         match self {
-            #[cfg(not(feature = "liquid"))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
             Network::Regtest => true,
             #[cfg(feature = "liquid")]
             Network::LiquidRegtest => true,
+            #[cfg(feature = "litecoin")]
+            Network::LitecoinRegtest => true,
             _ => false,
         }
     }
@@ -94,8 +121,18 @@ impl Network {
         }
     }
 
+    /// Returns the bech32 human-readable part for this network
+    #[cfg(feature = "litecoin")]
+    pub fn bech32_hrp(self) -> &'static str {
+        match self {
+            Network::Litecoin => "ltc",
+            Network::LitecoinTestnet => "tltc",
+            Network::LitecoinRegtest => "rltc",
+        }
+    }
+
     pub fn names() -> Vec<String> {
-        #[cfg(not(feature = "liquid"))]
+        #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
         return vec![
             "mainnet".to_string(),
             "testnet".to_string(),
@@ -110,14 +147,23 @@ impl Network {
             "liquidtestnet".to_string(),
             "liquidregtest".to_string(),
         ];
+
+        #[cfg(feature = "litecoin")]
+        return vec![
+            "litecoin".to_string(),
+            "litecointestnet".to_string(),
+            "litecoinregtest".to_string(),
+        ];
     }
 }
 
 pub fn genesis_hash(network: Network) -> BlockHash {
-    #[cfg(not(feature = "liquid"))]
+    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
     return bitcoin_genesis_hash(network.into());
     #[cfg(feature = "liquid")]
     return liquid_genesis_hash(network);
+    #[cfg(feature = "litecoin")]
+    return litecoin_genesis_hash(network);
 }
 
 pub fn bitcoin_genesis_hash(network: BNetwork) -> bitcoin::BlockHash {
@@ -163,18 +209,41 @@ pub fn liquid_genesis_hash(network: Network) -> elements::BlockHash {
     }
 }
 
+#[cfg(feature = "litecoin")]
+pub fn litecoin_genesis_hash(network: Network) -> BlockHash {
+    lazy_static! {
+        static ref LITECOIN_GENESIS: BlockHash =
+            "12a765e31ffd4059bada1e25190f6e98c99d4028c0fe1666a68542019d52529c"
+                .parse()
+                .unwrap();
+        static ref LITECOIN_TESTNET_GENESIS: BlockHash =
+            "4966625a4b2851d9fdee139e56211a0d88575f59ed816ca060a99a68c5d4ee1d"
+                .parse()
+                .unwrap();
+        // Litecoin regtest uses the same genesis block as Bitcoin regtest
+        static ref LITECOIN_REGTEST_GENESIS: BlockHash =
+            genesis_block(BNetwork::Regtest).block_hash();
+    }
+
+    match network {
+        Network::Litecoin => *LITECOIN_GENESIS,
+        Network::LitecoinTestnet => *LITECOIN_TESTNET_GENESIS,
+        Network::LitecoinRegtest => *LITECOIN_REGTEST_GENESIS,
+    }
+}
+
 impl From<&str> for Network {
     fn from(network_name: &str) -> Self {
         match network_name {
-            #[cfg(not(feature = "liquid"))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
             "mainnet" => Network::Bitcoin,
-            #[cfg(not(feature = "liquid"))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
             "testnet" => Network::Testnet,
-            #[cfg(not(feature = "liquid"))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
             "testnet4" => Network::Testnet4,
-            #[cfg(not(feature = "liquid"))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
             "regtest" => Network::Regtest,
-            #[cfg(not(feature = "liquid"))]
+            #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
             "signet" => Network::Signet,
 
             #[cfg(feature = "liquid")]
@@ -184,12 +253,19 @@ impl From<&str> for Network {
             #[cfg(feature = "liquid")]
             "liquidregtest" => Network::LiquidRegtest,
 
-            _ => panic!("unsupported Bitcoin network: {:?}", network_name),
+            #[cfg(feature = "litecoin")]
+            "litecoin" => Network::Litecoin,
+            #[cfg(feature = "litecoin")]
+            "litecointestnet" => Network::LitecoinTestnet,
+            #[cfg(feature = "litecoin")]
+            "litecoinregtest" => Network::LitecoinRegtest,
+
+            _ => panic!("unsupported network: {:?}", network_name),
         }
     }
 }
 
-#[cfg(not(feature = "liquid"))]
+#[cfg(not(any(feature = "liquid", feature = "litecoin")))]
 impl From<Network> for BNetwork {
     fn from(network: Network) -> Self {
         match network {
@@ -202,7 +278,7 @@ impl From<Network> for BNetwork {
     }
 }
 
-#[cfg(not(feature = "liquid"))]
+#[cfg(not(any(feature = "liquid", feature = "litecoin")))]
 impl From<BNetwork> for Network {
     fn from(network: BNetwork) -> Self {
         match network {

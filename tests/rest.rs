@@ -233,10 +233,7 @@ fn test_rest_blocks() -> Result<()> {
     );
 
     // Verify first block (tip) has correct height
-    assert_eq!(
-        last_blocks[0]["height"].as_u64(),
-        Some(bestblockheight)
-    );
+    assert_eq!(last_blocks[0]["height"].as_u64(), Some(bestblockheight));
 
     // Verify block list entries have all BlockValue fields with value checks
     for block in last_blocks {
@@ -296,8 +293,7 @@ fn test_rest_block() -> Result<()> {
     assert_eq!(res["tx_count"].as_u64(), Some(2));
 
     // Cross-reference BlockValue fields against bitcoind's getblockheader
-    let node_header: Value =
-        tester.call("getblockheader", &[blockhash.to_string().into()])?;
+    let node_header: Value = tester.call("getblockheader", &[blockhash.to_string().into()])?;
     assert_eq!(res["version"].as_u64(), node_header["version"].as_u64());
     assert_eq!(res["timestamp"].as_u64(), node_header["time"].as_u64());
     assert_eq!(
@@ -308,7 +304,10 @@ fn test_rest_block() -> Result<()> {
         res["previousblockhash"].as_str(),
         node_header["previousblockhash"].as_str()
     );
-    assert_eq!(res["mediantime"].as_u64(), node_header["mediantime"].as_u64());
+    assert_eq!(
+        res["mediantime"].as_u64(),
+        node_header["mediantime"].as_u64()
+    );
     assert!(res["size"].as_u64().unwrap() > 0);
     assert!(res["weight"].as_u64().unwrap() > 0);
     #[cfg(not(feature = "liquid"))]
@@ -378,10 +377,7 @@ fn test_rest_mempool() -> Result<()> {
     assert_eq!(mempool_after["count"].as_u64(), Some(0));
     assert_eq!(mempool_after["vsize"].as_u64(), Some(0));
     assert_eq!(mempool_after["total_fee"].as_u64(), Some(0));
-    assert_eq!(
-        mempool_after["fee_histogram"].as_array().unwrap().len(),
-        0
-    );
+    assert_eq!(mempool_after["fee_histogram"].as_array().unwrap().len(), 0);
 
     rest_handle.stop();
     Ok(())
@@ -491,9 +487,7 @@ fn test_rest_block_txids() -> Result<()> {
         "first txid should be coinbase, not user tx"
     );
     // Our txid should be present
-    assert!(txids
-        .iter()
-        .any(|t| t.as_str() == Some(&txid.to_string())));
+    assert!(txids.iter().any(|t| t.as_str() == Some(&txid.to_string())));
 
     rest_handle.stop();
     Ok(())
@@ -570,7 +564,10 @@ fn test_rest_address_utxo() -> Result<()> {
     );
     assert!(utxos[0]["vout"].is_u64());
     assert_eq!(utxos[0]["status"]["confirmed"].as_bool(), Some(true));
-    assert_eq!(utxos[0]["status"]["block_height"].as_u64(), Some(mine_height));
+    assert_eq!(
+        utxos[0]["status"]["block_height"].as_u64(),
+        Some(mine_height)
+    );
     assert!(utxos[0]["status"]["block_hash"].is_string());
     assert!(utxos[0]["status"]["block_time"].as_u64().unwrap() > 0);
     #[cfg(not(feature = "liquid"))]
@@ -636,7 +633,10 @@ fn test_rest_scripthash() -> Result<()> {
 
     // Verify /scripthash/:hash/txs/mempool matches /address/:address/txs/mempool
     let addr_mempool = get_json(rest_addr, &format!("/address/{}/txs/mempool", addr1))?;
-    let sh_mempool = get_json(rest_addr, &format!("/scripthash/{}/txs/mempool", scripthash))?;
+    let sh_mempool = get_json(
+        rest_addr,
+        &format!("/scripthash/{}/txs/mempool", scripthash),
+    )?;
     assert_eq!(addr_mempool, sh_mempool);
 
     // Verify /scripthash/:hash/utxo matches /address/:address/utxo
@@ -684,7 +684,10 @@ fn test_rest_tx_outspends() -> Result<()> {
     );
     assert_eq!(spent_entry["vin"].as_u64(), Some(spent_vin));
     assert_eq!(spent_entry["status"]["confirmed"].as_bool(), Some(true));
-    assert_eq!(spent_entry["status"]["block_height"].as_u64(), Some(mine_height));
+    assert_eq!(
+        spent_entry["status"]["block_height"].as_u64(),
+        Some(mine_height)
+    );
     assert!(spent_entry["status"]["block_hash"].is_string());
     assert!(spent_entry["status"]["block_time"].as_u64().unwrap() > 0);
 
@@ -759,10 +762,7 @@ fn test_rest_mempool_recent() -> Result<()> {
     }
 
     // Verify our sent txids are included
-    let recent_txids: HashSet<&str> = recent
-        .iter()
-        .map(|e| e["txid"].as_str().unwrap())
-        .collect();
+    let recent_txids: HashSet<&str> = recent.iter().map(|e| e["txid"].as_str().unwrap()).collect();
     assert!(recent_txids.contains(txid1.to_string().as_str()));
     assert!(recent_txids.contains(txid2.to_string().as_str()));
 

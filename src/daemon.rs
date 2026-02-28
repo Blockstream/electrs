@@ -621,7 +621,7 @@ impl Daemon {
                 Err(e) => {
                     let err_msg = format!("{e:?}");
                     if err_msg.contains("Block not found on disk")
-                       || err_msg.contains("Block not available") 
+                        || err_msg.contains("Block not available")
                     {
                         // There is a small chance the node returns the header but didn't finish to index the block
                         log::warn!("getblocks failing with: {e:?} trying {attempts} more time")

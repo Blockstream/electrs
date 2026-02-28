@@ -1,4 +1,6 @@
 mod block;
+#[cfg(feature = "litecoin")]
+pub mod litecoin_addr;
 mod script;
 mod transaction;
 

@@ -21,9 +21,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use crate::{chain::{
-    BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
-}, new_index::db_metrics::RocksDbMetrics};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
@@ -31,6 +28,10 @@ use crate::metrics::{Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricO
 use crate::util::{
     bincode, full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta,
     BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
+};
+use crate::{
+    chain::{BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value},
+    new_index::db_metrics::RocksDbMetrics,
 };
 
 use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
@@ -345,20 +346,20 @@ impl Indexer {
         let mut blocks_fetched = 0;
         let to_add_total = to_add.len();
 
-        start_fetcher(self.from, &daemon, to_add)?.map(|blocks|
-            {
-                if fetcher_count % 25 == 0 && to_add_total > 20 {
-                    info!("adding txes from blocks {}/{} ({:.1}%)",
-                        blocks_fetched,
-                        to_add_total,
-                        blocks_fetched as f32 / to_add_total as f32 * 100.0
-                    );
-                }
-                fetcher_count += 1;
-                blocks_fetched += blocks.len();
+        start_fetcher(self.from, &daemon, to_add)?.map(|blocks| {
+            if fetcher_count % 25 == 0 && to_add_total > 20 {
+                info!(
+                    "adding txes from blocks {}/{} ({:.1}%)",
+                    blocks_fetched,
+                    to_add_total,
+                    blocks_fetched as f32 / to_add_total as f32 * 100.0
+                );
+            }
+            fetcher_count += 1;
+            blocks_fetched += blocks.len();
 
-                self.add(&blocks)
-            });
+            self.add(&blocks)
+        });
 
         self.start_auto_compactions(&self.store.txstore_db);
 

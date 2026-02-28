@@ -1,3 +1,4 @@
+#[cfg(not(feature = "litecoin"))]
 use crate::chain::address::Address;
 use crate::errors::*;
 use crate::new_index::ChainQuery;
@@ -11,6 +12,7 @@ use bitcoin::hex::FromHex;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
+#[cfg(not(feature = "litecoin"))]
 use std::str::FromStr;
 
 use electrs_macros::trace;
@@ -65,12 +67,32 @@ fn to_scripthash(script_type: &str, script_str: &str) -> Result<FullHash> {
 }
 
 fn address_to_scripthash(addr: &str) -> Result<FullHash> {
-    let addr = Address::from_str(addr).chain_err(|| "invalid address")?;
+    #[cfg(not(feature = "litecoin"))]
+    {
+        let addr = Address::from_str(addr).chain_err(|| "invalid address")?;
 
-    #[cfg(not(feature = "liquid"))]
-    let addr = addr.assume_checked();
+        #[cfg(not(feature = "liquid"))]
+        let addr = addr.assume_checked();
 
-    Ok(compute_script_hash(&addr.script_pubkey().as_bytes()))
+        Ok(compute_script_hash(&addr.script_pubkey().as_bytes()))
+    }
+
+    #[cfg(feature = "litecoin")]
+    {
+        // Try all Litecoin networks for precache (network doesn't matter for scripthash)
+        let networks = [
+            crate::chain::Network::Litecoin,
+            crate::chain::Network::LitecoinTestnet,
+            crate::chain::Network::LitecoinRegtest,
+        ];
+        for network in &networks {
+            if let Some(script) = crate::util::litecoin_addr::parse_litecoin_address(addr, *network)
+            {
+                return Ok(compute_script_hash(&script));
+            }
+        }
+        bail!("invalid Litecoin address")
+    }
 }
 
 pub fn compute_script_hash(data: &[u8]) -> FullHash {

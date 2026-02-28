@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Electrs (Esplora variant) is a blockchain index engine and HTTP API for Bitcoin (and Liquid) written in Rust. It is the backend for the [Esplora block explorer](https://github.com/Blockstream/esplora) powering blockstream.info. Forked from [romanz/electrs](https://github.com/romanz/electrs), it adds an HTTP REST API, extended indexes, and Elements/Liquid support.
+Electrs (Esplora variant) is a blockchain index engine and HTTP API for Bitcoin (and Liquid/Litecoin) written in Rust. It is the backend for the [Esplora block explorer](https://github.com/Blockstream/esplora) powering blockstream.info. Forked from [romanz/electrs](https://github.com/romanz/electrs), it adds an HTTP REST API, extended indexes, and Elements/Liquid support, as well as Litecoin support.
 
 ## Build & Run
 
@@ -15,6 +15,12 @@ cargo run --release --bin electrs -- -vvvv --daemon-dir ~/.bitcoin
 
 # Build with Liquid support
 cargo build --features liquid --release
+
+# Build with Litecoin support
+cargo build --features litecoin --release
+
+# Run with Litecoin (requires a running litecoind)
+cargo run --features litecoin --release --bin electrs -- -vvvv --daemon-dir ~/.litecoin
 
 # Build with OpenTelemetry tracing
 cargo build --features otlp-tracing --release
@@ -77,6 +83,7 @@ The pre-commit hook (`.hooks/pre-commit`) runs `cargo +stable fmt --all -- --che
 - **`chain.rs`** — Blockchain type aliases and network definitions.
 - **`elements/`** — Liquid/Elements-specific code (behind `liquid` feature flag).
 - **`util/`** — Helpers for transactions, scripts, fees, merkle proofs, and block parsing.
+  - `litecoin_addr.rs` — Litecoin address encoding/decoding (bech32 `ltc1`/`tltc1`/`rltc1` and base58check with Litecoin version bytes). Behind `litecoin` feature flag.
 - **`electrs_macros/`** — Proc-macro crate for optional OTLP tracing instrumentation.
 
 ### Data Flow
@@ -87,7 +94,8 @@ The pre-commit hook (`.hooks/pre-commit`) runs `cargo +stable fmt --all -- --che
 
 ### Feature Flags
 
-- `liquid` — Liquid/Elements network support
+- `liquid` — Liquid/Elements network support (mutually exclusive with `litecoin`)
+- `litecoin` — Litecoin network support (mutually exclusive with `liquid`). Networks: litecoin, litecointestnet, litecoinregtest. Note: MWEB (MimbleWimble Extension Blocks) is not yet supported.
 - `electrum-discovery` — Electrum server peer discovery
 - `otlp-tracing` — OpenTelemetry tracing export
 - `bitcoind_28_0` — Bitcoin Core 28.0+ compatibility
@@ -105,7 +113,7 @@ Configuration is done via CLI args. Key options:
 - `--http-addr` — REST API listen address (default: 127.0.0.1:3000)
 - `--electrum-rpc-addr` — Electrum RPC listen address (default: 127.0.0.1:50001)
 - `--lightmode` — reduce disk usage by querying bitcoind for raw txs on demand
-- `--network` — bitcoin network (mainnet/testnet/regtest/signet/liquid)
+- `--network` — bitcoin network (mainnet/testnet/regtest/signet/liquid/litecoin/litecointestnet/litecoinregtest)
 - `--cors` — CORS origins for HTTP API
 
 ## Workspace

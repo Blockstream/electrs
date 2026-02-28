@@ -32,8 +32,7 @@ impl WalletTester {
             vec!["--server", &server_arg]
         };
         electrum_wallet_conf.view_stdout = true;
-        let electrum_wallet =
-            ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
+        let electrum_wallet = ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
 
         log::info!(
             "Electrum wallet version: {:?}",

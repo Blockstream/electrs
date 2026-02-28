@@ -15,6 +15,7 @@ default-run = "electrs"
 
 [features]
 liquid = ["elements"]
+litecoin = []
 electrum-discovery = ["electrum-client"]
 bench = []
 otlp-tracing = [

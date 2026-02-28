@@ -1047,8 +1047,8 @@ fn handle_request(
                             HttpError::from(format!("Invalid transaction hex for item {}", index))
                         })?
                         .filter(|r| r.is_err())
-						.next()
-						.transpose()
+                        .next()
+                        .transpose()
                         .map_err(|_| {
                             HttpError::from(format!("Invalid transaction hex for item {}", index))
                         })
@@ -1274,25 +1274,34 @@ fn to_scripthash(
 }
 
 fn address_to_scripthash(addr: &str, network: Network) -> Result<FullHash, HttpError> {
-    #[cfg(not(feature = "liquid"))]
-    let addr = address::Address::from_str(addr)?;
-    #[cfg(feature = "liquid")]
-    let addr = address::Address::parse_with_params(addr, network.address_params())?;
-
-    #[cfg(not(feature = "liquid"))]
-    let is_expected_net = addr.is_valid_for_network(network.into());
-
-    #[cfg(feature = "liquid")]
-    let is_expected_net = addr.params == network.address_params();
-
-    if !is_expected_net {
-        bail!(HttpError::from("Address on invalid network".to_string()))
+    #[cfg(not(any(feature = "liquid", feature = "litecoin")))]
+    {
+        let addr = address::Address::from_str(addr)?;
+        let is_expected_net = addr.is_valid_for_network(network.into());
+        if !is_expected_net {
+            bail!(HttpError::from("Address on invalid network".to_string()))
+        }
+        let addr = addr.assume_checked();
+        Ok(compute_script_hash(&addr.script_pubkey()))
     }
 
-    #[cfg(not(feature = "liquid"))]
-    let addr = addr.assume_checked();
+    #[cfg(feature = "liquid")]
+    {
+        let addr = address::Address::parse_with_params(addr, network.address_params())?;
+        let is_expected_net = addr.params == network.address_params();
+        if !is_expected_net {
+            bail!(HttpError::from("Address on invalid network".to_string()))
+        }
+        Ok(compute_script_hash(&addr.script_pubkey()))
+    }
 
-    Ok(compute_script_hash(&addr.script_pubkey()))
+    #[cfg(feature = "litecoin")]
+    {
+        let script_bytes = crate::util::litecoin_addr::parse_litecoin_address(addr, network)
+            .ok_or_else(|| HttpError::from("Invalid Litecoin address".to_string()))?;
+        let script = Script::from(script_bytes);
+        Ok(compute_script_hash(&script))
+    }
 }
 
 fn parse_scripthash(scripthash: &str) -> Result<FullHash, HttpError> {
