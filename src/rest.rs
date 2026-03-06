@@ -780,13 +780,19 @@ fn handle_request(
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txs"), start_index, None) => {
             let hash = BlockHash::from_str(hash)?;
+            
+            // Add lightweight validation that block exists before fetching transactions,
+            // to avoid expensive lookups in case of invalid block hash
+            query.chain().get_block_header(&hash)
+                .ok_or_else(|| HttpError::not_found("Block not found".to_string()))?;
+
             let start_index = start_index
                 .map_or(0u32, |el| el.parse().unwrap_or(0))
                 .max(0u32) as usize;
 
             ensure!(
                 start_index % CHAIN_TXS_PER_PAGE == 0,
-                "start index must be a multipication of {}",
+                "start index must be a multiple of {}",
                 CHAIN_TXS_PER_PAGE
             );
 

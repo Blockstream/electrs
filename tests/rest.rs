@@ -328,6 +328,22 @@ fn test_rest_block() -> Result<()> {
         tester.node_client().call::<String>("getblock", &[blockhash.to_string().into(), 0.into()])?;
     assert_eq!(rest_rawblock, Vec::from_hex(&node_hexblock).unwrap());
 
+    // Test GET /block/:hash/txid/:index
+    let res = get_plain(rest_addr, &format!("/block/{}/txid/1", blockhash))?;
+    assert_eq!(res, txid.to_string());
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[test]
+fn test_rest_block_txs() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let txid = tester.send(&addr1, "0.98765432 BTC".parse().unwrap())?;
+    let blockhash = tester.mine()?;
+
     // Test GET /block/:hash/txs
     let res = get_json(rest_addr, &format!("/block/{}/txs", blockhash))?;
     let block_txs = res.as_array().expect("list of txs");
@@ -338,9 +354,55 @@ fn test_rest_block() -> Result<()> {
         Some(txid.to_string().as_str())
     );
 
-    // Test GET /block/:hash/txid/:index
-    let res = get_plain(rest_addr, &format!("/block/{}/txid/1", blockhash))?;
-    assert_eq!(res, txid.to_string());
+    // Test GET /block/:hash/txs/:index
+    let res = get_json(rest_addr, &format!("/block/{}/txs/0", blockhash))?;
+    let block_txs = res.as_array().expect("list of txs");
+    assert_eq!(block_txs.len(), 2);
+    assert_eq!(block_txs[0]["vin"][0]["is_coinbase"].as_bool(), Some(true));
+    assert_eq!(
+        block_txs[1]["txid"].as_str(),
+        Some(txid.to_string().as_str())
+    );
+
+    // Test GET /block/:hash/txs/:index
+    // Should fail with 404 code when block isn't found
+    let invalid_resp = ureq::get(&format!("http://{}/block/{}/txs/0", rest_addr, "0000000000000000000000000000000000000000000000000000000000000000"))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(invalid_resp.status(), 404);
+    assert_eq!(invalid_resp.into_body().read_to_string()?, "Block not found");
+
+    // Test GET /block/:hash/txs/:index
+    // Should fail with 400 code when block hash is invalid
+    let invalid_resp = ureq::get(&format!("http://{}/block/{}/txs/0", rest_addr, "invalid_hash"))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(invalid_resp.status(), 400);
+    assert_eq!(invalid_resp.into_body().read_to_string()?, "Invalid hex string");
+
+    // Test GET /block/:hash/txs/:index
+    // Should fail with 400 code when `(index % 25) != 0`
+    let invalid_hash_resp = ureq::get(&format!("http://{}/block/{}/txs/1", rest_addr, blockhash))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(invalid_hash_resp.status(), 400);
+    assert_eq!(invalid_hash_resp.into_body().read_to_string()?, "start index must be a multiple of 25");
+
+    // Test GET /block/:hash/txs/:index
+    // Should fail with 400 code when index is out of range
+    let invalid_hash_resp = ureq::get(&format!("http://{}/block/{}/txs/25", rest_addr, blockhash))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(invalid_hash_resp.status(), 400);
+    assert_eq!(invalid_hash_resp.into_body().read_to_string()?, "start index out of range");
 
     rest_handle.stop();
     Ok(())
@@ -1043,7 +1105,7 @@ fn test_rest_reorg() -> Result<()> {
 #[cfg(not(feature = "liquid"))]
 #[test]
 fn test_rest_submit_package() -> Result<()> {
-    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+    let (rest_handle, rest_addr, tester) = common::init_rest_tester().unwrap();
 
     // Test with a real transaction package - create parent-child transactions
     // submitpackage requires between 2 and 25 transactions with proper dependencies
