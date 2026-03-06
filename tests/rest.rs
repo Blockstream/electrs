@@ -342,6 +342,26 @@ fn test_rest_block() -> Result<()> {
     let res = get_plain(rest_addr, &format!("/block/{}/txid/1", blockhash))?;
     assert_eq!(res, txid.to_string());
 
+    // Test GET /block/:hash/txid/:index
+    // Should fail with 400 code when block hash is invalid
+    let invalid_hash_resp = ureq::get(&format!("http://{}/block/{}/txs/1", rest_addr, "invalid_hash"))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(invalid_hash_resp.status(), 400);
+    assert_eq!(invalid_hash_resp.into_body().read_to_string()?, "Invalid hex string");
+
+    // Test GET /block/:hash/txid/:index
+    // Should fail with 404 code when block isn't found
+    let invalid_hash_resp = ureq::get(&format!("http://{}/block/{}/txs/0", rest_addr, "0000000000000000000000000000000000000000000000000000000000000000"))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(invalid_hash_resp.status(), 404);
+    assert_eq!(invalid_hash_resp.into_body().read_to_string()?, "Block not found");
+
     rest_handle.stop();
     Ok(())
 }
