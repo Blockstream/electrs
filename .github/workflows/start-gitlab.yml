@@ -25,6 +25,7 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
           # The GitHub token for reporting status back
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }} 
           GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
         run: |
           # --- Safety Checks ---
@@ -50,6 +51,7 @@ jobs:
             --form "variables[GITHUB_PR_SHA]=${GITHUB_PR_SHA}" \
             --form "variables[GITHUB_PR_REF]=${GITHUB_PR_REF}" \
             --form "variables[GITHUB_REPO]=${GITHUB_REPO}" \
+            --form "variables[GITHUB_PR_NUMBER]=${GITHUB_PR_NUMBER}" \
             --form "variables[GITHUB_REPO_URL]=${GITHUB_REPO_URL}" \
             "${GL_TRIGGER_URL}" > /dev/null
           echo "GitLab pipeline triggered."
