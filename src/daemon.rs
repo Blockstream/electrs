@@ -263,7 +263,7 @@ impl Connection {
             } else if in_header {
                 let parts: Vec<&str> = line.splitn(2, ": ").collect();
                 if parts.len() == 2 {
-                    headers.insert(parts[0].to_owned(), parts[1].to_owned());
+                    headers.insert(parts[0].to_lowercase(), parts[1].to_owned());
                 } else {
                     warn!("invalid header: {:?}", line);
                 }
@@ -276,7 +276,7 @@ impl Connection {
         let contents =
             contents.chain_err(|| ErrorKind::Connection("no reply from daemon".to_owned()))?;
         let contents_length: &str = headers
-            .get("Content-Length")
+            .get("content-length")
             .chain_err(|| format!("Content-Length is missing: {:?}", headers))?;
         let contents_length: usize = contents_length
             .parse()
