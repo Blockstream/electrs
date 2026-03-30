@@ -4,13 +4,8 @@ extern crate log;
 
 extern crate electrs;
 
-use crossbeam_channel::{self as channel};
-use error_chain::ChainedError;
-use std::{env, process, thread};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use bitcoin::hex::DisplayHex;
-use rand::{rng, RngCore};
+use crossbeam_channel::{self as channel};
 use electrs::{
     config::Config,
     daemon::Daemon,
@@ -21,6 +16,11 @@ use electrs::{
     rest,
     signal::Waiter,
 };
+use error_chain::ChainedError;
+use rand::{rng, RngCore};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use std::{env, process, thread};
 
 #[cfg(feature = "otlp-tracing")]
 use electrs::otlp_trace;
@@ -49,13 +49,13 @@ fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
 }
 
 fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<()> {
-    let (block_hash_notify, block_hash_receive) = channel::bounded(1);
-    let signal = Waiter::start(block_hash_receive);
+    let (zmq_event_notify, zmq_event_receive) = channel::bounded(1);
+    let signal = Waiter::start(zmq_event_receive);
     let metrics = Metrics::new(config.monitoring_addr);
     metrics.start();
 
     if let Some(zmq_addr) = config.zmq_addr.as_ref() {
-        zmq::start(&format!("tcp://{zmq_addr}"), block_hash_notify);
+        zmq::start(&format!("tcp://{zmq_addr}"), zmq_event_notify);
     }
 
     let daemon = Arc::new(Daemon::new(

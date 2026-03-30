@@ -1,4 +1,3 @@
-use bitcoin::BlockHash;
 use crossbeam_channel::{self as channel, after, select};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -6,11 +5,12 @@ use std::time::{Duration, Instant};
 use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
 
 use crate::errors::*;
+use crate::new_index::zmq::ZmqEvent;
 
 #[derive(Clone)] // so multiple threads could wait on signals
 pub struct Waiter {
     receiver: channel::Receiver<i32>,
-    zmq_receiver: channel::Receiver<BlockHash>,
+    zmq_receiver: channel::Receiver<ZmqEvent>,
 }
 
 fn notify(signals: &[i32]) -> channel::Receiver<i32> {
@@ -27,13 +27,13 @@ fn notify(signals: &[i32]) -> channel::Receiver<i32> {
 }
 
 impl Waiter {
-    pub fn start(block_hash_receive: channel::Receiver<BlockHash>) -> Waiter {
+    pub fn start(zmq_event_receive: channel::Receiver<ZmqEvent>) -> Waiter {
         Waiter {
             receiver: notify(&[
                 SIGINT, SIGTERM,
                 SIGUSR1, // allow external triggering (e.g. via bitcoind `blocknotify`)
             ]),
-            zmq_receiver: block_hash_receive,
+            zmq_receiver: zmq_event_receive,
         }
     }
 
