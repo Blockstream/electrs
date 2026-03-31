@@ -91,6 +91,10 @@ pub enum DBFlush {
 
 impl DB {
     pub fn open(path: &Path, config: &Config, verify_compat: bool) -> DB {
+        Self::open_with_cache(path, config, verify_compat, None)
+    }
+
+    pub fn open_with_cache(path: &Path, config: &Config, verify_compat: bool, shared_cache: Option<&rocksdb::Cache>) -> DB {
         debug!("opening DB at {:?}", path);
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
@@ -148,8 +152,16 @@ impl DB {
 
         // Configure block cache and table options
         let mut block_opts = rocksdb::BlockBasedOptions::default();
-        let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
-        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(cache_size_bytes));
+        let owned_cache;
+        let cache = match shared_cache {
+            Some(c) => c,
+            None => {
+                let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
+                owned_cache = rocksdb::Cache::new_lru_cache(cache_size_bytes);
+                &owned_cache
+            }
+        };
+        block_opts.set_block_cache(cache);
         // When --cache-index-filter-blocks is passed, store index and filter blocks
         // inside the block cache so their memory is bounded by --db-block-cache-mb.
         // Without this (the default), RocksDB keeps them on the heap where they may
