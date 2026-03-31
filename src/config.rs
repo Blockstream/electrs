@@ -70,6 +70,13 @@ pub struct Config {
     /// Must stay within db_write_buffer_size_mb to avoid mid-batch flushes.
     pub initial_sync_batch_size: usize,
 
+    /// Store index and filter blocks inside the block cache (default: false).
+    /// When enabled, bounds memory but allows eviction under pressure.
+    /// When disabled (default), index/filter blocks stay on the heap and are
+    /// may never be evicted, giving better read performance at the cost of ~18 MB
+    /// per SST file of unbounded memory.
+    pub db_cache_index_filter_blocks: bool,
+
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
@@ -256,6 +263,10 @@ impl Config {
                     .help("Number of blocks per batch during initial sync. Larger values keep more txo rows in the write buffer during indexing, improving lookup_txos cache hit rate for recently-created outputs.")
                     .takes_value(true)
                     .default_value("250")
+             ).arg(
+                Arg::with_name("cache_index_filter_blocks")
+                    .long("cache-index-filter-blocks")
+                    .help("Store index/filter blocks in the block cache instead of on the heap. Bounds memory but allows eviction under cache pressure.")
              ).arg(
                 Arg::with_name("zmq_addr")
                     .long("zmq-addr")
@@ -496,6 +507,7 @@ impl Config {
             db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
             initial_sync_batch_size: value_t_or_exit!(m, "initial_sync_batch_size", usize),
+            db_cache_index_filter_blocks: m.is_present("cache_index_filter_blocks"),
             zmq_addr,
 
             #[cfg(feature = "liquid")]

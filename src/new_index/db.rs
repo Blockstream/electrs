@@ -150,20 +150,18 @@ impl DB {
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
         block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(cache_size_bytes));
-        // Store index and filter blocks inside the block cache so their memory is
-        // bounded by --db-block-cache-mb. Without this, RocksDB allocates table-reader
-        // memory (index + filter blocks) on the heap separately for every open SST file.
-        // During initial sync, L0 files accumulate up to the compaction trigger (64 by
-        // default) and this unbounded heap allocation can grow to many GB.
-        // Note: increase --db-block-cache-mb proportionally (e.g. 4096) so the cache is
-        // large enough to hold the working set of filter/index blocks without thrashing.
-        block_opts.set_cache_index_and_filter_blocks(true);
-        // Pin L0 index and filter blocks in the cache so they are never evicted.
-        // Without this, data block churn evicts L0 index/filter blocks, causing
-        // repeated disk reads for every SST lookup — worse than the old heap approach.
-        // With this, L0 index/filter blocks behave like the old table-reader heap
-        // allocation but stay within the bounded block cache.
-        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        // When --cache-index-filter-blocks is passed, store index and filter blocks
+        // inside the block cache so their memory is bounded by --db-block-cache-mb.
+        // Without this (the default), RocksDB keeps them on the heap where they may
+        // never be evicted — possibly better for read performance compared to needing
+        // to go to disk, but uses ~18 MB per SST file.
+        if config.db_cache_index_filter_blocks {
+            block_opts.set_cache_index_and_filter_blocks(true);
+            // Pin L0 index and filter blocks in the cache so they are never evicted.
+            // Without this, data block churn evicts L0 index/filter blocks, causing
+            // repeated disk reads for every SST lookup.
+            block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        }
         // Bloom filters allow multi_get() to skip SST files that don't contain a key
         // without touching the index or data blocks. Without this, every point lookup
         // must binary-search the index of every L0 file whose key range overlaps the
