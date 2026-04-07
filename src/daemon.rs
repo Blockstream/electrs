@@ -784,8 +784,8 @@ impl Daemon {
             info!(
                 "downloaded {}/{} block headers ({:.0}%)",
                 result.len(),
-                tip_height,
-                result.len() as f32 / tip_height as f32 * 100.0
+                tip_height + 1,
+                result.len() as f32 / (tip_height + 1) as f32 * 100.0
             );
         }
 
