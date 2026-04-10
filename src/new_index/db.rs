@@ -152,7 +152,7 @@ impl DB {
 
         // Configure block cache and table options
         let mut block_opts = rocksdb::BlockBasedOptions::default();
-        let owned_cache;
+        let owned_cache: rocksdb::Cache;
         let cache = match shared_cache {
             Some(c) => c,
             None => {
