@@ -242,9 +242,9 @@ impl Config {
             ).arg(
                 Arg::with_name("db_block_cache_mb")
                     .long("db-block-cache-mb")
-                    .help("RocksDB block cache size in MB per database. Bounds index/filter block memory; use 4096+ for initial sync to avoid table-reader heap growth.")
+                    .help("RocksDB block cache size in MB (shared across all databases). Bounds index/filter block memory; use 4096+ for initial sync to avoid table-reader heap growth.")
                     .takes_value(true)
-                    .default_value("8")
+                    .default_value("24")
             ).arg(
                 Arg::with_name("db_parallelism")
                     .long("db-parallelism")
