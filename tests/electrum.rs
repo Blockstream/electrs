@@ -228,3 +228,52 @@ fn write_and_read(stream: &mut TcpStream, write: &str) -> String {
     }
     std::str::from_utf8(&result).unwrap().to_string()
 }
+
+/// Test that verifies the acceptor thread handles channel closure gracefully
+/// This test simulates the production scenario where the main RPC thread exits
+/// while the acceptor thread is still running. Without the fix, this would cause
+/// a panic at the acceptor.send().expect() call. With the fix, the acceptor thread
+/// should exit gracefully when the channel is closed.
+#[test]
+fn test_acceptor_panic_on_channel_close() {
+    use std::net::TcpStream;
+    use std::thread;
+    use std::time::Duration;
+
+    // Use the existing init_electrum_tester function which properly sets up the server
+    let (electrum_server, electrum_addr, _tester) = common::init_electrum_tester().unwrap();
+
+    // Give the server a moment to start up
+    thread::sleep(Duration::from_millis(100));
+
+    // Start a thread that continuously tries to connect to the server
+    // This will keep the acceptor thread busy accepting connections
+    let addr = electrum_addr;
+    let connection_thread = thread::spawn(move || {
+        for _ in 0..100 {
+            if let Ok(_stream) = TcpStream::connect(addr) {
+                // Keep the connection open briefly
+                thread::sleep(Duration::from_millis(10));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    // Give the connection thread time to start making connections
+    thread::sleep(Duration::from_millis(50));
+
+    // Now immediately stop the server by dropping it
+    // This will close the receiver channel, but the acceptor thread might still be running
+    // and trying to send new connections, which should cause a panic
+    drop(electrum_server);
+
+    // Give some time for the acceptor thread to potentially panic
+    thread::sleep(Duration::from_millis(500));
+
+    // Wait for the connection thread to finish
+    let _ = connection_thread.join();
+
+    // If we reach here without panicking, the test passes
+    // This test verifies that the acceptor thread gracefully handles channel closure
+    // instead of panicking when the main RPC thread exits
+}

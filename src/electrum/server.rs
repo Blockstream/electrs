@@ -789,7 +789,10 @@ impl RPC {
                 stream
                     .set_nonblocking(false)
                     .expect("failed to set connection as blocking");
-                acceptor.send(Some((stream, addr))).expect("send failed");
+                if let Err(e) = acceptor.send(Some((stream, addr))) {
+                    error!("Closing acceptor thread because channel closed with: {e}");
+                    break;
+                }
             }
         });
         chan
