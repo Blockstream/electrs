@@ -793,6 +793,7 @@ impl RPC {
                 stream
                     .set_nonblocking(false)
                     .expect("failed to set connection as blocking");
+                stream.set_nodelay(true).expect("failed to set TCP_NODELAY");
                 if acceptor.send(Some((stream, addr))).is_err() {
                     break; // receiver dropped, server is shutting down
                 }

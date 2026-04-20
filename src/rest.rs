@@ -601,7 +601,10 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
                 tokio::select! {
                     result = listener.accept() => {
                         match result {
-                            Ok((stream, _)) => spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful),
+                            Ok((stream, _)) => {
+                                stream.set_nodelay(true).expect("failed to set TCP_NODELAY");
+                                spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful);
+                            }
                             Err(e) => warn!("accept error: {}", e),
                         }
                     }
