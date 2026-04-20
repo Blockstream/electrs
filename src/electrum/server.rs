@@ -766,7 +766,11 @@ impl RPC {
                             }
                         })
                     }
-                    Notification::Exit => acceptor.send(None).unwrap(), // mark acceptor as done
+                    Notification::Exit => {
+                        if acceptor.send(None).is_err() {
+                            warn!("acceptor already shut down before Exit notification");
+                        }
+                    }
                 }
             }
         });
@@ -789,7 +793,9 @@ impl RPC {
                 stream
                     .set_nonblocking(false)
                     .expect("failed to set connection as blocking");
-                acceptor.send(Some((stream, addr))).expect("send failed");
+                if acceptor.send(Some((stream, addr))).is_err() {
+                    break; // receiver dropped, server is shutting down
+                }
             }
         });
         chan
