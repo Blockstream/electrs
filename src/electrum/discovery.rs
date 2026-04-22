@@ -528,7 +528,127 @@ mod tests {
 
     const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 
+    fn test_features() -> ServerFeatures {
+        ServerFeatures {
+            hosts: serde_json::from_str("{}").unwrap(),
+            server_version: "test 1.0".into(),
+            genesis_hash: genesis_hash(Network::Testnet),
+            protocol_min: PROTOCOL_VERSION,
+            protocol_max: PROTOCOL_VERSION,
+            hash_function: "sha256".into(),
+            pruning: None,
+        }
+    }
+
+    // Construct a DiscoveryManager with no queue entries and no DNS lookups.
+    fn test_manager() -> DiscoveryManager {
+        DiscoveryManager {
+            our_addrs: HashSet::new(),
+            our_version: PROTOCOL_VERSION,
+            our_features: test_features(),
+            announce: false,
+            tor_proxy: None,
+            healthy: Default::default(),
+            queue: Default::default(),
+        }
+    }
+
+    fn make_job(ip: &str, service: Service) -> HealthCheck {
+        HealthCheck {
+            addr: ServerAddr::Clearnet(ip.parse().unwrap()),
+            hostname: "peer.example".into(),
+            service,
+            is_default: false,
+            added_by: None,
+            last_check: None,
+            last_healthy: None,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn insert_healthy(manager: &DiscoveryManager, ip: &str, services: Vec<Service>) {
+        let addr = ServerAddr::Clearnet(ip.parse().unwrap());
+        let mut healthy = manager.healthy.write().unwrap();
+        let server = healthy
+            .entry(addr)
+            .or_insert_with(|| Server::new("peer.example".into(), test_features()));
+        for svc in services {
+            server.services.insert(svc);
+        }
+    }
+
+    // The old assert!(server.services.remove(&job.service)) panicked when the service
+    // was not present in the healthy set. Verify it no longer panics.
     #[test]
+    fn remove_unhealthy_service_missing_service_does_not_panic() {
+        let manager = test_manager();
+        insert_healthy(&manager, "1.2.3.4", vec![Service::Tcp(50001)]);
+        let job = make_job("1.2.3.4", Service::Ssl(50002));
+        manager.remove_unhealthy_service(&job);
+        let healthy = manager.healthy.read().unwrap();
+        let addr = ServerAddr::Clearnet("1.2.3.4".parse().unwrap());
+        assert!(healthy[&addr].services.contains(&Service::Tcp(50001)));
+    }
+
+    // The else branch was a FIXME "unreachable but it was reached" in production.
+    // Verify it does not panic.
+    #[test]
+    fn remove_unhealthy_service_missing_addr_does_not_panic() {
+        let manager = test_manager();
+        let job = make_job("1.2.3.4", Service::Tcp(50001));
+        manager.remove_unhealthy_service(&job);
+    }
+
+    #[test]
+    fn remove_unhealthy_service_removes_server_when_last_service_gone() {
+        let manager = test_manager();
+        insert_healthy(&manager, "1.2.3.4", vec![Service::Tcp(50001)]);
+        let job = make_job("1.2.3.4", Service::Tcp(50001));
+        manager.remove_unhealthy_service(&job);
+        let healthy = manager.healthy.read().unwrap();
+        assert!(!healthy.contains_key(&ServerAddr::Clearnet("1.2.3.4".parse().unwrap())));
+    }
+
+    #[test]
+    fn remove_unhealthy_service_keeps_server_when_other_services_remain() {
+        let manager = test_manager();
+        insert_healthy(&manager, "1.2.3.4", vec![Service::Tcp(50001), Service::Ssl(50002)]);
+        let job = make_job("1.2.3.4", Service::Tcp(50001));
+        manager.remove_unhealthy_service(&job);
+        let healthy = manager.healthy.read().unwrap();
+        let addr = ServerAddr::Clearnet("1.2.3.4".parse().unwrap());
+        assert!(healthy.contains_key(&addr));
+        assert!(healthy[&addr].services.contains(&Service::Ssl(50002)));
+        assert!(!healthy[&addr].services.contains(&Service::Tcp(50001)));
+    }
+
+    #[test]
+    fn poisoned_healthy_lock_does_not_panic_on_get_servers() {
+        let manager = Arc::new(test_manager());
+        let m = Arc::clone(&manager);
+        let _ = std::thread::spawn(move || {
+            let _guard = m.healthy.write().unwrap();
+            panic!("intentional lock poison");
+        })
+        .join();
+        let servers = manager.get_servers();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn poisoned_queue_lock_does_not_panic_on_run_health_check() {
+        let manager = Arc::new(test_manager());
+        let m = Arc::clone(&manager);
+        let _ = std::thread::spawn(move || {
+            let _guard = m.queue.write().unwrap();
+            panic!("intentional lock poison");
+        })
+        .join();
+        assert!(manager.run_health_check().is_ok());
+    }
+
+    #[test]
+    #[ignore = "makes live network connections to testnet Electrum servers"]
     fn test() -> Result<()> {
         stderrlog::new().verbosity(4).init().unwrap();
 
