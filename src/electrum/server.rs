@@ -474,10 +474,10 @@ impl Connection {
             #[cfg(feature = "electrum-discovery")]
             "server.add_peer" => self.server_add_peer(&params),
 
-            &_ => bail!("unknown method {} {:?}", method, params),
+            &_ => Err(format!("unknown method {}", method).into()),
         };
         timer.observe_duration();
-        // TODO: return application errors should be sent to the client
+        // TODO: return errors as JSON-RPC 2.0 error objects ({code, message}) instead of bare strings
         Ok(match result {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err(e) => {
