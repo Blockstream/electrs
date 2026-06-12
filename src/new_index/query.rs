@@ -69,6 +69,10 @@ impl Query {
         self.mempool.read().unwrap()
     }
 
+    pub fn mempool_synced(&self) -> bool {
+        self.mempool.read().unwrap().is_synced()
+    }
+
     #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.daemon.broadcast_raw(txhex)?;

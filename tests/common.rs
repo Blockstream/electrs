@@ -108,6 +108,7 @@ impl TestRunner {
             index_unspendables: false,
             cors: None,
             precache_scripts: None,
+            serve_during_mempool_sync: false,
             utxos_limit: 100,
             electrum_txs_limit: 100,
             electrum_banner: "".into(),

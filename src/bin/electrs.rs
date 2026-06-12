@@ -51,6 +51,23 @@ fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
     }
 }
 
+// TODO: configuration for which servers to start
+fn start_servers(
+    config: &Arc<Config>,
+    query: &Arc<Query>,
+    metrics: &Metrics,
+    salt_rwlock: &Arc<RwLock<String>>,
+) -> (rest::Handle, ElectrumRPC) {
+    let rest_server = rest::start(Arc::clone(config), Arc::clone(query));
+    let electrum_server = ElectrumRPC::start(
+        Arc::clone(config),
+        Arc::clone(query),
+        metrics,
+        Arc::clone(salt_rwlock),
+    );
+    (rest_server, electrum_server)
+}
+
 fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<()> {
     let (block_hash_notify, block_hash_receive) = channel::bounded(1);
     let signal = Waiter::start(block_hash_receive);
@@ -94,10 +111,15 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         &metrics,
     ));
 
+    // Pre-caching is pure cache warming; run it in the background so it doesn't
+    // delay startup. The file is still read upfront to fail fast on a bad path.
     if let Some(ref precache_file) = config.precache_scripts {
         let precache_scripthashes = precache::scripthashes_from_file(precache_file.to_string())
             .expect("cannot load scripts to precache");
-        precache::precache(&chain, precache_scripthashes);
+        let precache_chain = Arc::clone(&chain);
+        thread::spawn(move || {
+            precache::precache(&precache_chain, precache_scripthashes);
+        });
     }
 
     info!("loading mempool");
@@ -106,12 +128,6 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         &metrics,
         Arc::clone(&config),
     )));
-
-    while !Mempool::update(&mempool, &daemon, &tip)? {
-        // Mempool syncing was aborted because the chain tip moved;
-        // Index the new block(s) and try again.
-        tip = indexer.update(&daemon)?;
-    }
 
     #[cfg(feature = "liquid")]
     let asset_db = config.asset_db_path.as_ref().map(|db_dir| {
@@ -129,15 +145,25 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         asset_db,
     ));
 
-    // TODO: configuration for which servers to start
-    let rest_server = rest::start(Arc::clone(&config), Arc::clone(&query));
-    let electrum_server = ElectrumRPC::start(
-        Arc::clone(&config),
-        Arc::clone(&query),
-        &metrics,
-        Arc::clone(&salt_rwlock),
-    );
+    // With --serve-during-mempool-sync, the servers start serving chain-based queries
+    // right away while the mempool syncs; /health/ready reports mempool_synced=false
+    // until the initial sync completes, keeping the instance out of LB rotation.
+    let mut servers = if config.serve_during_mempool_sync {
+        Some(start_servers(&config, &query, &metrics, &salt_rwlock))
+    } else {
+        None
+    };
 
+    while !Mempool::update(&mempool, &daemon, &tip)? {
+        // Mempool syncing was aborted because the chain tip moved;
+        // Index the new block(s) and try again.
+        tip = indexer.update(&daemon)?;
+    }
+
+    let (rest_server, electrum_server) = match servers.take() {
+        Some(servers) => servers,
+        None => start_servers(&config, &query, &metrics, &salt_rwlock),
+    };
     info!("startup complete");
 
     let main_loop_count = metrics.gauge(MetricOpts::new(

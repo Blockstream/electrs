@@ -697,6 +697,28 @@ fn handle_request(
         path.get(3),
         path.get(4),
     ) {
+        (&Method::GET, Some(&"health"), Some(&"ready"), None, None, None) => {
+            // The chain index is always synced by the time the server is listening; the
+            // mempool may still be performing its initial sync when started with
+            // --serve-during-mempool-sync. 503 keeps not-fully-synced instances out of
+            // load balancer rotation while still being reachable for diagnostics.
+            let mempool_synced = query.mempool_synced();
+            let status = if mempool_synced {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            Ok(Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .header("Cache-Control", "no-cache")
+                .body(Full::new(Bytes::from(format!(
+                    "{{\"chain_synced\":true,\"mempool_synced\":{}}}",
+                    mempool_synced
+                ))))
+                .unwrap())
+        }
+
         (&Method::GET, Some(&"blocks"), Some(&"tip"), Some(&"hash"), None, None) => http_message(
             StatusCode::OK,
             query.chain().best_hash().to_string(),
