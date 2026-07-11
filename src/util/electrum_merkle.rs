@@ -24,6 +24,32 @@ pub fn get_tx_merkle_proof(
     Ok((branch, pos))
 }
 
+/// Merkle proof of a transaction's inclusion in its block's WITNESS tree
+/// (wtxids, coinbase leaf zeroed per BIP-141): the tree committed to by the
+/// coinbase witness commitment. Together with a txid proof of the coinbase,
+/// this binds a transaction's full serialization (witness included) to the
+/// block header, which a txid proof alone cannot do for segwit data.
+/// Returns (branch, position, witness_merkle_root).
+#[cfg(not(feature = "liquid"))]
+#[trace]
+pub fn get_tx_witness_merkle_proof(
+    chain: &ChainQuery,
+    tx_hash: &Txid,
+    block_hash: &BlockHash,
+) -> Result<(Vec<Sha256dHash>, usize, Sha256dHash)> {
+    let txids = chain
+        .get_block_txids(block_hash)
+        .chain_err(|| format!("missing block txids for #{}", block_hash))?;
+    let pos = txids
+        .iter()
+        .position(|txid| txid == tx_hash)
+        .chain_err(|| format!("missing txid {}", tx_hash))?;
+
+    let wtxids = chain.get_block_wtxids(block_hash)?;
+    let (branch, root) = create_merkle_branch_and_root(wtxids, pos);
+    Ok((branch, pos, root))
+}
+
 #[trace]
 pub fn get_header_merkle_proof(
     chain: &ChainQuery,
@@ -87,7 +113,7 @@ fn merklize(left: Sha256dHash, right: Sha256dHash) -> Sha256dHash {
     Sha256dHash::hash(&data)
 }
 
-fn create_merkle_branch_and_root(
+pub fn create_merkle_branch_and_root(
     mut hashes: Vec<Sha256dHash>,
     mut index: usize,
 ) -> (Vec<Sha256dHash>, Sha256dHash) {
