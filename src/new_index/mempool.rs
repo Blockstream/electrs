@@ -37,6 +37,15 @@ pub struct Mempool {
     feeinfo: HashMap<Txid, TxFeeInfo>,
     // Map txid -> scripthashes touched, to prune efficiently on eviction.
     tx_scripthashes: HashMap<Txid, Vec<FullHash>>,
+    // Delta tracking for electrum subscription updates: scripthash -> the epoch at
+    // which a mempool add/removal last touched it. Connections snapshot the epoch
+    // each periodic tick and only re-check scripthashes touched since their last
+    // tick instead of every subscription (O(touched) vs O(subscribed)).
+    touched: HashMap<FullHash, u64>,
+    touched_epoch: u64,
+    // Entries older than this epoch have been pruned; ticks whose snapshot predates
+    // it must fall back to a full scan for correctness.
+    touched_floor: u64,
     history: HashMap<FullHash, Vec<TxHistoryInfo>>, // ScriptHash -> {history_entries}
     edges: HashMap<OutPoint, (Txid, u32)>,          // OutPoint -> (spending_txid, spending_vin)
     recent: ArrayDeque<TxOverview, RECENT_TXS_SIZE, Wrapping>, // The N most recent txs to enter the mempool
@@ -74,6 +83,9 @@ impl Mempool {
             txstore: HashMap::new(),
             feeinfo: HashMap::new(),
             tx_scripthashes: HashMap::new(),
+            touched: HashMap::new(),
+            touched_epoch: 0,
+            touched_floor: 0,
             history: HashMap::new(),
             edges: HashMap::new(),
             recent: ArrayDeque::new(),
@@ -346,6 +358,15 @@ impl Mempool {
 
     #[trace]
     fn add(&mut self, txs_map: HashMap<Txid, Transaction>) -> Result<()> {
+        self.touched_epoch += 1;
+        // Bound the touched-tracking map: entries older than ~720 epochs (roughly an
+        // hour of 5s ticks) cannot matter to any connection that ticks regularly;
+        // ticks whose snapshot predates the floor fall back to a full scan.
+        if self.touched.len() > 200_000 {
+            let floor = self.touched_epoch.saturating_sub(720);
+            self.touched.retain(|_, e| *e >= floor);
+            self.touched_floor = floor;
+        }
         self.delta
             .with_label_values(&["add"])
             .observe(txs_map.len() as f64);
@@ -445,6 +466,9 @@ impl Mempool {
             }
             tx_scripthashes.sort_unstable();
             tx_scripthashes.dedup();
+            for sh in &tx_scripthashes {
+                self.touched.insert(*sh, self.touched_epoch);
+            }
             self.tx_scripthashes.insert(txid, tx_scripthashes);
             for (i, txi) in tx.input.iter().enumerate() {
                 self.edges.insert(txi.previous_output, (txid, i as u32));
@@ -493,11 +517,34 @@ impl Mempool {
     }
 
     #[trace]
+    /// Current touched-epoch; bumped on every mempool add/removal batch.
+    pub fn touched_epoch(&self) -> u64 {
+        self.touched_epoch
+    }
+
+    /// Scripthashes touched strictly after `since`, or `None` when `since` predates
+    /// the pruning floor (caller must fall back to a full scan). Also prunes the
+    /// tracking map when it grows large: entries older than ~720 epochs (roughly an
+    /// hour of 5s ticks) cannot matter to any live connection that ticks regularly.
+    pub fn touched_since(&self, since: u64) -> Option<HashSet<FullHash>> {
+        if since < self.touched_floor {
+            return None;
+        }
+        Some(
+            self.touched
+                .iter()
+                .filter(|(_, e)| **e > since)
+                .map(|(sh, _)| *sh)
+                .collect(),
+        )
+    }
+
     fn remove(&mut self, to_remove: HashSet<&Txid>) {
         self.delta
             .with_label_values(&["remove"])
             .observe(to_remove.len() as f64);
         let _timer = self.latency.with_label_values(&["remove"]).start_timer();
+        self.touched_epoch += 1;
 
         for txid in &to_remove {
             let tx = self
@@ -513,6 +560,9 @@ impl Mempool {
                 .tx_scripthashes
                 .remove(*txid)
                 .unwrap_or_else(|| panic!("missing tx_scripthashes for {}", txid));
+            for sh in &scripthashes {
+                self.touched.insert(*sh, self.touched_epoch);
+            }
             prune_history_entries(&mut self.history, &scripthashes, txid);
 
             for txin in tx.input {

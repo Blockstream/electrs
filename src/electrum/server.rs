@@ -158,6 +158,9 @@ struct Connection {
     query: Arc<Query>,
     last_header_entry: Option<HeaderEntry>,
     status_hashes: HashMap<Sha256dHash, Value>, // ScriptHash -> StatusHash
+    // Mempool touched-epoch snapshot from this connection's last periodic tick;
+    // None forces a full subscription scan (first tick / after pruning).
+    mempool_touched_epoch: Option<u64>,
     stream: TcpStream,
     addr: SocketAddr,
     sender: SyncSender<Message>,
@@ -192,6 +195,7 @@ impl Connection {
             query,
             last_header_entry: None, // disable header subscription for now
             status_hashes: HashMap::new(),
+            mempool_touched_epoch: None,
             stream,
             addr,
             sender,
@@ -617,9 +621,11 @@ impl Connection {
             .with_label_values(&["periodic_update"])
             .start_timer();
         let mut result = vec![];
+        let mut tip_changed = false;
         if let Some(ref mut last_entry) = self.last_header_entry {
             let entry = self.query.chain().best_header();
             if *last_entry != entry {
+                tip_changed = true;
                 *last_entry = entry;
                 let hex_header = serialize_hex(last_entry.header());
                 let header = json!({"hex": hex_header, "height": last_entry.height()});
@@ -629,7 +635,28 @@ impl Connection {
                     "params": [header]}));
             }
         }
+        // Delta-driven fast path: on a mempool-only tick (no new block), only
+        // re-check subscriptions whose scripthash the mempool actually touched
+        // since our last tick. A new block can affect any subscription (and the
+        // chain index has no equivalent touched-set yet), so tip changes keep the
+        // full scan; blocks are rare relative to 5s ticks. `None` (first tick, or
+        // the mempool pruned past our snapshot) also falls back to the full scan.
+        let (current_epoch, touched) = {
+            let mempool = self.query.mempool();
+            let epoch = mempool.touched_epoch();
+            let touched = match self.mempool_touched_epoch {
+                Some(since) if !tip_changed => mempool.touched_since(since),
+                _ => None,
+            };
+            (epoch, touched)
+        };
+        self.mempool_touched_epoch = Some(current_epoch);
         for (script_hash, status_hash) in self.status_hashes.iter_mut() {
+            if let Some(ref touched) = touched {
+                if !touched.contains(&script_hash.to_byte_array()) {
+                    continue;
+                }
+            }
             let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
             let new_status_hash = get_status_hash(history_txids, &self.query)
                 .map_or(Value::Null, |h| json!(h.to_lower_hex_string()));
