@@ -283,15 +283,24 @@ impl Indexer {
     fn start_auto_compactions(&self, db: &DB) {
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
-            info!("full-compaction sentinel 'F' not found — running one-time full compaction");
+            info!(
+                "full-compaction sentinel 'F' not found in {:?} — running one-time full compaction",
+                db
+            );
             db.full_compaction();
-            info!("full compaction finished — tightening triggers to steady-state values");
+            info!(
+                "full compaction finished for {:?} — tightening triggers to steady-state values",
+                db
+            );
             db.apply_steady_state_triggers();
             db.put_sync(&key, b"");
             assert!(db.get(&key).is_some());
-            info!("full-compaction sentinel 'F' set");
+            info!("full-compaction sentinel 'F' set in {:?}", db);
         } else {
-            info!("full-compaction sentinel 'F' found — skipping full compaction");
+            trace!(
+                "full-compaction sentinel 'F' found in {:?} — skipping full compaction",
+                db
+            );
         }
         db.enable_auto_compaction();
     }
