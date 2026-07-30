@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use stderrlog;
 
 use crate::chain::Network;
@@ -27,7 +28,9 @@ pub struct Config {
     pub daemon_dir: PathBuf,
     pub blocks_dir: PathBuf,
     pub daemon_rpc_addr: SocketAddr,
+    pub daemon_rpc_fallback_addr: Option<SocketAddr>,
     pub daemon_parallelism: usize,
+    pub daemon_conn_max_age: Option<Duration>,
     pub cookie: Option<String>,
     pub electrum_rpc_addr: SocketAddr,
     pub http_addr: SocketAddr,
@@ -37,6 +40,7 @@ pub struct Config {
     pub light_mode: bool,
     pub address_search: bool,
     pub index_unspendables: bool,
+    pub enable_mining_rest: bool,
     pub cors: Option<String>,
     pub precache_scripts: Option<String>,
     pub utxos_limit: usize,
@@ -169,10 +173,23 @@ impl Config {
                     .takes_value(true),
             )
             .arg(
+                Arg::with_name("daemon_rpc_fallback_addr")
+                    .long("daemon-rpc-fallback-addr")
+                    .help("Fallback Bitcoin daemon JSONRPC 'addr:port' to connect if the primary fails")
+                    .takes_value(true),
+            )
+            .arg(
                 Arg::with_name("daemon_parallelism")
                     .long("daemon-parallelism")
                     .help("Number of JSONRPC requests to send in parallel")
                     .default_value("4")
+            )
+            .arg(
+                Arg::with_name("daemon_rpc_conn_max_age")
+                    .long("daemon-rpc-conn-max-age")
+                    .help("Max age (in seconds) of a daemon RPC TCP connection before it is proactively recycled. Recycling re-establishes the connection, letting a load balancer (e.g. a Kubernetes ClusterSetIP) re-select a backend after node rotations. The reconnect happens inline on the next request, so prefer a generous value (minutes, not seconds) to avoid periodic latency spikes. 0 = unlimited / never recycle (default)")
+                    .default_value("0")
+                    .takes_value(true),
             )
             .arg(
                 Arg::with_name("monitoring_addr")
@@ -199,6 +216,11 @@ impl Config {
                 Arg::with_name("index_unspendables")
                     .long("index-unspendables")
                     .help("Enable indexing of provably unspendable outputs")
+            )
+            .arg(
+                Arg::with_name("enable_mining_rest")
+                    .long("enable-mining-rest")
+                    .help("Enable cached mining-related HTTP endpoints")
             )
             .arg(
                 Arg::with_name("cors")
@@ -311,7 +333,7 @@ impl Config {
         let args = args.arg(
                 Arg::with_name("electrum_public_hosts")
                     .long("electrum-public-hosts")
-                    .help("A dictionary of hosts where the Electrum server can be reached at. Required to enable server discovery. See https://electrumx.readthedocs.io/en/latest/protocol-methods.html#server-features")
+                    .help("A dictionary of hosts where the Electrum server can be reached at. Required to enable server discovery. See https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features")
                     .takes_value(true)
             ).arg(
                 Arg::with_name("electrum_announce")
@@ -430,6 +452,16 @@ impl Config {
                 .unwrap_or(&format!("127.0.0.1:{}", default_daemon_port)),
             "Bitcoin RPC",
         );
+        let daemon_rpc_fallback_addr: Option<SocketAddr> = m
+            .value_of("daemon_rpc_fallback_addr")
+            .map(|e| str_to_socketaddr(e, "Bitcoin Fallback RPC"));
+
+        let daemon_conn_max_age: Option<Duration> =
+            match value_t_or_exit!(m, "daemon_rpc_conn_max_age", u64) {
+                0 => None, // 0 = unlimited / never recycle
+                secs => Some(Duration::from_secs(secs)),
+            };
+
         let electrum_rpc_addr: SocketAddr = str_to_socketaddr(
             m.value_of("electrum_rpc_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_electrum_port)),
@@ -497,7 +529,9 @@ impl Config {
             daemon_dir,
             blocks_dir,
             daemon_rpc_addr,
+            daemon_rpc_fallback_addr,
             daemon_parallelism: value_t_or_exit!(m, "daemon_parallelism", usize),
+            daemon_conn_max_age,
             cookie,
             utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
             electrum_rpc_addr,
@@ -519,6 +553,7 @@ impl Config {
             light_mode: m.is_present("light_mode"),
             address_search: m.is_present("address_search"),
             index_unspendables: m.is_present("index_unspendables"),
+            enable_mining_rest: m.is_present("enable_mining_rest"),
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
             db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),

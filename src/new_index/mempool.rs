@@ -7,7 +7,7 @@ use electrs_macros::trace;
 #[cfg(feature = "liquid")]
 use elements::{encode::serialize, AssetId};
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -322,6 +322,28 @@ impl Mempool {
         }
     }
 
+    /// Add multiple transactions (e.g. an accepted package) to the mempool in a single batch,
+    /// so that interdependent parent/child txs are linked within the same `add` call. Txids that
+    /// are already present or cannot be fetched from the daemon are skipped.
+    pub fn add_by_txids(&mut self, daemon: &Daemon, txids: &[Txid]) -> Result<()> {
+        let mut txs_map = HashMap::new();
+        for &txid in txids {
+            if self.txstore.get(&txid).is_some() {
+                continue;
+            }
+            match daemon.getmempooltx(&txid) {
+                Ok(tx) => {
+                    txs_map.insert(txid, tx);
+                }
+                Err(e) => warn!("add_by_txids cannot find txid='{}': e='{}'", txid, e),
+            }
+        }
+        if txs_map.is_empty() {
+            return Ok(());
+        }
+        self.add(txs_map)
+    }
+
     #[trace]
     fn add(&mut self, txs_map: HashMap<Txid, Transaction>) -> Result<()> {
         self.delta
@@ -494,13 +516,37 @@ impl Mempool {
             prune_history_entries(&mut self.history, &scripthashes, txid);
 
             for txin in tx.input {
-                assert!(
-                    self.edges.remove(&txin.previous_output).is_some(),
-                    "missing mempool edge for outpoint {}:{} (tx {})",
-                    txin.previous_output.txid,
-                    txin.previous_output.vout,
-                    txid
-                );
+                // Don't assert here: conflicting (RBF) spends can transiently
+                // coexist in the local view. update() itself is safe (evictions
+                // are applied before additions, diffed against one consistent
+                // bitcoind snapshot), but Query::broadcast_raw()/submit_package()
+                // inject transactions via add_by_txid(s) outside the sync loop -
+                // broadcasting a replacement while the original is still indexed
+                // makes the later add() clobber the original's `edges` entry.
+                // Evicting the original then finds its entry gone or foreign.
+                // Recoverable bookkeeping noise, not a reason to crash.
+                match self.edges.entry(txin.previous_output) {
+                    Entry::Occupied(entry) if entry.get().0 == **txid => {
+                        entry.remove();
+                    }
+                    Entry::Occupied(entry) => {
+                        warn!(
+                            "mempool edge for outpoint {}:{} owned by conflicting tx {} (evicting {})",
+                            txin.previous_output.txid,
+                            txin.previous_output.vout,
+                            entry.get().0,
+                            txid
+                        );
+                    }
+                    Entry::Vacant(_) => {
+                        warn!(
+                            "mempool edge for outpoint {}:{} already gone (evicting {})",
+                            txin.previous_output.txid,
+                            txin.previous_output.vout,
+                            txid
+                        );
+                    }
+                }
             }
         }
 

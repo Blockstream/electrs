@@ -191,11 +191,16 @@ fn test_rest_address() -> Result<()> {
     assert!(txids.is_empty());
 
     // Test GET /address-prefix/:prefix
+    // Assert addr1 is among the matches rather than the only one: other
+    // randomly-generated wallet addresses (e.g. change) can legitimately
+    // share the 8-char prefix (~1/1024 per address), which made this
+    // assertion flaky as an exact len()==1 check.
     let addr1_prefix = &addr1.to_string()[0..8];
     let res = get_json(rest_addr, &format!("/address-prefix/{}", addr1_prefix))?;
     let found = res.as_array().expect("array of matching addresses");
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].as_str(), Some(addr1.to_string().as_str()));
+    assert!(found
+        .iter()
+        .any(|a| a.as_str() == Some(addr1.to_string().as_str())));
 
     rest_handle.stop();
     Ok(())
@@ -444,6 +449,43 @@ fn test_rest_mempool() -> Result<()> {
     assert_eq!(
         mempool_after["fee_histogram"].as_array().unwrap().len(),
         0
+    );
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[test]
+fn test_rest_getblocktemplate() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    let tip = tester.get_best_block_hash()?;
+    let response = get(rest_addr, "/block-template")?;
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let template: Value = response.into_body().read_json()?;
+    assert_eq!(
+        template["previousblockhash"].as_str(),
+        Some(tip.to_string().as_str())
+    );
+    assert!(template["transactions"].is_array());
+    assert!(template["version"].is_i64() || template["version"].is_u64());
+    assert!(template["rules"].is_array());
+    assert!(template["bits"].is_string());
+
+    let cached_template = get_json(rest_addr, "/block-template")?;
+    assert_eq!(cached_template, template);
+
+    let new_tip = tester.mine()?;
+    let updated_template = get_json(rest_addr, "/block-template")?;
+    assert_eq!(
+        updated_template["previousblockhash"].as_str(),
+        Some(new_tip.to_string().as_str())
     );
 
     rest_handle.stop();
@@ -1241,6 +1283,57 @@ fn test_rest_submit_package() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: POST /txs/package must add accepted txs to electrs' local mempool, so they are
+/// immediately visible via the address/scripthash endpoints (not only after the next background sync).
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_rest_package_updates_mempool() -> Result<()> {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let (rest_handle, rest_addr, tester) = common::init_rest_tester().unwrap();
+
+    let addr = tester.newaddress()?;
+
+    // Create a tx via the node directly, WITHOUT tester.send() -- so electrs does not sync it into
+    // its local mempool. The tx is in bitcoind's mempool but unknown to electrs.
+    let txid: Txid = tester
+        .node_client()
+        .call("sendtoaddress", &[addr.to_string().into(), 0.1.into()])
+        .unwrap();
+    let tx_hex = serialize_hex(&tester.get_raw_transaction(txid)?);
+
+    let addr_txids = |rest_addr: net::SocketAddr| -> Vec<String> {
+        get_json(rest_addr, &format!("/address/{}/txs", addr))
+            .unwrap()
+            .as_array()
+            .expect("txs array")
+            .iter()
+            .map(|tx| tx["txid"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // electrs has not synced the tx yet, so the address has no txs
+    assert!(
+        addr_txids(rest_addr).is_empty(),
+        "tx should not be in electrs' mempool before the package is submitted"
+    );
+
+    // submit the (already-in-bitcoind-mempool) tx as a 1-tx package
+    let package_resp =
+        ureq::post(&format!("http://{}/txs/package", rest_addr)).send_json([tx_hex])?;
+    assert_eq!(package_resp.status(), 200);
+
+    // the accepted tx must now be visible immediately via the address endpoint
+    assert_eq!(
+        addr_txids(rest_addr),
+        vec![txid.to_string()],
+        "POST /txs/package did not add the accepted tx to electrs' local mempool"
+    );
+
+    rest_handle.stop();
+    Ok(())
+}
+
 // Elements-only tests
 
 #[cfg(feature = "liquid")]
@@ -1443,6 +1536,91 @@ fn test_rest_liquid_block() -> Result<()> {
     assert!(block2["ext"]["current"]["fedpegscript"].is_null());
     assert!(block2["ext"]["current"]["fedpeg_program"].is_null());
     assert!(block2["ext"]["current"]["extension_space"].is_null());
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_rest_mempool_rbf_eviction() -> Result<()> {
+    // Regression test for the mempool eviction panic ("missing mempool edge
+    // for outpoint"): tx A and its RBF replacement B spend the same outpoint
+    // and transiently coexist in the local mempool view when B is injected
+    // through the broadcast endpoint (add_by_txid) while A is still indexed.
+    // B's add() clobbers A's `edges` entry; the next sync round evicts A and
+    // must tolerate the missing/foreign edge instead of panicking.
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    // Broadcast tx A via the node wallet, explicitly BIP125-replaceable,
+    // and index it into the local mempool view.
+    let addr1 = tester.newaddress()?;
+    let txid_a: Txid = tester.node_client().call(
+        "sendtoaddress",
+        &[
+            serde_json::json!(addr1.to_string()),
+            serde_json::json!(0.5),
+            serde_json::json!(null),
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(true), // replaceable
+        ],
+    )?;
+    tester.sync()?;
+    let res = get_json(rest_addr, &format!("/tx/{}", txid_a))?;
+    assert_eq!(res["status"]["confirmed"].as_bool(), Some(false));
+
+    // Build replacement B (same inputs, higher fee) WITHOUT broadcasting it
+    // through the node, so the node's mempool still holds A.
+    let bumped: Value = tester
+        .node_client()
+        .call("psbtbumpfee", &[serde_json::json!(txid_a.to_string())])?;
+    let processed: Value = tester
+        .node_client()
+        .call("walletprocesspsbt", &[bumped["psbt"].clone()])?;
+    assert_eq!(processed["complete"].as_bool(), Some(true));
+    let finalized: Value = tester
+        .node_client()
+        .call("finalizepsbt", &[processed["psbt"].clone()])?;
+    let b_hex = finalized["hex"].as_str().expect("finalized tx hex");
+
+    // Inject B through the electrs broadcast endpoint: the node accepts the
+    // replacement (evicting A node-side), and add_by_txid() indexes B locally
+    // while A is still present - clobbering A's edges entry for the shared
+    // outpoint.
+    let broadcast_resp = ureq::post(&format!("http://{}/tx", rest_addr)).send(b_hex)?;
+    assert_eq!(broadcast_resp.status(), 200);
+    let txid_b = broadcast_resp.into_body().read_to_string()?;
+
+    // The next sync evicts A from the local view. The unfixed code passes the
+    // eviction assert here - but only by STEALING B's edge entry (any Some()
+    // satisfied it), which is the actual arming step of the crash.
+    tester.sync()?;
+
+    // B remains queryable in the mempool; A is gone.
+    let res = get_json(rest_addr, &format!("/tx/{}", txid_b.trim()))?;
+    assert_eq!(res["status"]["confirmed"].as_bool(), Some(false));
+    let gone = ureq::get(&format!("http://{}/tx/{}", rest_addr, txid_a))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(gone.status(), 404);
+
+    // Now B itself leaves the mempool (confirmed here; RBF-of-B or expiry are
+    // equivalent). Evicting B finds its edge entry gone - stolen by A's
+    // eviction above - and the unfixed code panics with "missing mempool edge
+    // for outpoint", killing the sync loop. The fixed code only removes an
+    // edge its evicted tx still owns, so B's edge survived A's eviction and
+    // this round stays clean.
+    tester.mine()?;
+    tester.sync()?;
+
+    let res = get_json(rest_addr, &format!("/tx/{}", txid_b.trim()))?;
+    assert_eq!(res["status"]["confirmed"].as_bool(), Some(true));
+
+    // And the server is still fully alive.
+    let _tip = get_plain(rest_addr, "/blocks/tip/height")?;
 
     rest_handle.stop();
     Ok(())

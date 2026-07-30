@@ -94,8 +94,10 @@ impl TestRunner {
             db_path: electrsdb.path().to_path_buf(),
             daemon_dir: daemon_subdir.clone(),
             daemon_parallelism: 3,
+            daemon_conn_max_age: None,
             blocks_dir: daemon_subdir.join("blocks"),
             daemon_rpc_addr: params.rpc_socket.into(),
+            daemon_rpc_fallback_addr: None,
             cookie: None,
             electrum_rpc_addr: rand_available_addr(),
             http_addr: rand_available_addr(),
@@ -105,6 +107,7 @@ impl TestRunner {
             light_mode: false,
             address_search: true,
             index_unspendables: false,
+            enable_mining_rest: true,
             cors: None,
             precache_scripts: None,
             utxos_limit: 100,
@@ -140,11 +143,13 @@ impl TestRunner {
             &config.daemon_dir,
             &config.blocks_dir,
             config.daemon_rpc_addr,
+            config.daemon_rpc_fallback_addr,
             config.daemon_parallelism,
             config.cookie_getter(),
             config.network_type,
             signal.clone(),
             &metrics,
+            config.daemon_conn_max_age,
         )?);
 
         let store = Arc::new(Store::open(&config, &metrics, true));

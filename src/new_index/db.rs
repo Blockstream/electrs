@@ -99,28 +99,9 @@ impl DB {
         db_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         db_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
         db_opts.set_target_file_size_base(1_073_741_824);
-        // Bulk-load compaction: allow L0 files to accumulate to a bounded limit
-        // before compacting. This reduces write amplification compared to the
-        // default trigger of 4, while keeping the file count — and therefore
-        // bloom-filter memory and lookup cost — bounded.
-        //
-        // With bloom filters at 10 bits/key and a 512 MB write buffer, each L0
-        // file has ~7.8 M keys, so its filter block is ~9.75 MB. At 64 files
-        // that is ~625 MB of pinned filter blocks — well within an 8 GB cache.
-        // Each lookup checks 64 bloom filters (fast, in-memory) and reads from
-        // only ~0.64 files on average (1 % false-positive rate × 64 files).
-        //
-        // Set slowdown/stop triggers well above the compaction trigger so writes
-        // are never stalled while background compaction catches up.
-        // Disable the pending-compaction-bytes stall so the large backlog that
-        // builds up during the bulk load does not block writes.
-        const L0_BULK_TRIGGER: i32 = 64;
-        db_opts.set_level_zero_file_num_compaction_trigger(L0_BULK_TRIGGER);
-        db_opts.set_level_zero_slowdown_writes_trigger(L0_BULK_TRIGGER * 4);
-        db_opts.set_level_zero_stop_writes_trigger(L0_BULK_TRIGGER * 8);
-        db_opts.set_hard_pending_compaction_bytes_limit(0);
-        db_opts.set_soft_pending_compaction_bytes_limit(0);
-
+        // L0 compaction triggers are left at RocksDB defaults (4/20/36) here.
+        // After open, apply_bulk_load_triggers() widens them for initial sync
+        // when the full-compaction sentinel 'F' is absent.
 
         let parallelism: i32 = config.db_parallelism.try_into()
             .expect("db_parallelism value too large for i32");
@@ -188,6 +169,13 @@ impl DB {
         let db = DB {
             db: Arc::new(rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB"))
         };
+        let key = b"F".to_vec();
+        if db.get(&key).is_none() {
+            info!("sentinel 'F' absent in {:?} — widening L0 triggers for bulk load", path);
+            db.apply_bulk_load_triggers();
+        } else {
+            info!("sentinel 'F' present in {:?} — using steady-state L0 triggers", path);
+        }
         if verify_compat {
             db.verify_compatibility(config);
         }
@@ -204,23 +192,51 @@ impl DB {
         info!("finished full compaction on {:?} in elapsed='{:.1?}'", self.db, elapsed);
     }
 
-    pub fn enable_auto_compaction(&self) {
-       // Reset L0 triggers and pending-compaction stall thresholds to RocksDB
-       // defaults, so that steady-state operation compacts promptly and avoids
-       // unbounded compaction backlogs that cause read latency spikes.
-       // RocksDB defaults (stable since v5.x through v10.4.2). Hardcoded because
-       // set_options() doesn't return previous values and the Rust bindings lack getters.
+    fn apply_bulk_load_triggers(&self) {
+        const L0_BULK_TRIGGER: u32 = 64;
+        let trigger = L0_BULK_TRIGGER.to_string();
+        let slowdown = (L0_BULK_TRIGGER * 4).to_string();
+        let stop = (L0_BULK_TRIGGER * 8).to_string();
 
+        let opts = [
+            ("level0_file_num_compaction_trigger", trigger.as_str()),
+            ("level0_slowdown_writes_trigger", slowdown.as_str()),
+            ("level0_stop_writes_trigger", stop.as_str()),
+            ("soft_pending_compaction_bytes_limit", "0"),
+            ("hard_pending_compaction_bytes_limit", "0"),
+        ];
+        self.db.set_options(&opts).unwrap();
+    }
+
+    pub fn enable_auto_compaction(&self) {
+        let opts = [("disable_auto_compactions", "false")];
+        self.db.set_options(&opts).unwrap();
+    }
+
+    /// Restore RocksDB-default compaction triggers after bulk-load widening,
+    /// for lower read amplification in steady-state operation.
+    ///
+    /// Must be called only after a compaction has drained L0 and any level-size
+    /// imbalance — otherwise the tightened `level0_stop_writes_trigger` parks
+    /// foreground flushes and sync writes in `WaitUntilFlushWouldNotStallWrites`
+    /// until background compaction catches up. On a mature DB with an hour-long
+    /// bottommost compaction in flight, that wait can exceed 70 minutes.
+    pub fn apply_steady_state_triggers(&self) {
+        // RocksDB internal defaults (cf_options.h, stable since v5.x through v10.4.2).
+        // Hardcoded because set_options() doesn't return previous values and the Rust
+        // bindings lack getters. Update these if RocksDB changes its defaults.
+        let trigger = 4u32.to_string();
+        let slowdown = 20u32.to_string();
+        let stop = 36u32.to_string();
         let soft_limit = (64u64 << 30).to_string(); // 64 GiB
         let hard_limit = (256u64 << 30).to_string(); // 256 GiB
 
         let opts = [
-            ("disable_auto_compactions", "false"),
-            ("level0_file_num_compaction_trigger", "4"),
-            ("level0_slowdown_writes_trigger", "20"),
-            ("level0_stop_writes_trigger", "36"),
-            ("soft_pending_compaction_bytes_limit", &soft_limit),
-            ("hard_pending_compaction_bytes_limit", &hard_limit),
+            ("level0_file_num_compaction_trigger", trigger.as_str()),
+            ("level0_slowdown_writes_trigger", slowdown.as_str()),
+            ("level0_stop_writes_trigger", stop.as_str()),
+            ("soft_pending_compaction_bytes_limit", soft_limit.as_str()),
+            ("hard_pending_compaction_bytes_limit", hard_limit.as_str()),
         ];
         self.db.set_options(&opts).unwrap();
     }

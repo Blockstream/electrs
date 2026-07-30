@@ -54,6 +54,8 @@ impl AssetRegistry {
     }
 
     pub fn fs_sync(&mut self) -> Result<()> {
+        let mut assets_cache = HashMap::new();
+
         for entry in fs::read_dir(&self.directory).chain_err(|| "failed reading asset dir")? {
             let entry = entry.chain_err(|| "invalid fh")?;
             let filetype = entry.file_type().chain_err(|| "failed getting file type")?;
@@ -84,8 +86,9 @@ impl AssetRegistry {
                     .modified()
                     .chain_err(|| "metadata modified failed")?;
 
-                if let Some((last_update, _)) = self.assets_cache.get(&asset_id) {
+                if let Some((last_update, metadata)) = self.assets_cache.get(&asset_id) {
                     if *last_update == modified {
+                        assets_cache.insert(asset_id, (modified, metadata.clone()));
                         continue;
                     }
                 }
@@ -95,9 +98,11 @@ impl AssetRegistry {
                 )
                 .chain_err(|| "failed parsing file")?;
 
-                self.assets_cache.insert(asset_id, (modified, metadata));
+                assets_cache.insert(asset_id, (modified, metadata));
             }
         }
+
+        self.assets_cache = assets_cache;
         Ok(())
     }
 
@@ -188,4 +193,120 @@ fn lc_cmp_opt(a: &Option<String>, b: &Option<String>) -> cmp::Ordering {
     a.as_ref()
         .map(|a| a.to_lowercase())
         .cmp(&b.as_ref().map(|b| b.to_lowercase()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const ASSET_ID_A: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+    const ASSET_ID_B: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+
+    fn asset_id(id: &str) -> AssetId {
+        AssetId::from_str(id).unwrap()
+    }
+
+    fn asset_file(dir: &TempDir, id: &str) -> path::PathBuf {
+        dir.path()
+            .join(&id[..DIR_PARTITION_LEN])
+            .join(format!("{}.json", id))
+    }
+
+    fn write_asset(dir: &TempDir, id: &str, name: &str, ticker: &str) {
+        let partition_dir = dir.path().join(&id[..DIR_PARTITION_LEN]);
+        fs::create_dir_all(&partition_dir).unwrap();
+        fs::write(
+            partition_dir.join(format!("{}.json", id)),
+            format!(
+                r#"{{"contract":null,"entity":{{"domain":"example.com"}},"precision":8,"name":"{}","ticker":"{}"}}"#,
+                name, ticker
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fs_sync_loads_assets_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        write_asset(&dir, ASSET_ID_A, "Asset A", "AAA");
+
+        let mut registry = AssetRegistry::new(dir.path().to_path_buf());
+        registry.fs_sync().unwrap();
+
+        let metadata = registry.get(&asset_id(ASSET_ID_A)).unwrap();
+        assert_eq!(metadata.name, "Asset A");
+        assert_eq!(metadata.ticker.as_deref(), Some("AAA"));
+    }
+
+    #[test]
+    fn fs_sync_removes_assets_deleted_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        write_asset(&dir, ASSET_ID_A, "Asset A", "AAA");
+        write_asset(&dir, ASSET_ID_B, "Asset B", "BBB");
+
+        let mut registry = AssetRegistry::new(dir.path().to_path_buf());
+        registry.fs_sync().unwrap();
+        assert_eq!(registry.assets_cache.len(), 2);
+
+        fs::remove_file(asset_file(&dir, ASSET_ID_A)).unwrap();
+        registry.fs_sync().unwrap();
+
+        assert!(registry.get(&asset_id(ASSET_ID_A)).is_none());
+        assert!(registry.get(&asset_id(ASSET_ID_B)).is_some());
+        assert_eq!(registry.assets_cache.len(), 1);
+    }
+
+    #[test]
+    fn fs_sync_reuses_cached_metadata_when_file_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        write_asset(&dir, ASSET_ID_A, "Asset A", "AAA");
+
+        let mut registry = AssetRegistry::new(dir.path().to_path_buf());
+        registry.fs_sync().unwrap();
+
+        let id = asset_id(ASSET_ID_A);
+        let modified = fs::metadata(asset_file(&dir, ASSET_ID_A))
+            .unwrap()
+            .modified()
+            .unwrap();
+        registry.assets_cache.insert(
+            id,
+            (
+                modified,
+                AssetMeta {
+                    contract: JsonValue::Null,
+                    entity: json!({"domain": "cached.example.com"}),
+                    precision: 0,
+                    name: "Cached Asset".to_string(),
+                    ticker: Some("CACHE".to_string()),
+                },
+            ),
+        );
+
+        registry.fs_sync().unwrap();
+
+        let metadata = registry.get(&id).unwrap();
+        assert_eq!(metadata.name, "Cached Asset");
+        assert_eq!(metadata.ticker.as_deref(), Some("CACHE"));
+    }
+
+    #[test]
+    fn fs_sync_refreshes_metadata_when_file_is_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        write_asset(&dir, ASSET_ID_A, "Asset A", "AAA");
+
+        let mut registry = AssetRegistry::new(dir.path().to_path_buf());
+        registry.fs_sync().unwrap();
+
+        let id = asset_id(ASSET_ID_A);
+        registry.assets_cache.get_mut(&id).unwrap().0 = SystemTime::UNIX_EPOCH;
+        write_asset(&dir, ASSET_ID_A, "Updated Asset", "UPD");
+
+        registry.fs_sync().unwrap();
+
+        let metadata = registry.get(&id).unwrap();
+        assert_eq!(metadata.name, "Updated Asset");
+        assert_eq!(metadata.ticker.as_deref(), Some("UPD"));
+    }
 }

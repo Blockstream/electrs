@@ -601,7 +601,10 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
                 tokio::select! {
                     result = listener.accept() => {
                         match result {
-                            Ok((stream, _)) => spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful),
+                            Ok((stream, _)) => {
+                                stream.set_nodelay(true).expect("failed to set TCP_NODELAY");
+                                spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful);
+                            }
                             Err(e) => warn!("accept error: {}", e),
                         }
                     }
@@ -1147,6 +1150,15 @@ fn handle_request(
             json_response(query.estimate_fee_map(), TTL_SHORT)
         }
 
+        (&Method::GET, Some(&"block-template"), None, None, None, None) => {
+            if !config.enable_mining_rest {
+                return Err(HttpError::forbidden(
+                    "mining REST endpoints are disabled".to_string(),
+                ));
+            }
+            getblocktemplate_response(query.getblocktemplate())
+        }
+
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"assets"), Some(&"registry"), None, None, None) => {
             let start_index: usize = query_params
@@ -1288,12 +1300,84 @@ where
 }
 
 fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Full<Bytes>>, HttpError> {
+    json_response_with_status(value, StatusCode::OK, ttl)
+}
+
+fn json_response_with_status<T: Serialize>(
+    value: T,
+    status: StatusCode,
+    ttl: u32,
+) -> Result<Response<Full<Bytes>>, HttpError> {
     let value = serde_json::to_string(&value)?;
     Ok(Response::builder()
+        .status(status)
         .header("Content-Type", "application/json")
         .header("Cache-Control", format!("public, max-age={:}", ttl))
         .body(Full::new(Bytes::from(value)))
         .unwrap())
+}
+
+fn json_response_no_store<T: Serialize>(
+    value: T,
+    status: StatusCode,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    let value = serde_json::to_string(&value)?;
+    Ok(Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(Bytes::from(value)))
+        .unwrap())
+}
+
+fn json_bytes_response_no_store(body: Bytes) -> Result<Response<Full<Bytes>>, HttpError> {
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(body))
+        .unwrap())
+}
+
+fn text_response_no_store<T: Into<Bytes>>(
+    status: StatusCode,
+    message: T,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    Ok(Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(message.into()))
+        .unwrap())
+}
+
+fn getblocktemplate_response(
+    result: errors::Result<Bytes>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    match result {
+        Ok(body) => json_bytes_response_no_store(body),
+        Err(err) => {
+            if let Some((code, message)) = getblocktemplate_rpc_error(&err) {
+                return json_response_no_store(
+                    json!({ "error": { "code": code, "message": message } }),
+                    StatusCode::BAD_GATEWAY,
+                );
+            }
+            if let errors::ErrorKind::Connection(message) = err.kind() {
+                return text_response_no_store(StatusCode::BAD_GATEWAY, message.clone());
+            }
+            Err(HttpError::from(err))
+        }
+    }
+}
+
+fn getblocktemplate_rpc_error(err: &errors::Error) -> Option<(i64, String)> {
+    match err.kind() {
+        errors::ErrorKind::RpcError(code, message, method) if method == "getblocktemplate" => {
+            Some((*code, message.clone()))
+        }
+        _ => None,
+    }
 }
 
 #[trace]
@@ -1378,6 +1462,10 @@ impl HttpError {
     fn not_found(msg: String) -> Self {
         HttpError(StatusCode::NOT_FOUND, msg)
     }
+
+    fn forbidden(msg: String) -> Self {
+        HttpError(StatusCode::FORBIDDEN, msg)
+    }
 }
 
 impl From<String> for HttpError {
@@ -1452,7 +1540,9 @@ impl From<address::AddressError> for HttpError {
 
 #[cfg(test)]
 mod tests {
-    use crate::rest::HttpError;
+    use crate::{errors, rest::HttpError};
+    use http_body_util::BodyExt;
+    use hyper::StatusCode;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -1516,5 +1606,64 @@ mod tests {
             .ok_or(HttpError::from("notexist absent or not a u64".to_string()));
 
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_getblocktemplate_rpc_error() {
+        let err: errors::Error = errors::ErrorKind::RpcError(
+            -8,
+            "getblocktemplate must be called with the segwit rule set".to_string(),
+            "getblocktemplate".to_string(),
+        )
+        .into();
+        assert_eq!(
+            super::getblocktemplate_rpc_error(&err),
+            Some((
+                -8,
+                "getblocktemplate must be called with the segwit rule set".to_string()
+            ))
+        );
+
+        let other_method: errors::Error =
+            errors::ErrorKind::RpcError(-5, "Block not found".to_string(), "getblock".to_string())
+                .into();
+        assert_eq!(super::getblocktemplate_rpc_error(&other_method), None);
+    }
+
+    #[tokio::test]
+    async fn test_getblocktemplate_response_no_store_errors() {
+        let warmup: errors::Error = errors::ErrorKind::RpcError(
+            -28,
+            "warming up".to_string(),
+            "getblocktemplate".to_string(),
+        )
+        .into();
+        let response = super::getblocktemplate_response(Err(warmup)).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"].as_i64(), Some(-28));
+        assert_eq!(body["error"]["message"].as_str(), Some("warming up"));
+
+        let connection: errors::Error =
+            errors::ErrorKind::Connection("daemon unavailable".to_string()).into();
+        let response = super::getblocktemplate_response(Err(connection)).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"daemon unavailable");
     }
 }

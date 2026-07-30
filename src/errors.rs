@@ -24,6 +24,11 @@ error_chain! {
             display("Too many history entries")
         }
 
+        InvalidParams(msg: String) {
+            description("Invalid RPC params")
+            display("{}", msg)
+        }
+
         #[cfg(feature = "electrum-discovery")]
         ElectrumClient(e: electrum_client::Error) {
             description("Electrum client error")
