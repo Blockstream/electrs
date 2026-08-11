@@ -244,6 +244,22 @@ pub struct ChainQuery {
 // TODO: &[Block] should be an iterator / a queue.
 impl Indexer {
     pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
+        #[cfg(feature = "liquid")]
+        if let Some(prevtx) = config.initial_issuance_prevtx {
+            // Seed a dummy zero-value txo so the indexer can resolve the
+            // initial issuance input via a normal lookup, instead of a
+            // special-case in has_prevout(). See issue #125.
+            let outpoint = OutPoint {
+                txid: prevtx,
+                vout: 0,
+            };
+            let key = TxOutRow::key(&outpoint);
+            let txstore_db = store.txstore_db();
+            if txstore_db.get(&key).is_none() {
+                txstore_db.put(&key, &serialize(&TxOut::default()));
+            }
+        }
+
         Indexer {
             store,
             flush: DBFlush::Disable,
