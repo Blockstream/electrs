@@ -697,6 +697,40 @@ async fn handle_request(
         path.get(3),
         path.get(4),
     ) {
+        (&Method::GET, Some(&"headers"), hash, count, None, None) => {
+            let count = count
+                .and_then(|c| c.parse::<usize>().ok())
+                .map(|c| c.max(1).min(2000))
+                .unwrap_or(2000);
+            let from_hash = hash
+                .map(|h| BlockHash::from_hex(h))
+                .transpose()?
+                .unwrap_or_else(|| query.chain().best_hash());
+
+            let headers = match query.chain().get_headers(&from_hash, count) {
+                Some(headers) => headers,
+                None => return Err(HttpError::not_found("Block not found".to_string())),
+            };
+
+            let mut raw = Vec::with_capacity(8 + 80 * headers.len());
+            raw.append(&mut encode::serialize(
+                &encode::VarInt(headers.len() as u64),
+            ));
+            for header in headers.into_iter() {
+                raw.append(&mut encode::serialize(&header));
+            }
+
+            let cache_ttl = match hash {
+                None => TTL_SHORT,
+                Some(_) => TTL_SHORT,
+            };
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/octet-stream")
+                .header("Cache-Control", format!("public, max-age={:}", cache_ttl))
+                .body(Body::from(raw))
+                .unwrap())
+        }
         (&Method::GET, Some(&"blocks"), Some(&"tip"), Some(&"hash"), None, None) => http_message(
             StatusCode::OK,
             query.chain().best_hash().to_string(),
