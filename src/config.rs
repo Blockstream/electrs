@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use stderrlog;
+#[cfg(feature = "liquid")]
+use url::Url;
 
 use crate::chain::Network;
 use crate::daemon::CookieGetter;
@@ -122,7 +124,7 @@ pub struct Config {
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
-    pub asset_db_path: Option<PathBuf>,
+    pub asset_registry_url: Option<Url>,
 
     pub electrum_public_hosts: Option<crate::electrum::ServerHosts>,
     #[cfg(feature = "electrum-discovery")]
@@ -433,9 +435,17 @@ impl Config {
                     .takes_value(true),
             )
             .arg(
+                Arg::with_name("asset_registry_url")
+                    .long("asset-registry-url")
+                    .help("Base URL for the Liquid asset registry v2 service")
+                    .takes_value(true),
+            )
+            .arg(
+                // Retained so upgraded deployments receive an actionable migration error
+                // instead of clap's generic unknown-argument message.
                 Arg::with_name("asset_db_path")
                     .long("asset-db-path")
-                    .help("Directory for liquid/elements asset db")
+                    .hidden(true)
                     .takes_value(true),
             );
 
@@ -474,7 +484,20 @@ impl Config {
             });
 
         #[cfg(feature = "liquid")]
-        let asset_db_path = m.value_of("asset_db_path").map(PathBuf::from);
+        if m.value_of("asset_db_path").is_some() {
+            clap::Error::with_description(
+                "--asset-db-path is no longer supported; the on-disk asset registry has been \
+                 replaced by the v2 HTTP registry — configure it with --asset-registry-url",
+                clap::ErrorKind::InvalidValue,
+            )
+            .exit();
+        }
+        #[cfg(feature = "liquid")]
+        let asset_registry_url = m.value_of("asset_registry_url").map(|value| {
+            parse_asset_registry_url(value).unwrap_or_else(|e| {
+                clap::Error::with_description(&e, clap::ErrorKind::InvalidValue).exit()
+            })
+        });
 
         let default_daemon_port = match network_type {
             #[cfg(not(feature = "liquid"))]
@@ -788,7 +811,7 @@ impl Config {
             #[cfg(feature = "liquid")]
             parent_network,
             #[cfg(feature = "liquid")]
-            asset_db_path,
+            asset_registry_url,
 
             electrum_public_hosts,
             #[cfg(feature = "electrum-discovery")]
@@ -833,6 +856,20 @@ impl RpcLogging {
             panic!("Flags '--hide-json-rpc-logging-parameters' or '--anonymize-json-rpc-logging-source-ip' require '--enable-json-rpc-logging'");
         }
     }
+}
+
+#[cfg(feature = "liquid")]
+fn parse_asset_registry_url(value: &str) -> std::result::Result<Url, String> {
+    let url = Url::parse(value).map_err(|error| {
+        format!(
+            "--asset-registry-url is not a valid URL: {} (did you forget the http:// or \
+             https:// scheme?)",
+            error
+        )
+    })?;
+    crate::elements::validate_registry_base_url(&url)
+        .map_err(|error| format!("--asset-registry-url: {}", error))?;
+    Ok(url)
 }
 
 pub fn get_network_subdir(network: Network) -> Option<&'static str> {
@@ -883,6 +920,8 @@ impl CookieGetter for CookieFile {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "liquid")]
+    use super::parse_asset_registry_url;
     use super::SensitiveAuth;
 
     #[test]
@@ -893,5 +932,40 @@ mod tests {
 
         assert_eq!(rendered, r#"UserPass("poc-user", "<sensitive>")"#);
         assert!(!rendered.contains(password));
+    }
+
+    #[cfg(feature = "liquid")]
+    #[test]
+    fn parse_asset_registry_url_rejects_missing_scheme() {
+        let error = parse_asset_registry_url("registry.example.com/api").unwrap_err();
+
+        assert!(error.contains("http://"));
+        assert!(error.contains("https://"));
+    }
+
+    #[cfg(feature = "liquid")]
+    #[test]
+    fn parse_asset_registry_url_rejects_wrong_scheme() {
+        let error = parse_asset_registry_url("ftp://registry.example/api").unwrap_err();
+
+        assert!(error.contains("http or https"));
+    }
+
+    #[cfg(feature = "liquid")]
+    #[test]
+    fn parse_asset_registry_url_rejects_credentialed_url() {
+        let error = parse_asset_registry_url("https://user:pass@registry.example/api").unwrap_err();
+
+        assert!(error.contains("must not contain a username or password"));
+    }
+
+    #[cfg(feature = "liquid")]
+    #[test]
+    fn parse_asset_registry_url_rejects_query_and_fragment() {
+        let error = parse_asset_registry_url("https://registry.example/api?x=1").unwrap_err();
+        assert!(error.contains("must not contain a query string"));
+
+        let error = parse_asset_registry_url("https://registry.example/api#x").unwrap_err();
+        assert!(error.contains("must not contain a fragment"));
     }
 }

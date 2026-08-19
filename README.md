@@ -82,12 +82,53 @@ In addition to electrs's original configuration options, a few new options are a
 
 Additional options with the `liquid` feature:
 - `--parent-network <network>` - the parent network this chain is pegged to.
+- `--asset-registry-url <url>` - base URL for the Liquid asset registry v2 service (see [Liquid asset registry](#liquid-asset-registry)).
 
 Additional options with the `electrum-discovery` feature:
 - `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features).
 - `--electrum-announce` - announce the electrum server on the electrum p2p server discovery network.
 
 See `$ cargo run --release --bin electrs -- --help` for the full list of options.
+
+### Liquid asset registry
+
+With `--asset-registry-url`, electrs reads asset metadata from the registry v2
+HTTP service. The URL must use HTTP(S) and must not contain credentials, a query
+string, or a fragment.
+
+Timeouts can be configured in milliseconds with the
+`ELECTRS_ASSET_REGISTRY_CONNECT_TIMEOUT_MS` and
+`ELECTRS_ASSET_REGISTRY_REQUEST_TIMEOUT_MS` environment variables, up to
+30000 ms. They default to 2000 ms and 3000 ms, respectively. A request that
+cannot get one of the 16 per-asset (or 4 list) registry connection slots within
+one second fails as overloaded.
+
+`GET /asset/:asset_id` and `GET /asset/:asset_id/supply/decimal` report how the
+registry answered in the `X-Asset-Registry-Status` header, and `/asset/:asset_id`
+also in a `registry_status` body field. Both are omitted when the registry was
+not consulted (no registry configured, or the native asset).
+
+- `available` - fresh registry metadata is included.
+- `not_found` - the registry has no entry for the asset. This is cached like
+  `available`, including `Cache-Control: public, max-age=10`, so a newly
+  registered asset can take that long to appear downstream.
+- `stale` - the cached metadata expired and is served while one background
+  refresh runs, with `Cache-Control: no-store`.
+- `unavailable` - there is no cached metadata and the registry lookup failed.
+  `/asset/:asset_id` returns the locally indexed chain data without registry
+  metadata, with `Cache-Control: no-store`. `/supply/decimal` returns a gateway
+  error instead, because the asset's precision comes only from the registry.
+
+Successful lookups are cached for 15 seconds. An expired `not_found` waits for
+the refresh rather than being served as stale. Failed lookups are cached for at
+most one second to coalesce retries without masking a recovered registry for
+the successful-metadata TTL.
+
+`GET /assets/registry` is a pass-through to the registry's asset list and is
+not cached. `X-Total-Results` is the registry's total, and `start_index` and
+`limit` page over the registry's ordering. If the registry is unavailable, or
+lists an asset that is not yet in the local index, the request fails with a
+gateway error rather than returning a page inconsistent with its total.
 
 ### Mining-related HTTP endpoints
 

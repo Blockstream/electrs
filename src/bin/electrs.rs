@@ -31,7 +31,7 @@ use std::{env, process, thread};
 use electrs::otlp_trace;
 
 #[cfg(feature = "liquid")]
-use electrs::elements::AssetRegistry;
+use electrs::elements::RegistryClient;
 use electrs::metrics::MetricOpts;
 
 /// Default salt rotation interval in seconds (24 hours)
@@ -161,11 +161,13 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     }
 
     #[cfg(feature = "liquid")]
-    let asset_db = config.asset_db_path.as_ref().map(|db_dir| {
-        let asset_db = Arc::new(RwLock::new(AssetRegistry::new(db_dir.clone())));
-        AssetRegistry::spawn_sync(asset_db.clone());
-        asset_db
-    });
+    let asset_registry = config
+        .asset_registry_url
+        .as_ref()
+        .map(|url| RegistryClient::new(url.clone()))
+        .transpose()
+        .chain_err(|| "failed creating asset registry client")?
+        .map(Arc::new);
 
     let query = Arc::new(Query::new(
         Arc::clone(&chain),
@@ -173,7 +175,7 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         Arc::clone(&daemon),
         Arc::clone(&config),
         #[cfg(feature = "liquid")]
-        asset_db,
+        asset_registry,
     ));
 
     // TODO: configuration for which servers to start

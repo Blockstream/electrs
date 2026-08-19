@@ -215,7 +215,7 @@ fn liquid_reorg_removes_asset_issuance() -> Result<()> {
     let asset_id = elements::AssetId::from_str(issuance["asset"].as_str().unwrap()).unwrap();
     let issuance_txid = elements::Txid::from_str(issuance["txid"].as_str().unwrap()).unwrap();
     let issued_in = tester.mine()?;
-    assert!(tester.query().lookup_asset(&asset_id)?.is_some());
+    assert!(tester.query().lookup_asset_local(&asset_id)?.is_some());
     let store = tester.query().chain().store();
     assert!(store
         .history_db()

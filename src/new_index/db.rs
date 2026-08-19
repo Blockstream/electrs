@@ -849,7 +849,7 @@ mod tests {
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
             #[cfg(feature = "liquid")]
-            asset_db_path: None,
+            asset_registry_url: None,
         }
     }
 
