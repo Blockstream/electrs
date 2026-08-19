@@ -28,6 +28,10 @@ use electrs::{
     rest,
     signal::Waiter,
 };
+#[cfg(feature = "liquid")]
+use electrs::elements::RegistryClient;
+#[cfg(feature = "liquid")]
+use url::Url;
 
 pub struct TestRunner {
     config: Arc<Config>,
@@ -44,6 +48,28 @@ pub struct TestRunner {
 
 impl TestRunner {
     pub fn new() -> Result<TestRunner> {
+        Self::new_inner(
+            #[cfg(feature = "liquid")]
+            None,
+            None,
+        )
+    }
+
+    #[cfg(feature = "liquid")]
+    pub fn new_with_asset_registry(
+        asset_registry_url: Url,
+        cors: Option<String>,
+    ) -> Result<TestRunner> {
+        Self::new_inner(
+            Some(electrs::config::SensitiveUrl::new(asset_registry_url)),
+            cors,
+        )
+    }
+
+    fn new_inner(
+        #[cfg(feature = "liquid")] asset_registry_url: Option<electrs::config::SensitiveUrl>,
+        cors: Option<String>,
+    ) -> Result<TestRunner> {
         let log = init_log();
 
         // Setup the bitcoind/elementsd config
@@ -109,7 +135,7 @@ impl TestRunner {
             address_search: true,
             index_unspendables: false,
             enable_mining_rest: true,
-            cors: None,
+            cors,
             precache_scripts: None,
             utxos_limit: 100,
             electrum_txs_limit: 100,
@@ -119,7 +145,7 @@ impl TestRunner {
             zmq_addr: None,
 
             #[cfg(feature = "liquid")]
-            asset_db_path: None, // XXX
+            asset_registry_url,
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
             db_block_cache_mb: 8,
@@ -183,13 +209,27 @@ impl TestRunner {
         )));
         assert!(Mempool::update(&mempool, &daemon, &tip)?);
 
+        #[cfg(feature = "liquid")]
+        let asset_registry = config
+            .asset_registry_url
+            .as_ref()
+            .map(|url| {
+                RegistryClient::with_cache_ttl(
+                    url.as_url().clone(),
+                    std::time::Duration::from_secs(1),
+                )
+            })
+            .transpose()
+            .chain_err(|| "failed creating test asset registry client")?
+            .map(Arc::new);
+
         let query = Arc::new(Query::new(
             Arc::clone(&chain),
             Arc::clone(&mempool),
             Arc::clone(&daemon),
             Arc::clone(&config),
             #[cfg(feature = "liquid")]
-            None, // TODO
+            asset_registry,
         ));
 
         let salt_rwlock = Arc::new(RwLock::new(String::from("foobar")));
@@ -325,6 +365,18 @@ impl TestRunner {
 
 pub fn init_rest_tester() -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
     let tester = TestRunner::new()?;
+    let addr = tester.config.http_addr;
+    let rest_server = rest::start(Arc::clone(&tester.config), Arc::clone(&tester.query));
+    wait_for_tcp(addr, "REST");
+    Ok((rest_server, addr, tester))
+}
+
+#[cfg(feature = "liquid")]
+pub fn init_rest_tester_with_asset_registry(
+    asset_registry_url: Url,
+    cors: Option<String>,
+) -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
+    let tester = TestRunner::new_with_asset_registry(asset_registry_url, cors)?;
     let addr = tester.config.http_addr;
     let rest_server = rest::start(Arc::clone(&tester.config), Arc::clone(&tester.query));
     wait_for_tcp(addr, "REST");

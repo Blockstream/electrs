@@ -74,6 +74,20 @@ In addition to electrs's original configuration options, a few new options are a
 
 Additional options with the `liquid` feature:
 - `--parent-network <network>` - the parent network this chain is pegged to.
+- `--asset-registry-url <url>` - base URL for the Liquid asset registry v2 service.
+
+Asset registry timeouts can be configured in milliseconds with the
+`ELECTRS_ASSET_REGISTRY_CONNECT_TIMEOUT_MS` and
+`ELECTRS_ASSET_REGISTRY_REQUEST_TIMEOUT_MS` environment variables. They default
+to 2000 ms and 5000 ms, respectively.
+
+The registry URL must be a public HTTP(S) URL without embedded credentials.
+Successful per-asset lookups are cached for 15 seconds. After expiry, electrs
+serves the cached metadata with `X-Asset-Registry-Status: stale` and
+`Cache-Control: no-store` while one background refresh runs; an initial lookup
+failure returns a gateway error instead of an incomplete asset response. Failed
+lookups are cached for at most one second to coalesce retries without masking a
+recovered registry for the successful-metadata TTL.
 
 Additional options with the `electrum-discovery` feature:
 - `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features).

@@ -16,7 +16,10 @@ use hyper::body::Bytes as BodyBytes;
 #[cfg(feature = "liquid")]
 use crate::{
     chain::AssetId,
-    elements::{ebcompact::TxidCompat, lookup_asset, AssetRegistry, AssetSorting, LiquidAsset},
+    elements::{
+        ebcompact::TxidCompat, lookup_asset, AssetMeta, AssetSearchFilters, AssetSorting,
+        LiquidAsset, RegistryClient, RegistryError,
+    },
 };
 
 const FEE_ESTIMATES_TTL: u64 = 60; // seconds
@@ -35,7 +38,23 @@ pub struct Query {
     cached_relayfee: RwLock<Option<f64>>,
     cached_block_template: BlockTemplateCache,
     #[cfg(feature = "liquid")]
-    asset_db: Option<Arc<RwLock<AssetRegistry>>>,
+    asset_registry: Option<Arc<RegistryClient>>,
+}
+
+#[cfg(feature = "liquid")]
+#[derive(Debug)]
+pub enum AssetRegistryStatus {
+    NotRequested,
+    Available,
+    Stale,
+    NotFound,
+    Unavailable(RegistryError),
+}
+
+#[cfg(feature = "liquid")]
+pub struct AssetLookup {
+    pub asset: Option<LiquidAsset>,
+    pub registry_status: AssetRegistryStatus,
 }
 
 impl Query {
@@ -283,14 +302,14 @@ impl Query {
         mempool: Arc<RwLock<Mempool>>,
         daemon: Arc<Daemon>,
         config: Arc<Config>,
-        asset_db: Option<Arc<RwLock<AssetRegistry>>>,
+        asset_registry: Option<Arc<RegistryClient>>,
     ) -> Self {
         Query {
             chain,
             mempool,
             daemon,
             config,
-            asset_db,
+            asset_registry,
             cached_estimates: RwLock::new((HashMap::new(), None)),
             cached_relayfee: RwLock::new(None),
             cached_block_template: BlockTemplateCache::new(),
@@ -299,31 +318,124 @@ impl Query {
 
     #[cfg(feature = "liquid")]
     #[trace]
-    pub fn lookup_asset(&self, asset_id: &AssetId) -> Result<Option<LiquidAsset>> {
-        lookup_asset(&self, self.asset_db.as_ref(), asset_id, None)
+    pub fn lookup_asset_local(&self, asset_id: &AssetId) -> Result<Option<LiquidAsset>> {
+        lookup_asset(self, asset_id, None)
     }
 
     #[cfg(feature = "liquid")]
     #[trace]
-    pub fn list_registry_assets(
-        &self,
+    pub async fn lookup_asset(self: Arc<Self>, asset_id: &AssetId) -> Result<AssetLookup> {
+        let query = Arc::clone(&self);
+        let asset_id_owned = *asset_id;
+        let mut asset =
+            match tokio::task::spawn_blocking(move || query.lookup_asset_local(&asset_id_owned))
+                .await
+                .map_err(|err| Error::from(format!("asset lookup task failed: {}", err)))??
+            {
+                Some(asset) => asset,
+                None => {
+                    return Ok(AssetLookup {
+                        asset: None,
+                        registry_status: AssetRegistryStatus::NotRequested,
+                    })
+                }
+            };
+
+        if !matches!(asset, LiquidAsset::Issued(_)) {
+            return Ok(AssetLookup {
+                asset: Some(asset),
+                registry_status: AssetRegistryStatus::NotRequested,
+            });
+        }
+
+        let registry = match &self.asset_registry {
+            Some(registry) => registry,
+            None => {
+                return Ok(AssetLookup {
+                    asset: Some(asset),
+                    registry_status: AssetRegistryStatus::NotRequested,
+                })
+            }
+        };
+
+        let registry_status = match registry.get_asset_with_status(asset_id).await {
+            Ok(lookup) => match lookup.asset {
+                Some(registry_asset) => {
+                    let metadata = AssetMeta::from_registry_asset(registry_asset);
+                    if let LiquidAsset::Issued(issued) = &mut asset {
+                        issued.meta = Some(metadata);
+                    }
+                    if lookup.stale {
+                        AssetRegistryStatus::Stale
+                    } else {
+                        AssetRegistryStatus::Available
+                    }
+                }
+                None if lookup.stale => AssetRegistryStatus::Stale,
+                None => AssetRegistryStatus::NotFound,
+            },
+            Err(error) => AssetRegistryStatus::Unavailable(error),
+        };
+
+        Ok(AssetLookup {
+            asset: Some(asset),
+            registry_status,
+        })
+    }
+
+    #[cfg(feature = "liquid")]
+    #[trace]
+    pub async fn list_registry_assets(
+        self: Arc<Self>,
         start_index: usize,
         limit: usize,
         sorting: AssetSorting,
-    ) -> Result<(usize, Vec<LiquidAsset>)> {
-        let asset_db = match &self.asset_db {
+        filters: AssetSearchFilters,
+    ) -> std::result::Result<(usize, Vec<LiquidAsset>), RegistryError> {
+        let registry = match &self.asset_registry {
             None => return Ok((0, vec![])),
-            Some(db) => db.read().unwrap(),
+            Some(registry) => Arc::clone(registry),
         };
-        let (total_num, results) = asset_db.list(start_index, limit, sorting);
-        // Attach on-chain information alongside the registry metadata
-        let results = results
-            .into_iter()
-            .map(|(asset_id, metadata)| {
-                Ok(lookup_asset(&self, None, asset_id, Some(metadata))?
-                    .chain_err(|| "missing registered asset")?)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok((total_num, results))
+
+        let page = registry
+            .list_assets(start_index, limit, sorting, &filters)
+            .await?;
+        let total_count = page.total_count;
+        let items = page.items;
+        let query = Arc::clone(&self);
+        let (missing, results) = tokio::task::spawn_blocking(
+            move || -> std::result::Result<(Vec<AssetId>, Vec<LiquidAsset>), RegistryError> {
+                let mut results = Vec::with_capacity(items.len());
+                let mut missing = Vec::new();
+                for registry_asset in items {
+                    let asset_id = registry_asset.asset_id;
+                    let metadata = AssetMeta::from_registry_asset(Arc::new(registry_asset));
+                    match lookup_asset(&query, &asset_id, Some(metadata))
+                        .map_err(|error| RegistryError::LocalLookup(error.to_string()))?
+                    {
+                        Some(asset) => results.push(asset),
+                        None => missing.push(asset_id),
+                    }
+                }
+                Ok((missing, results))
+            },
+        )
+        .await
+        .map_err(|err| {
+            RegistryError::LocalLookup(format!("asset registry lookup task failed: {}", err))
+        })??;
+
+        if !missing.is_empty() {
+            return Err(RegistryError::LocalLookup(format!(
+                "registered assets not yet available in the local index count='{}' asset_ids='{}'",
+                missing.len(),
+                missing
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )));
+        }
+        Ok((total_count, results))
     }
 }
