@@ -38,7 +38,7 @@ use {
 };
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::num::ParseIntError;
 use std::os::unix::fs::FileTypeExt;
 use std::sync::Arc;
@@ -487,11 +487,14 @@ fn ttl_by_depth(height: Option<usize>, query: &Query) -> u32 {
     })
 }
 
-fn prepare_txs(
+fn prepare_txs<F>(
     txs: Vec<(Transaction, Option<BlockId>)>,
-    query: &Query,
+    lookup_txos: F,
     config: &Config,
-) -> Vec<TransactionValue> {
+) -> Result<Vec<TransactionValue>, HttpError>
+where
+    F: FnOnce(BTreeSet<OutPoint>) -> errors::Result<HashMap<OutPoint, TxOut>>,
+{
     let outpoints = txs
         .iter()
         .flat_map(|(tx, _)| {
@@ -502,11 +505,12 @@ fn prepare_txs(
         })
         .collect();
 
-    let prevouts = query.lookup_txos(outpoints);
+    let prevouts = lookup_txos(outpoints).map_err(HttpError::lookup)?;
 
-    txs.into_iter()
+    Ok(txs
+        .into_iter()
         .map(|(tx, blockid)| TransactionValue::new(tx, blockid, &prevouts, config))
-        .collect()
+        .collect())
 }
 
 fn spawn_conn(
@@ -849,7 +853,7 @@ fn handle_blocking_request(
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txs"), start_index, None) => {
             let hash = BlockHash::from_str(hash)?;
-            
+
             // Add lightweight validation that block exists before fetching transactions,
             // to avoid expensive lookups in case of invalid block hash
             query.chain().get_block_header(&hash)
@@ -878,7 +882,10 @@ fn handle_blocking_request(
             // XXX stale blocks alway get TTL_SHORT
             let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
 
-            json_response(prepare_txs(txs, query, config), ttl)
+            json_response(
+                prepare_txs(txs, |outpoints| query.chain().lookup_txos(outpoints), config)?,
+                ttl,
+            )
         }
         (&Method::GET, Some(script_type @ &"address"), Some(script_str), None, None, None)
         | (&Method::GET, Some(script_type @ &"scripthash"), Some(script_str), None, None, None) => {
@@ -910,26 +917,26 @@ fn handle_blocking_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            let chain_txs = query
+                .chain()
+                .history(&script_hash[..], None, CHAIN_TXS_PER_PAGE)
+                .map_err(HttpError::lookup)?;
 
-            let mut txs = vec![];
-
-            txs.extend(
-                query
-                    .mempool()
+            let txs = query.with_mempool(|mempool| {
+                let mut txs = mempool
                     .history(&script_hash[..], MAX_MEMPOOL_TXS)
                     .into_iter()
-                    .map(|tx| (tx, None)),
-            );
+                    .map(|tx| (tx, None))
+                    .collect::<Vec<_>>();
+                txs.extend(
+                    chain_txs
+                        .into_iter()
+                        .map(|(tx, blockid)| (tx, Some(blockid))),
+                );
+                prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)
+            })?;
 
-            txs.extend(
-                query
-                    .chain()
-                    .history(&script_hash[..], None, CHAIN_TXS_PER_PAGE)
-                    .into_iter()
-                    .map(|(tx, blockid)| (tx, Some(blockid))),
-            );
-
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_response(txs, TTL_SHORT)
         }
 
         (
@@ -950,7 +957,6 @@ fn handle_blocking_request(
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
             let last_seen_txid = last_seen_txid.and_then(|txid| Txid::from_str(txid).ok());
-
             let txs = query
                 .chain()
                 .history(
@@ -958,11 +964,15 @@ fn handle_blocking_request(
                     last_seen_txid.as_ref(),
                     CHAIN_TXS_PER_PAGE,
                 )
+                .map_err(HttpError::lookup)?
                 .into_iter()
                 .map(|(tx, blockid)| (tx, Some(blockid)))
                 .collect();
 
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_response(
+                prepare_txs(txs, |outpoints| query.chain().lookup_txos(outpoints), config)?,
+                TTL_SHORT,
+            )
         }
         (
             &Method::GET,
@@ -981,15 +991,16 @@ fn handle_blocking_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            let txs = query.with_mempool(|mempool| {
+                let txs = mempool
+                    .history(&script_hash[..], MAX_MEMPOOL_TXS)
+                    .into_iter()
+                    .map(|tx| (tx, None))
+                    .collect();
+                prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)
+            })?;
 
-            let txs = query
-                .mempool()
-                .history(&script_hash[..], MAX_MEMPOOL_TXS)
-                .into_iter()
-                .map(|tx| (tx, None))
-                .collect();
-
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_response(txs, TTL_SHORT)
         }
 
         (
@@ -1026,13 +1037,34 @@ fn handle_blocking_request(
         }
         (&Method::GET, Some(&"tx"), Some(hash), None, None, None) => {
             let hash = Txid::from_str(hash)?;
-            let tx = query
-                .lookup_txn(&hash)
-                .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
+            let chain_tx = query
+                .chain()
+                .lookup_txn(&hash, None)
+                .map_err(HttpError::lookup)?;
             let blockid = query.chain().tx_confirming_block(&hash);
             let ttl = ttl_by_depth(blockid.as_ref().map(|b| b.height), query);
 
-            let tx = prepare_txs(vec![(tx, blockid)], query, config).remove(0);
+            let tx = match chain_tx {
+                Some(tx) => prepare_txs(
+                    vec![(tx, blockid)],
+                    |outpoints| query.chain().lookup_txos(outpoints),
+                    config,
+                )?
+                .remove(0),
+                None => query.with_mempool(|mempool| {
+                    let tx = mempool
+                        .lookup_txn(&hash)
+                        .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
+                    Ok::<_, HttpError>(
+                        prepare_txs(
+                            vec![(tx, None)],
+                            |outpoints| mempool.lookup_txos(outpoints),
+                            config,
+                        )?
+                        .remove(0),
+                    )
+                })?,
+            };
 
             json_response(tx, ttl)
         }
@@ -1118,6 +1150,7 @@ fn handle_blocking_request(
             let hash = Txid::from_str(hash)?;
             let tx = query
                 .lookup_txn(&hash)
+                .map_err(HttpError::lookup)?
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
             let spends: Vec<SpendingValue> = query
                 .lookup_tx_spends(&tx)
@@ -1257,26 +1290,26 @@ fn handle_blocking_request(
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"txs"), None, None) => {
             let asset_id = AssetId::from_str(asset_str)?;
+            let chain_txs = query
+                .chain()
+                .asset_history(&asset_id, None, CHAIN_TXS_PER_PAGE)
+                .map_err(HttpError::lookup)?;
 
-            let mut txs = vec![];
-
-            txs.extend(
-                query
-                    .mempool()
+            let txs = query.with_mempool(|mempool| {
+                let mut txs = mempool
                     .asset_history(&asset_id, MAX_MEMPOOL_TXS)
                     .into_iter()
-                    .map(|tx| (tx, None)),
-            );
+                    .map(|tx| (tx, None))
+                    .collect::<Vec<_>>();
+                txs.extend(
+                    chain_txs
+                        .into_iter()
+                        .map(|(tx, blockid)| (tx, Some(blockid))),
+                );
+                prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)
+            })?;
 
-            txs.extend(
-                query
-                    .chain()
-                    .asset_history(&asset_id, None, CHAIN_TXS_PER_PAGE)
-                    .into_iter()
-                    .map(|(tx, blockid)| (tx, Some(blockid))),
-            );
-
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_response(txs, TTL_SHORT)
         }
 
         #[cfg(feature = "liquid")]
@@ -1290,29 +1323,33 @@ fn handle_blocking_request(
         ) => {
             let asset_id = AssetId::from_str(asset_str)?;
             let last_seen_txid = last_seen_txid.and_then(|txid| Txid::from_str(txid).ok());
-
             let txs = query
                 .chain()
                 .asset_history(&asset_id, last_seen_txid.as_ref(), CHAIN_TXS_PER_PAGE)
+                .map_err(HttpError::lookup)?
                 .into_iter()
                 .map(|(tx, blockid)| (tx, Some(blockid)))
                 .collect();
 
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_response(
+                prepare_txs(txs, |outpoints| query.chain().lookup_txos(outpoints), config)?,
+                TTL_SHORT,
+            )
         }
 
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"txs"), Some(&"mempool"), None) => {
             let asset_id = AssetId::from_str(asset_str)?;
+            let txs = query.with_mempool(|mempool| {
+                let txs = mempool
+                    .asset_history(&asset_id, MAX_MEMPOOL_TXS)
+                    .into_iter()
+                    .map(|tx| (tx, None))
+                    .collect();
+                prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)
+            })?;
 
-            let txs = query
-                .mempool()
-                .asset_history(&asset_id, MAX_MEMPOOL_TXS)
-                .into_iter()
-                .map(|tx| (tx, None))
-                .collect();
-
-            json_response(prepare_txs(txs, query, config), TTL_SHORT)
+            json_response(txs, TTL_SHORT)
         }
 
         #[cfg(feature = "liquid")]
@@ -1527,6 +1564,14 @@ impl HttpError {
     fn forbidden(msg: String) -> Self {
         HttpError(StatusCode::FORBIDDEN, msg)
     }
+
+    fn lookup(err: errors::Error) -> Self {
+        let status = match err.kind() {
+            errors::ErrorKind::MissingTxo(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        HttpError(status, err.to_string())
+    }
 }
 
 impl From<String> for HttpError {
@@ -1675,6 +1720,17 @@ mod tests {
             "sendrawtransaction".to_string(),
         )));
         assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn transaction_preparation_failures_map_to_not_found_or_unavailable() {
+        let missing = HttpError::lookup(errors::Error::from(ErrorKind::MissingTxo(
+            "abc:0".to_string(),
+        )));
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+
+        let corrupt = HttpError::lookup(errors::Error::from("failed to parse TxOut"));
+        assert_eq!(corrupt.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

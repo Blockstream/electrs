@@ -77,6 +77,10 @@ impl Query {
         self.mempool.read().unwrap()
     }
 
+    pub fn with_mempool<T>(&self, f: impl FnOnce(&Mempool) -> T) -> T {
+        with_read_snapshot(&self.mempool, f)
+    }
+
     #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.daemon.broadcast_raw(txhex)?;
@@ -152,10 +156,11 @@ impl Query {
     }
 
     #[trace]
-    pub fn lookup_txn(&self, txid: &Txid) -> Option<Transaction> {
-        self.chain
-            .lookup_txn(txid, None)
-            .or_else(|| self.mempool().lookup_txn(txid))
+    pub fn lookup_txn(&self, txid: &Txid) -> Result<Option<Transaction>> {
+        Ok(self
+            .chain
+            .lookup_txn(txid, None)?
+            .or_else(|| self.mempool().lookup_txn(txid)))
     }
 
     #[trace]
@@ -166,11 +171,9 @@ impl Query {
     }
 
     #[trace]
-    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
+    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         // the mempool lookup_txos() internally looks up confirmed txos as well
-        self.mempool()
-            .lookup_txos(outpoints)
-            .expect("failed loading txos")
+        self.mempool().lookup_txos(outpoints)
     }
 
     #[trace]
@@ -354,5 +357,42 @@ impl Query {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((total_num, results))
+    }
+}
+
+fn with_read_snapshot<T, R>(lock: &RwLock<T>, f: impl FnOnce(&T) -> R) -> R {
+    let guard = lock.read().unwrap();
+    f(&guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_read_snapshot;
+    use std::sync::{mpsc, Arc, RwLock};
+    use std::thread;
+
+    #[test]
+    fn read_snapshot_blocks_writes_between_selection_and_lookup() {
+        let state = Arc::new(RwLock::new(vec!["parent", "child"]));
+        let writer_state = Arc::clone(&state);
+        let (selected_tx, selected_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+
+        let reader = thread::spawn(move || {
+            with_read_snapshot(&state, |snapshot| {
+                assert_eq!(snapshot.last(), Some(&"child"));
+                selected_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                assert_eq!(snapshot.first(), Some(&"parent"));
+            });
+        });
+
+        selected_rx.recv().unwrap();
+        assert!(writer_state.try_write().is_err());
+        continue_tx.send(()).unwrap();
+        reader.join().unwrap();
+
+        writer_state.write().unwrap().remove(0);
+        assert_eq!(*writer_state.read().unwrap(), vec!["child"]);
     }
 }
