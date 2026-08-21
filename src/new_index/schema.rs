@@ -777,7 +777,7 @@ impl ChainQuery {
         scripthash: &[u8],
         last_seen_txid: Option<&Txid>,
         limit: usize,
-    ) -> Vec<(Transaction, BlockId)> {
+    ) -> Result<Vec<(Transaction, BlockId)>> {
         // scripthash lookup
         self._history(b'H', scripthash, last_seen_txid, limit)
     }
@@ -788,7 +788,7 @@ impl ChainQuery {
         hash: &[u8],
         last_seen_txid: Option<&Txid>,
         limit: usize,
-    ) -> Vec<(Transaction, BlockId)> {
+    ) -> Result<Vec<(Transaction, BlockId)>> {
         let _timer_scan = self.start_timer("history");
         let headers = self.store.indexed_headers.read().unwrap();
         let history_iter = self
@@ -818,12 +818,12 @@ impl ChainQuery {
         }
         drop(headers);
 
-        self.lookup_txns(&txids_with_blockhash)
-            .expect("failed looking up txs in history index")
+        Ok(self
+            .lookup_txns(&txids_with_blockhash)?
             .into_iter()
             .zip(blockids)
             .map(|(tx, blockid)| (tx, blockid))
-            .collect()
+            .collect())
     }
 
     pub fn history_txids(&self, scripthash: &[u8], limit: usize) -> Vec<(Txid, BlockId)> {
@@ -1137,17 +1137,21 @@ impl ChainQuery {
 
     pub fn lookup_txns(&self, txids: &[(Txid, BlockHash)]) -> Result<Vec<Transaction>> {
         let _timer = self.start_timer("lookup_txns");
-        Ok(self
-            .lookup_raw_txns(txids)?
+        self.lookup_raw_txns(txids)?
             .into_iter()
-            .map(|rawtx| deserialize(&rawtx).expect("failed to parse Transaction"))
-            .collect())
+            .map(|rawtx| deserialize(&rawtx).chain_err(|| "failed to parse Transaction"))
+            .collect()
     }
 
-    pub fn lookup_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Transaction> {
+    pub fn lookup_txn(
+        &self,
+        txid: &Txid,
+        blockhash: Option<&BlockHash>,
+    ) -> Result<Option<Transaction>> {
         let _timer = self.start_timer("lookup_txn");
-        let rawtx = self.lookup_raw_txn(txid, blockhash)?;
-        Some(deserialize(&rawtx).expect("failed to parse Transaction"))
+        self.lookup_raw_txn(txid, blockhash)
+            .map(|rawtx| deserialize(&rawtx).chain_err(|| "failed to parse Transaction"))
+            .transpose()
     }
 
     pub fn lookup_raw_txns(&self, txids: &[(Txid, BlockHash)]) -> Result<Vec<Bytes>> {
@@ -1166,7 +1170,7 @@ impl ChainQuery {
                 .txstore_db
                 .multi_get(keys)
                 .into_iter()
-                .map(|val| val.unwrap().chain_err(|| "missing tx"))
+                .map(|val| val?.chain_err(|| "missing tx"))
                 .collect()
         }
     }
@@ -1292,7 +1296,7 @@ impl ChainQuery {
         asset_id: &AssetId,
         last_seen_txid: Option<&Txid>,
         limit: usize,
-    ) -> Vec<(Transaction, BlockId)> {
+    ) -> Result<Vec<(Transaction, BlockId)>> {
         self._history(b'I', &asset_id.into_inner()[..], last_seen_txid, limit)
     }
 
@@ -1390,10 +1394,9 @@ fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap
         .into_iter()
         .zip(outpoints)
         .map(|(res, outpoint)| {
-            let txo = res
-                .unwrap()
-                .ok_or_else(|| format!("missing txo {}", outpoint))?;
-            Ok((outpoint, deserialize(&txo).expect("failed to parse TxOut")))
+            let txo = res?.ok_or_else(|| ErrorKind::MissingTxo(outpoint.to_string()))?;
+            let txo = deserialize(&txo).chain_err(|| "failed to parse TxOut")?;
+            Ok((outpoint, txo))
         })
         .collect()
 }

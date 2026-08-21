@@ -3,6 +3,10 @@ error_chain! {
         Error, ErrorKind, ResultExt, Result;
     }
 
+    foreign_links {
+        RocksDb(rocksdb::Error);
+    }
+
     errors {
         Connection(msg: String) {
             description("Connection error")
@@ -32,6 +36,11 @@ error_chain! {
         TooManySubscriptions(limit: usize) {
             description("Too many subscriptions")
             display("Too many subscriptions on this connection (limit: {})", limit)
+        }
+
+        MissingTxo(outpoint: String) {
+            description("Missing transaction output")
+            display("missing txo {}", outpoint)
         }
 
         InvalidParams(msg: String) {
