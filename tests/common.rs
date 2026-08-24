@@ -227,6 +227,18 @@ impl TestRunner {
         return &self.node.client();
     }
 
+    pub fn query(&self) -> &Arc<Query> {
+        &self.query
+    }
+
+    pub fn mempool(&self) -> &Arc<RwLock<Mempool>> {
+        &self.mempool
+    }
+
+    pub fn daemon(&self) -> &Arc<Daemon> {
+        &self.daemon
+    }
+
     pub fn sync(&mut self) -> Result<()> {
         let tip = self.indexer.update(&self.daemon)?;
         assert!(Mempool::update(&self.mempool, &self.daemon, &tip)?);

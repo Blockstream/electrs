@@ -917,24 +917,27 @@ fn handle_blocking_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            // Read outside the mempool guard, so a tx that is both indexed as confirmed
+            // and still in the local mempool can appear in chain_txs and the mempool
+            // history below.
             let chain_txs = query
                 .chain()
                 .history(&script_hash[..], None, CHAIN_TXS_PER_PAGE)
                 .map_err(HttpError::lookup)?;
 
-            let txs = query.with_mempool(|mempool| {
-                let mut txs = mempool
-                    .history(&script_hash[..], MAX_MEMPOOL_TXS)
+            let mempool = query.mempool();
+            let mut txs = mempool
+                .history(&script_hash[..], MAX_MEMPOOL_TXS)
+                .into_iter()
+                .map(|tx| (tx, None))
+                .collect::<Vec<_>>();
+            txs.extend(
+                chain_txs
                     .into_iter()
-                    .map(|tx| (tx, None))
-                    .collect::<Vec<_>>();
-                txs.extend(
-                    chain_txs
-                        .into_iter()
-                        .map(|(tx, blockid)| (tx, Some(blockid))),
-                );
-                prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)
-            })?;
+                    .map(|(tx, blockid)| (tx, Some(blockid))),
+            );
+            let txs = prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)?;
+            drop(mempool);
 
             json_response(txs, TTL_SHORT)
         }
@@ -991,14 +994,14 @@ fn handle_blocking_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
-            let txs = query.with_mempool(|mempool| {
-                let txs = mempool
-                    .history(&script_hash[..], MAX_MEMPOOL_TXS)
-                    .into_iter()
-                    .map(|tx| (tx, None))
-                    .collect();
-                prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)
-            })?;
+            let mempool = query.mempool();
+            let txs = mempool
+                .history(&script_hash[..], MAX_MEMPOOL_TXS)
+                .into_iter()
+                .map(|tx| (tx, None))
+                .collect();
+            let txs = prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)?;
+            drop(mempool);
 
             json_response(txs, TTL_SHORT)
         }
@@ -1051,19 +1054,20 @@ fn handle_blocking_request(
                     config,
                 )?
                 .remove(0),
-                None => query.with_mempool(|mempool| {
+                None => {
+                    let mempool = query.mempool();
                     let tx = mempool
                         .lookup_txn(&hash)
                         .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
-                    Ok::<_, HttpError>(
-                        prepare_txs(
-                            vec![(tx, None)],
-                            |outpoints| mempool.lookup_txos(outpoints),
-                            config,
-                        )?
-                        .remove(0),
-                    )
-                })?,
+                    let prepared = prepare_txs(
+                        vec![(tx, None)],
+                        |outpoints| mempool.lookup_txos(outpoints),
+                        config,
+                    )?
+                    .remove(0);
+                    drop(mempool);
+                    prepared
+                }
             };
 
             json_response(tx, ttl)
@@ -1290,24 +1294,27 @@ fn handle_blocking_request(
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"txs"), None, None) => {
             let asset_id = AssetId::from_str(asset_str)?;
+            // Read outside the mempool guard, so a tx that is both indexed as confirmed
+            // and still in the local mempool can appear in chain_txs and the mempool
+            // history below.
             let chain_txs = query
                 .chain()
                 .asset_history(&asset_id, None, CHAIN_TXS_PER_PAGE)
                 .map_err(HttpError::lookup)?;
 
-            let txs = query.with_mempool(|mempool| {
-                let mut txs = mempool
-                    .asset_history(&asset_id, MAX_MEMPOOL_TXS)
+            let mempool = query.mempool();
+            let mut txs = mempool
+                .asset_history(&asset_id, MAX_MEMPOOL_TXS)
+                .into_iter()
+                .map(|tx| (tx, None))
+                .collect::<Vec<_>>();
+            txs.extend(
+                chain_txs
                     .into_iter()
-                    .map(|tx| (tx, None))
-                    .collect::<Vec<_>>();
-                txs.extend(
-                    chain_txs
-                        .into_iter()
-                        .map(|(tx, blockid)| (tx, Some(blockid))),
-                );
-                prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)
-            })?;
+                    .map(|(tx, blockid)| (tx, Some(blockid))),
+            );
+            let txs = prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)?;
+            drop(mempool);
 
             json_response(txs, TTL_SHORT)
         }
@@ -1340,14 +1347,14 @@ fn handle_blocking_request(
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"txs"), Some(&"mempool"), None) => {
             let asset_id = AssetId::from_str(asset_str)?;
-            let txs = query.with_mempool(|mempool| {
-                let txs = mempool
-                    .asset_history(&asset_id, MAX_MEMPOOL_TXS)
-                    .into_iter()
-                    .map(|tx| (tx, None))
-                    .collect();
-                prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)
-            })?;
+            let mempool = query.mempool();
+            let txs = mempool
+                .asset_history(&asset_id, MAX_MEMPOOL_TXS)
+                .into_iter()
+                .map(|tx| (tx, None))
+                .collect();
+            let txs = prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)?;
+            drop(mempool);
 
             json_response(txs, TTL_SHORT)
         }
@@ -1570,6 +1577,7 @@ impl HttpError {
             errors::ErrorKind::MissingTxo(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
+        warn!("REST lookup failed status='{}' err='{:?}'", status, err);
         HttpError(status, err.to_string())
     }
 }
