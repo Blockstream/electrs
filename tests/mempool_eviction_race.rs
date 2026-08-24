@@ -1,12 +1,17 @@
 //! Deterministic reproduction of the mempool-eviction prevout-lookup abort
-//! this branch fixes (see src/new_index/query.rs's `Query::lookup_txos`).
+//! in src/new_index/query.rs and src/rest.rs.
 //!
 //! The REST handlers for e.g. GET /tx/:txid used to look up a transaction
 //! (once, in one mempool snapshot) and then separately resolve its prevouts
-//! via `Query::lookup_txos()` (a second, later mempool snapshot). If the
-//! referenced mempool ancestor was evicted in between -- e.g. by an RBF
-//! replacement -- the second lookup could come back empty and hit an
-//! `.expect("failed loading txos")`.
+//! via a second, later mempool snapshot. If the referenced mempool ancestor
+//! was evicted in between -- e.g. by an RBF replacement -- the second lookup
+//! could come back empty and hit an `.expect("failed loading txos")`.
+//!
+//! This test drives those two separate snapshots directly: SELECT via
+//! `Query::lookup_txn()`, then LOOKUP via `Query::mempool().lookup_txos()`.
+//! The fix in this MR removes the panic by propagating the miss as a
+//! `MissingTxo` error and by holding a single snapshot across both steps in
+//! the REST handlers themselves.
 //!
 //! Rather than racing real wall-clock timing against electrs's background
 //! mempool-sync thread (which only runs on a fixed poll interval and makes
@@ -85,7 +90,7 @@ fn prevout_lookup_survives_ancestor_eviction() -> Result<()> {
     // Sanity check: resolving prevouts works fine right now, before any
     // eviction -- proves the graceful error below is caused by the
     // eviction, not by some unrelated test-setup mistake.
-    let prevouts_before = query.lookup_txos(outpoints.clone())?;
+    let prevouts_before = query.mempool().lookup_txos(outpoints.clone())?;
     assert!(prevouts_before.contains_key(&OutPoint::new(parent_txid, parent_vout as u32)));
 
     // EVICT: RBF-replace the parent on the node by directly double-spending
@@ -130,12 +135,13 @@ fn prevout_lookup_survives_ancestor_eviction() -> Result<()> {
     let tip = tester.get_best_block_hash()?;
     assert!(Mempool::update(&tester.mempool(), &tester.daemon(), &tip)?);
 
-    // LOOKUP: mirrors prepare_txs()'s `query.lookup_txos()` on the *same*
-    // outpoints selected before the eviction -- the parent's output is now
-    // gone from both the local mempool view (evicted) and the confirmed
-    // chain (it was never mined). Pre-fix this panicked; post-fix it must
-    // come back as a graceful `MissingTxo` error instead.
-    let result = query.lookup_txos(outpoints);
+    // LOOKUP: a second, independent mempool snapshot on the *same* outpoints
+    // selected before the eviction -- the parent's output is now gone from
+    // both the local mempool view (evicted) and the confirmed chain (it was
+    // never mined). Pre-fix this panicked at the `.expect("failed loading
+    // txos")` in the `Query::lookup_txos` wrapper; post-fix it must come
+    // back as a graceful `MissingTxo` error instead.
+    let result = query.mempool().lookup_txos(outpoints);
 
     match result {
         Ok(txos) => panic!(
@@ -148,7 +154,7 @@ fn prevout_lookup_survives_ancestor_eviction() -> Result<()> {
             ErrorKind::MissingTxo(outpoint) => {
                 assert_eq!(
                     outpoint,
-                    &OutPoint::new(parent_txid, parent_vout as u32).to_string()
+                    &OutPoint::new(parent_txid, parent_vout as u32).to_string()[..]
                 );
             }
             other => panic!("expected ErrorKind::MissingTxo, got: {:?}", other),
