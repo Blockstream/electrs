@@ -103,10 +103,26 @@ fn bitcoind_fetcher(
                 fetcher_count += 1;
 
                 let blockhashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
-                let blocks = daemon
-                    .getblocks(&blockhashes)
-                    .expect("failed to get blocks from bitcoind");
-                assert_eq!(blocks.len(), entries.len());
+                let blocks = match daemon.getblocks(&blockhashes) {
+                    Ok(blocks) => blocks,
+                    Err(e) => {
+                        log::error!(
+                            "bitcoind_fetcher stopping, will retry on next index update err='{:?}' first_hash='{:?}' batch_size='{}'",
+                            e,
+                            blockhashes.first(),
+                            blockhashes.len()
+                        );
+                        return;
+                    }
+                };
+                if blocks.len() != entries.len() {
+                    log::error!(
+                        "bitcoind_fetcher block/entry count mismatch expected='{}' got='{}'",
+                        entries.len(),
+                        blocks.len()
+                    );
+                    return;
+                }
                 let block_entries: Vec<BlockEntry> = blocks
                     .into_iter()
                     .zip(entries)
@@ -120,10 +136,10 @@ fn bitcoind_fetcher(
                         }
                     })
                     .collect();
-                assert_eq!(block_entries.len(), entries.len());
-                sender
-                    .send(block_entries)
-                    .expect("failed to send fetched blocks");
+                if sender.send(block_entries).is_err() {
+                    log::warn!("bitcoind_fetcher receiver dropped, stopping");
+                    return;
+                }
                 log::debug!("last fetch {:?}", entries.last());
             }
         }),
@@ -247,10 +263,21 @@ fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBloc
                 .unwrap();
             blobs.map(|blob| {
                 trace!("parsing {} bytes", blob.len());
-                let blocks = parse_blocks(&pool, blob, magic).expect("failed to parse blk*.dat file");
-                sender
-                    .send(blocks)
-                    .expect("failed to send blocks from blk*.dat file");
+                // Skipping the file is safe: whatever is missing gets picked up on the
+                // FetchFrom::Bitcoind switchover.
+                let blocks = match parse_blocks(&pool, blob, magic) {
+                    Ok(blocks) => blocks,
+                    Err(e) => {
+                        log::warn!(
+                            "blkfiles_parser skipping blob err='{:?}'",
+                            e
+                        );
+                        return;
+                    }
+                };
+                if sender.send(blocks).is_err() {
+                    log::warn!("blkfiles_parser receiver dropped, stopping");
+                }
             });
         }),
     )
@@ -277,6 +304,12 @@ fn parse_blocks(pool: &rayon::ThreadPool, blob: Vec<u8>, magic: u32) -> Result<V
         let start = cursor.position();
         let end = start + block_size as u64;
 
+        // The magic+size truncation handling below covers a truncated header prefix,
+        // but not a truncated block body. Treat that as EOF.
+        if end > max_pos {
+            break;
+        }
+
         // If Core's WriteBlockToDisk ftell fails, only the magic bytes and size will be written
         // and the block body won't be written to the blk*.dat file.
         // Since the first 4 bytes should contain the block's version, we can skip such blocks
@@ -294,10 +327,14 @@ fn parse_blocks(pool: &rayon::ThreadPool, blob: Vec<u8>, magic: u32) -> Result<V
         cursor.set_position(end as u64);
     }
 
-    Ok(pool.install(|| {
+    pool.install(|| {
         slices
             .into_par_iter()
-            .map(|(slice, size)| (deserialize(slice).expect("failed to parse Block"), size))
-            .collect()
-    }))
+            .map(|(slice, size)| {
+                let block = deserialize(slice)
+                    .chain_err(|| "failed to deserialize block from blk file")?;
+                Ok((block, size))
+            })
+            .collect::<Result<Vec<SizedBlock>>>()
+    })
 }
