@@ -1270,7 +1270,14 @@ impl Daemon {
     pub fn getblock(&self, blockhash: &BlockHash) -> Result<Block> {
         let block =
             block_from_value(self.request("getblock", json!([blockhash, /*verbose=*/ false]))?)?;
-        assert_eq!(block.block_hash(), *blockhash);
+        let returned = block.block_hash();
+        if returned != *blockhash {
+            bail!(
+                "bitcoind returned wrong block for getblock requested_hash='{}' returned_hash='{}'",
+                blockhash,
+                returned
+            );
+        }
         Ok(block)
     }
 
@@ -1295,23 +1302,39 @@ impl Daemon {
                 Err(e) => {
                     let err_msg = format!("{e:?}");
                     if err_msg.contains("Block not found on disk")
-                       || err_msg.contains("Block not available") 
+                       || err_msg.contains("Block not available")
                     {
                         // There is a small chance the node returns the header but didn't finish to index the block
                         log::warn!("getblocks failing with: {e:?} trying {attempts} more time")
                     } else {
-                        panic!("failed to get blocks from bitcoind: {}", err_msg);
+                        bail!("failed to get blocks from bitcoind err='{}'", err_msg);
                     }
                 }
             }
             if attempts == 0 {
-                panic!("failed to get blocks from bitcoind")
+                bail!("failed to get blocks from bitcoind attempts='0'");
             }
             std::thread::sleep(RETRY_WAIT_DURATION);
         };
-        let mut blocks = vec![];
-        for value in values {
-            blocks.push(block_from_value(value)?);
+        if values.len() != blockhashes.len() {
+            bail!(
+                "bitcoind returned wrong number of blocks requested='{}' returned='{}'",
+                blockhashes.len(),
+                values.len()
+            );
+        }
+        let mut blocks = Vec::with_capacity(values.len());
+        for (value, requested) in values.into_iter().zip(blockhashes.iter()) {
+            let block = block_from_value(value)?;
+            let returned = block.block_hash();
+            if returned != *requested {
+                bail!(
+                    "bitcoind returned wrong block for getblocks requested_hash='{}' returned_hash='{}'",
+                    requested,
+                    returned
+                );
+            }
+            blocks.push(block);
         }
         Ok(blocks)
     }
@@ -1466,20 +1489,35 @@ impl Daemon {
 
     #[trace]
     fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
+        const MAX_TIP_HEIGHT: u64 = 100_000_000;
+
         let info: Value = self.request("getblockheader", json!([tip]))?;
         let tip_height = info
             .get("height")
-            .expect("missing height")
-            .as_u64()
-            .expect("non-numeric height") as usize;
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("bitcoind returned malformed getblockheader info='{:?}'", info))?
+            as u64;
+        if tip_height > MAX_TIP_HEIGHT {
+            bail!(
+                "bitcoind returned implausible tip_height='{}' cap='{}'",
+                tip_height,
+                MAX_TIP_HEIGHT
+            );
+        }
+        let tip_height = tip_height as usize;
         let all_heights: Vec<usize> = (0..=tip_height).collect();
         let chunk_size = 100_000;
         let mut result = vec![];
         for heights in all_heights.chunks(chunk_size) {
-            let mut headers = self.getblockheaders(&heights)?;
-            assert!(headers.len() == heights.len());
-
-            result.append(&mut headers);
+            let headers = self.getblockheaders(&heights)?;
+            if headers.len() != heights.len() {
+                bail!(
+                    "bitcoind returned wrong number of headers requested='{}' returned='{}'",
+                    heights.len(),
+                    headers.len()
+                );
+            }
+            result.extend(headers);
 
             debug!(
                 "downloaded {}/{} block headers ({:.0}%)",
@@ -1491,10 +1529,22 @@ impl Daemon {
 
         let mut blockhash = *DEFAULT_BLOCKHASH;
         for header in &result {
-            assert_eq!(header.prev_blockhash, blockhash);
+            if header.prev_blockhash != blockhash {
+                bail!(
+                    "bitcoind returned non-contiguous headers expected_prev='{}' got_prev='{}'",
+                    blockhash,
+                    header.prev_blockhash
+                );
+            }
             blockhash = header.block_hash();
         }
-        assert_eq!(blockhash, *tip);
+        if blockhash != *tip {
+            bail!(
+                "bitcoind headers do not end at requested tip expected_tip='{}' got_tip='{}'",
+                tip,
+                blockhash
+            );
+        }
         Ok(result)
     }
 
