@@ -1,6 +1,6 @@
 use prometheus::GaugeVec;
 use rayon::prelude::*;
-use rocksdb;
+use rocksdb::ColumnFamilyDescriptor;
 
 use std::convert::TryInto;
 use std::path::Path;
@@ -12,9 +12,14 @@ use crate::config::Config;
 use crate::new_index::db_metrics::RocksDbMetrics;
 use crate::util::{bincode, spawn_thread, Bytes};
 
-static DB_VERSION: u32 = 3;
+const DB_VERSION: u32 = 4;
 
 const ROCKSDB_NUM_LEVELS: u32 = 7;
+
+const DEFAULT_CF: &str = rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
+const TXSTORE_CF: &str = "txstore";
+const HISTORY_CF: &str = "history";
+const CACHE_CF: &str = "cache";
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct DBRow {
@@ -81,6 +86,7 @@ impl<'a> Iterator for ReverseScanIterator<'a> {
 #[derive(Debug)]
 pub struct DB {
     db: Arc<rocksdb::DB>,
+    cf_name: &'static str,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -90,127 +96,94 @@ pub enum DBFlush {
 }
 
 impl DB {
-    pub fn open(path: &Path, config: &Config, verify_compat: bool, shared_cache: &rocksdb::Cache) -> DB {
-        info!("opening DB at {:?}", path);
-        let mut db_opts = rocksdb::Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.set_max_open_files(100_000); // TODO: make sure to `ulimit -n` this process correctly
-        db_opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
-        db_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        db_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
-        db_opts.set_target_file_size_base(1_073_741_824);
-        // L0 compaction triggers are left at RocksDB defaults (4/20/36) here.
-        // After open, apply_bulk_load_triggers() widens them for initial sync
-        // when the full-compaction sentinel 'F' is absent.
+    fn new(db: Arc<rocksdb::DB>, cf_name: &'static str) -> DB {
+        DB { db, cf_name }
+    }
 
-        let parallelism: i32 = config.db_parallelism.try_into()
-            .expect("db_parallelism value too large for i32");
-
-        // Configure parallelism (background jobs and thread pools)
-        db_opts.increase_parallelism(parallelism);
-
-        // Configure write buffer size (not set by increase_parallelism)
-        db_opts.set_write_buffer_size(config.db_write_buffer_size_mb * 1024 * 1024);
-
-        // 4 MiB readahead for compaction I/O. Larger than the previous 1 MiB to better
-        // amortise syscall overhead when reading the many L0 files accumulated during
-        // initial sync.
-        db_opts.set_compaction_readahead_size(4 << 20);
-
-        // Background-sync SST files to the OS incrementally as they are written,
-        // rather than doing a large fsync on close. Smooths out I/O latency spikes.
-        db_opts.set_bytes_per_sync(1 << 20);
-
-        // Parallelize sub-ranges within a single compaction job (including the one-time
-        // full_compaction at the end of initial sync). Without this, compact_range() is
-        // single-threaded regardless of increase_parallelism(). Setting it equal to the
-        // parallelism level keeps all background threads busy during the final compaction.
-        db_opts.set_max_subcompactions(parallelism as u32);
-
-        // Configure block cache and table options
-        let mut block_opts = rocksdb::BlockBasedOptions::default();
-        block_opts.set_block_cache(shared_cache);
-        // When --cache-index-filter-blocks is passed, store index and filter blocks
-        // inside the block cache so their memory is bounded by --db-block-cache-mb.
-        // Without this (the default), RocksDB keeps them on the heap where they may
-        // never be evicted — possibly better for read performance compared to needing
-        // to go to disk, but uses ~18 MB per SST file.
-        if config.db_cache_index_filter_blocks {
-            block_opts.set_cache_index_and_filter_blocks(true);
-            // Pin L0 index and filter blocks in the cache so they are never evicted.
-            // Without this, data block churn evicts L0 index/filter blocks, causing
-            // repeated disk reads for every SST lookup.
-            block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-        }
-        // Bloom filters allow multi_get() to skip SST files that don't contain a key
-        // without touching the index or data blocks. Without this, every point lookup
-        // must binary-search the index of every L0 file whose key range overlaps the
-        // query (all of them for random txids) — extremely expensive with 1000+ L0
-        // files accumulated during initial sync. At 10 bits/key the false-positive
-        // rate is ~1%, so only ~10 out of 1000 L0 files need actual I/O per key.
-        // Combined with the prefix extractor below, these become prefix Bloom filters
-        // keyed on `code || hash` (33 bytes), which also allow prefix range scans
-        // (e.g. history lookups) to skip L0 files entirely. The filter blocks are
-        // cached and pinned alongside the index blocks via the settings above.
-        block_opts.set_bloom_filter(10.0, false);
-
-        // All electrs keys share the structure `code (1 byte) || hash (32 bytes) || ...`.
-        // A 33-byte fixed prefix extractor enables prefix Bloom filters: range scans
-        // like iter_scan("H" + scripthash) can skip SST files whose Bloom filter
-        // doesn't match the prefix, rather than checking every L0 file.
-        //
-        // INVARIANT: All iter_scan* and raw_iterator methods must use total_order_seek
-        // when the seek key may be shorter than 33 bytes. Without it, RocksDB silently
-        // skips SST files that contain matching keys. See the conditional in iter_scan().
-        db_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(33));
-
-        db_opts.set_block_based_table_factory(&block_opts);
-
-        let db = DB {
-            db: Arc::new(rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB"))
-        };
+    fn new_data_cf(db: Arc<rocksdb::DB>, cf_name: &'static str) -> DB {
+        let db = Self::new(db, cf_name);
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
-            info!("sentinel 'F' absent in {:?} — widening L0 triggers for bulk load", path);
+            info!(
+                "sentinel 'F' absent in {} — widening L0 triggers for bulk load",
+                cf_name
+            );
             db.apply_bulk_load_triggers();
         } else {
-            info!("sentinel 'F' present in {:?} — using steady-state L0 triggers", path);
-        }
-        if verify_compat {
-            db.verify_compatibility(config);
+            info!(
+                "sentinel 'F' present in {} — using steady-state L0 triggers",
+                cf_name
+            );
+            db.apply_steady_state_triggers();
         }
         db
     }
 
+    pub fn default_cf(db: Arc<rocksdb::DB>) -> DB {
+        Self::new(db, DEFAULT_CF)
+    }
+
+    pub fn txstore_cf(db: Arc<rocksdb::DB>) -> DB {
+        Self::new_data_cf(db, TXSTORE_CF)
+    }
+
+    pub fn history_cf(db: Arc<rocksdb::DB>) -> DB {
+        Self::new_data_cf(db, HISTORY_CF)
+    }
+
+    pub fn cache_cf(db: Arc<rocksdb::DB>) -> DB {
+        Self::new_data_cf(db, CACHE_CF)
+    }
+
     pub fn full_compaction(&self) {
-        info!("starting full compaction on {:?}", self.db);
+        info!(
+            "starting full compaction on {} ({:?})",
+            self.cf_name, self.db
+        );
         let start = std::time::Instant::now();
         let mut opts = rocksdb::CompactOptions::default();
         opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
-        self.db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &opts);
+        self.db
+            .compact_range_cf_opt(self.cf(), None::<&[u8]>, None::<&[u8]>, &opts);
         let elapsed = start.elapsed();
-        info!("finished full compaction on {:?} in elapsed='{:.1?}'", self.db, elapsed);
+        info!(
+            "finished full compaction on {} ({:?}) in elapsed='{:.1?}'",
+            self.cf_name, self.db, elapsed
+        );
     }
 
     fn apply_bulk_load_triggers(&self) {
-        const L0_BULK_TRIGGER: u32 = 64;
-        let trigger = L0_BULK_TRIGGER.to_string();
-        let slowdown = (L0_BULK_TRIGGER * 4).to_string();
-        let stop = (L0_BULK_TRIGGER * 8).to_string();
+        // Bulk-load compaction: allow L0 files to accumulate to a bounded limit
+        // before compacting. This reduces write amplification compared to the
+        // default trigger of 4, while keeping the file count — and therefore
+        // bloom-filter memory and lookup cost — bounded.
+        //
+        // With bloom filters at 10 bits/key and a 128 MB write buffer, each L0
+        // file has ~3.9 M keys, so its filter block is ~4.9 MB. At the slowdown
+        // threshold (48 files) that is ~235 MB of pinned filter blocks per CF,
+        // ~705 MB across 3 data CFs — within a 2 GB cache. At the stop threshold
+        // (64 files) it is ~314 MB per CF / ~940 MB total, still within bounds.
+        // Previously trigger=64 with 256 MB buffers caused pinned metadata to
+        // overflow the 2 GB cache at L0=128 (~3.7 GB), spilling to uncontrolled
+        // heap and triggering OOM.
+        //
+        // Set slowdown/stop triggers above the compaction trigger so RocksDB
+        // throttles writes while background compaction catches up.
+        const L0_BULK_TRIGGER: &str = "32";
+        const L0_BULK_SLOWDOWN: &str = "48";
+        const L0_BULK_STOP: &str = "64";
 
         let opts = [
-            ("level0_file_num_compaction_trigger", trigger.as_str()),
-            ("level0_slowdown_writes_trigger", slowdown.as_str()),
-            ("level0_stop_writes_trigger", stop.as_str()),
-            ("soft_pending_compaction_bytes_limit", "0"),
-            ("hard_pending_compaction_bytes_limit", "0"),
+            ("level0_file_num_compaction_trigger", L0_BULK_TRIGGER),
+            ("level0_slowdown_writes_trigger", L0_BULK_SLOWDOWN),
+            ("level0_stop_writes_trigger", L0_BULK_STOP),
         ];
-        self.db.set_options(&opts).unwrap();
+        self.db.set_options_cf(self.cf(), &opts).unwrap();
     }
 
     pub fn enable_auto_compaction(&self) {
         let opts = [("disable_auto_compactions", "false")];
-        self.db.set_options(&opts).unwrap();
+        self.db.set_options_cf(self.cf(), &opts).unwrap();
     }
 
     /// Restore RocksDB-default compaction triggers after bulk-load widening,
@@ -238,27 +211,28 @@ impl DB {
             ("soft_pending_compaction_bytes_limit", soft_limit.as_str()),
             ("hard_pending_compaction_bytes_limit", hard_limit.as_str()),
         ];
-        self.db.set_options(&opts).unwrap();
+        self.db.set_options_cf(self.cf(), &opts).unwrap();
     }
 
     pub fn raw_iterator(&self) -> rocksdb::DBRawIterator<'_> {
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_total_order_seek(true);
-        self.db.raw_iterator_opt(opts)
+        self.db.raw_iterator_cf_opt(self.cf(), opts)
     }
 
     pub fn iter_scan(&self, prefix: &[u8]) -> ScanIterator<'_> {
         let iter = if prefix.len() >= 33 {
-            self.db.prefix_iterator(prefix)
+            self.db.prefix_iterator_cf(self.cf(), prefix)
         } else {
             // Short prefixes (e.g. b"B", b"D") are below the 33-byte prefix extractor
             // length. prefix_iterator would silently skip SST files. Use total_order_seek
             // to fall back to a full scan; ScanIterator enforces the prefix boundary.
             let mut opts = rocksdb::ReadOptions::default();
             opts.set_total_order_seek(true);
-            self.db.iterator_opt(
-                rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            self.db.iterator_cf_opt(
+                self.cf(),
                 opts,
+                rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
             )
         };
         ScanIterator {
@@ -273,16 +247,17 @@ impl DB {
         // uses the prefix extractor for bloom filtering automatically. When < 33
         // bytes, fall back to total_order_seek to avoid silent misses.
         let iter = if start_at.len() >= 33 {
-            self.db.iterator(rocksdb::IteratorMode::From(
-                start_at,
-                rocksdb::Direction::Forward,
-            ))
+            self.db.iterator_cf(
+                self.cf(),
+                rocksdb::IteratorMode::From(start_at, rocksdb::Direction::Forward),
+            )
         } else {
             let mut opts = rocksdb::ReadOptions::default();
             opts.set_total_order_seek(true);
-            self.db.iterator_opt(
-                rocksdb::IteratorMode::From(start_at, rocksdb::Direction::Forward),
+            self.db.iterator_cf_opt(
+                self.cf(),
                 opts,
+                rocksdb::IteratorMode::From(start_at, rocksdb::Direction::Forward),
             )
         };
         ScanIterator {
@@ -308,25 +283,33 @@ impl DB {
 
     pub fn write_rows(&self, mut rows: Vec<DBRow>, flush: DBFlush) {
         log::trace!(
-            "writing {} rows to {:?}, flush={:?}",
+            "writing {} rows to {} ({:?}), flush={:?}",
             rows.len(),
+            self.cf_name,
             self.db,
             flush
         );
         rows.par_sort_unstable_by(|a, b| a.key.cmp(&b.key));
         let mut batch = rocksdb::WriteBatch::default();
+        let cf = self.cf();
         for row in rows {
-            batch.put(&row.key, &row.value);
+            batch.put_cf(cf, &row.key, &row.value);
         }
         self.write_batch(batch, flush)
     }
 
     pub fn delete_rows(&self, mut rows: Vec<DBRow>, flush: DBFlush) {
-        log::trace!("deleting {} rows from {:?}", rows.len(), self.db,);
+        log::trace!(
+            "deleting {} rows from {} ({:?})",
+            rows.len(),
+            self.cf_name,
+            self.db,
+        );
         rows.par_sort_unstable_by(|a, b| a.key.cmp(&b.key));
         let mut batch = rocksdb::WriteBatch::default();
+        let cf = self.cf();
         for row in rows {
-            batch.delete(&row.key);
+            batch.delete_cf(cf, &row.key);
         }
         self.write_batch(batch, flush)
     }
@@ -343,21 +326,21 @@ impl DB {
     }
 
     pub fn flush(&self) {
-        self.db.flush().unwrap();
+        self.db.flush_cf(self.cf()).unwrap();
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
-        self.db.put(key, value).unwrap();
+        self.db.put_cf(self.cf(), key, value).unwrap();
     }
 
     pub fn put_sync(&self, key: &[u8], value: &[u8]) {
         let mut opts = rocksdb::WriteOptions::new();
         opts.set_sync(true);
-        self.db.put_opt(key, value, &opts).unwrap();
+        self.db.put_cf_opt(self.cf(), key, value, &opts).unwrap();
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
-        self.db.get(key).unwrap().map(|v| v.to_vec())
+        self.db.get_cf(self.cf(), key).unwrap().map(|v| v.to_vec())
     }
 
     pub fn multi_get<K, I>(&self, keys: I) -> Vec<Result<Option<Vec<u8>>, rocksdb::Error>>
@@ -365,51 +348,57 @@ impl DB {
         K: AsRef<[u8]>,
         I: IntoIterator<Item = K>,
     {
-        self.db.multi_get(keys)
+        let cf = self.cf();
+        self.db.multi_get_cf(keys.into_iter().map(|key| (cf, key)))
     }
 
     /// Remove database entries in the range [from, to)
     pub fn delete_range<K: AsRef<[u8]>>(&self, from: K, to: K, flush: DBFlush) {
         let mut batch = rocksdb::WriteBatch::default();
-        batch.delete_range(from, to);
+        batch.delete_range_cf(self.cf(), from, to);
         self.write_batch(batch, flush);
     }
 
-    fn verify_compatibility(&self, config: &Config) {
-        let compatibility_bytes = bincode::serialize_little(&(DB_VERSION, config.light_mode)).unwrap();
-
-        match self.get(b"V") {
-            None => self.put(b"V", &compatibility_bytes),
-            Some(x) if x != compatibility_bytes => {
-                panic!("Incompatible database found. Please reindex or migrate.")
-            }
-            Some(_) => (),
-        }
+    pub(super) fn cf(&self) -> rocksdb::ColumnFamilyRef<'_> {
+        self.db
+            .cf_handle(self.cf_name)
+            .unwrap_or_else(|| panic!("missing RocksDB column family {}", self.cf_name))
     }
 
     #[cfg(test)]
     fn open_test(path: &Path) -> DB {
+        const TEST_CF: &str = "test";
+
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
-        db_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(33));
+        db_opts.create_missing_column_families(true);
+        db_opts.set_atomic_flush(true);
 
+        let mut cf_opts = rocksdb::Options::default();
+        cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(33));
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         block_opts.set_bloom_filter(10.0, false);
-        db_opts.set_block_based_table_factory(&block_opts);
+        cf_opts.set_block_based_table_factory(&block_opts);
 
-        DB {
-            db: Arc::new(rocksdb::DB::open(&db_opts, path).expect("failed to open test RocksDB")),
-        }
+        let cf_descriptors = [ColumnFamilyDescriptor::new(TEST_CF, cf_opts)];
+
+        let db = rocksdb::DB::open_cf_descriptors(&db_opts, path, cf_descriptors)
+            .expect("failed to open test RocksDB");
+        DB::new(Arc::new(db), TEST_CF)
     }
 
     pub fn start_stats_exporter(&self, db_metrics: Arc<RocksDbMetrics>, db_name: &str) {
         let db_arc = Arc::clone(&self.db);
         let db_arc2 = Arc::clone(&self.db);
+        let cf_name = self.cf_name;
         let label = db_name.to_string();
         let label2 = label.clone();
 
         let update_gauge = move |gauge: &GaugeVec, property: &str| {
-            if let Ok(Some(value)) = db_arc.property_value(property) {
+            let cf = db_arc
+                .cf_handle(cf_name)
+                .unwrap_or_else(|| panic!("missing RocksDB column family {}", cf_name));
+            if let Ok(Some(value)) = db_arc.property_value_cf(cf, property) {
                 if let Ok(v) = value.parse::<f64>() {
                     gauge.with_label_values(&[&label]).set(v);
                 }
@@ -450,18 +439,183 @@ impl DB {
             update_gauge(&db_metrics.block_cache_capacity, "rocksdb.block-cache-capacity");
             update_gauge(&db_metrics.block_cache_usage, "rocksdb.block-cache-usage");
             update_gauge(&db_metrics.block_cache_pinned_usage, "rocksdb.block-cache-pinned-usage");
+            let cf = db_arc2
+                .cf_handle(cf_name)
+                .unwrap_or_else(|| panic!("missing RocksDB column family {}", cf_name));
             for level in 0..ROCKSDB_NUM_LEVELS {
                 let prop = format!("rocksdb.num-files-at-level{}", level);
-                if let Ok(Some(value)) = db_arc2.property_value(&prop) {
+                if let Ok(Some(value)) = db_arc2.property_value_cf(cf, &prop) {
                     if let Ok(v) = value.parse::<f64>() {
                         let level_str = level.to_string();
-                        db_metrics.num_files_at_level.with_label_values(&[&label2, &level_str]).set(v);
+                        db_metrics
+                            .num_files_at_level
+                            .with_label_values(&[&label2, &level_str])
+                            .set(v);
                     }
                 }
             }
             thread::sleep(Duration::from_secs(5));
         });
     }
+}
+
+pub fn open_rocksdb(path: &Path, config: &Config) -> rocksdb::DB {
+    assert!(
+        !path.join("newindex").exists(),
+        "Found obsolete index database layout. Please reindex."
+    );
+
+    debug!("opening DB at {:?}", path);
+
+    let mut db_opts = rocksdb::Options::default();
+    db_opts.create_if_missing(true);
+    db_opts.create_missing_column_families(true);
+    db_opts.set_atomic_flush(true);
+    db_opts.set_max_open_files(100_000); // TODO: make sure to `ulimit -n` this process correctly
+
+    let parallelism: i32 = config
+        .db_parallelism
+        .try_into()
+        .expect("db_parallelism value too large for i32");
+
+    // Configure parallelism (background jobs and thread pools)
+    db_opts.increase_parallelism(parallelism);
+
+    // 4 MiB readahead for compaction I/O. Larger than the previous 1 MiB to better
+    // amortise syscall overhead when reading the many L0 files accumulated during
+    // initial sync.
+    db_opts.set_compaction_readahead_size(4 << 20);
+
+    // Background-sync SST files to the OS incrementally as they are written,
+    // rather than doing a large fsync on close. Smooths out I/O latency spikes.
+    db_opts.set_bytes_per_sync(1 << 20);
+
+    // Parallelize sub-ranges within a single compaction job (including the one-time
+    // full_compaction at the end of initial sync). Without this, compact_range() is
+    // single-threaded regardless of increase_parallelism(). Cap it at four because
+    // subcompactions can multiply the configured background-job concurrency:
+    // https://github.com/facebook/rocksdb/wiki/Subcompaction#options
+    db_opts.set_max_subcompactions(parallelism.min(4) as u32);
+
+    // Create a single shared LRU cache for all CFs. The total size is
+    // --db-block-cache-mb (not multiplied by 3). RocksDB's LRU cache is
+    // thread-safe, so all CFs share one eviction pool. This lets the
+    // txstore (which holds the bulk of the data) claim as much cache as it
+    // needs without being artificially capped at 1/3 of the total.
+    let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
+    let shared_cache = rocksdb::Cache::new_lru_cache(cache_size_bytes);
+    debug!(
+        "shared LRU block cache: db_block_cache_mb='{}'",
+        config.db_block_cache_mb
+    );
+
+    let cf_descriptors = [
+        ColumnFamilyDescriptor::new(DEFAULT_CF, rocksdb::Options::default()),
+        ColumnFamilyDescriptor::new(TXSTORE_CF, data_cf_options(config, &shared_cache)),
+        ColumnFamilyDescriptor::new(HISTORY_CF, data_cf_options(config, &shared_cache)),
+        ColumnFamilyDescriptor::new(CACHE_CF, data_cf_options(config, &shared_cache)),
+    ];
+
+    let db = rocksdb::DB::open_cf_descriptors(&db_opts, path, cf_descriptors)
+        .expect("failed to open RocksDB");
+
+    verify_compatibility(&db);
+    db
+}
+
+#[cfg(all(test, not(feature = "liquid")))]
+pub(super) fn open_test_rocksdb(path: &Path) -> rocksdb::DB {
+    let mut db_opts = rocksdb::Options::default();
+    db_opts.create_if_missing(true);
+    db_opts.create_missing_column_families(true);
+    db_opts.set_atomic_flush(true);
+
+    let cf_descriptors = [DEFAULT_CF, TXSTORE_CF, HISTORY_CF, CACHE_CF]
+        .iter()
+        .copied()
+        .map(|name| ColumnFamilyDescriptor::new(name, rocksdb::Options::default()));
+
+    rocksdb::DB::open_cf_descriptors(&db_opts, path, cf_descriptors)
+        .expect("failed to open test RocksDB")
+}
+
+fn verify_compatibility(db: &rocksdb::DB) {
+    let compatibility_bytes = bincode::serialize_little(&DB_VERSION).unwrap();
+    let cf = db
+        .cf_handle(DEFAULT_CF)
+        .unwrap_or_else(|| panic!("missing RocksDB column family {}", DEFAULT_CF));
+
+    match db.get_cf(cf, b"V").unwrap().map(|v| v.to_vec()) {
+        None => db.put_cf(cf, b"V", &compatibility_bytes).unwrap(),
+        Some(x) if x != compatibility_bytes => {
+            panic!("Incompatible database found. Please reindex.")
+        }
+        Some(_) => (),
+    }
+}
+
+fn data_cf_options(config: &Config, shared_cache: &rocksdb::Cache) -> rocksdb::Options {
+    let mut cf_opts = rocksdb::Options::default();
+    cf_opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
+    cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    cf_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+    cf_opts.set_target_file_size_base((config.db_target_file_size_mb as u64) * 1024 * 1024);
+    // 0 disables the limit. Set finite values via
+    // --db-{soft,hard}-pending-compaction-gb to engage RocksDB's automatic write
+    // throttling when the compaction backlog grows past the threshold. Steady-state
+    // defaults are restored after full compaction.
+    cf_opts.set_soft_pending_compaction_bytes_limit(
+        (config.db_soft_pending_compaction_gb as usize) << 30,
+    );
+    cf_opts.set_hard_pending_compaction_bytes_limit(
+        (config.db_hard_pending_compaction_gb as usize) << 30,
+    );
+    // L0 compaction triggers are left at RocksDB defaults (4/20/36) here.
+    // After open, apply_bulk_load_triggers() widens them for initial sync
+    // when the full-compaction sentinel 'F' is absent.
+
+    // Configure write buffer size (not set by increase_parallelism)
+    cf_opts.set_write_buffer_size(config.db_write_buffer_size_mb * 1024 * 1024);
+
+    // Configure block cache and table options
+    let mut block_opts = rocksdb::BlockBasedOptions::default();
+    block_opts.set_block_cache(shared_cache);
+    // When --cache-index-filter-blocks is passed, store index and filter blocks
+    // inside the block cache so their memory is bounded by --db-block-cache-mb.
+    // Without this (the default), RocksDB keeps them on the heap where they may
+    // never be evicted — possibly better for read performance compared to needing
+    // to go to disk, but uses ~18 MB per SST file.
+    if config.db_cache_index_filter_blocks {
+        block_opts.set_cache_index_and_filter_blocks(true);
+        // Pin L0 index and filter blocks in the cache so they are never evicted.
+        // Without this, data block churn evicts L0 index/filter blocks, causing
+        // repeated disk reads for every SST lookup.
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    }
+    // Bloom filters allow multi_get() to skip SST files that don't contain a key
+    // without touching the index or data blocks. Without this, every point lookup
+    // must binary-search the index of every L0 file whose key range overlaps the
+    // query (all of them for random txids) — extremely expensive with 1000+ L0
+    // files accumulated during initial sync. At 10 bits/key the false-positive
+    // rate is ~1%, so only ~10 out of 1000 L0 files need actual I/O per key.
+    // Combined with the prefix extractor below, these become prefix Bloom filters
+    // keyed on `code || hash` (33 bytes), which also allow prefix range scans
+    // (e.g. history lookups) to skip L0 files entirely. The filter blocks are
+    // cached and pinned alongside the index blocks via the settings above.
+    block_opts.set_bloom_filter(10.0, false);
+
+    // All electrs keys share the structure `code (1 byte) || hash (32 bytes) || ...`.
+    // A 33-byte fixed prefix extractor enables prefix Bloom filters: range scans
+    // like iter_scan("H" + scripthash) can skip SST files whose Bloom filter
+    // doesn't match the prefix, rather than checking every L0 file.
+    //
+    // INVARIANT: All iter_scan* and raw_iterator methods must use total_order_seek
+    // when the seek key may be shorter than 33 bytes. Without it, RocksDB silently
+    // skips SST files that contain matching keys. See the conditional in iter_scan().
+    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(33));
+
+    cf_opts.set_block_based_table_factory(&block_opts);
+    cf_opts
 }
 
 #[cfg(test)]

@@ -150,19 +150,19 @@ impl Query {
     #[trace]
     pub fn lookup_txn(&self, txid: &Txid) -> Option<Transaction> {
         self.chain
-            .lookup_txn(txid, None)
+            .lookup_txn(txid)
             .or_else(|| self.mempool().lookup_txn(txid))
     }
 
     #[trace]
     pub fn lookup_raw_txn(&self, txid: &Txid) -> Option<Bytes> {
         self.chain
-            .lookup_raw_txn(txid, None)
+            .lookup_raw_txn(txid)
             .or_else(|| self.mempool().lookup_raw_txn(txid))
     }
 
     #[trace]
-    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
+    pub fn lookup_txos(&self, outpoints: Vec<OutPoint>) -> HashMap<OutPoint, TxOut> {
         // the mempool lookup_txos() internally looks up confirmed txos as well
         self.mempool()
             .lookup_txos(outpoints)

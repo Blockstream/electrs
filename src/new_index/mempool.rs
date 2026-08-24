@@ -7,7 +7,7 @@ use electrs_macros::trace;
 #[cfg(feature = "liquid")]
 use elements::{encode::serialize, AssetId};
 
-use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -471,7 +471,7 @@ impl Mempool {
     }
 
     #[trace]
-    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
+    pub fn lookup_txos(&self, outpoints: Vec<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self
             .latency
             .with_label_values(&["lookup_txos"])

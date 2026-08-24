@@ -24,7 +24,6 @@ pub struct Config {
     pub network_type: Network,
     pub db_path: PathBuf,
     pub daemon_dir: PathBuf,
-    pub blocks_dir: PathBuf,
     pub daemon_rpc_addr: SocketAddr,
     pub daemon_rpc_fallback_addr: Option<SocketAddr>,
     pub daemon_parallelism: usize,
@@ -35,8 +34,6 @@ pub struct Config {
     pub http_addr: SocketAddr,
     pub http_socket_file: Option<PathBuf>,
     pub monitoring_addr: SocketAddr,
-    pub jsonrpc_import: bool,
-    pub light_mode: bool,
     pub address_search: bool,
     pub index_unspendables: bool,
     pub enable_mining_rest: bool,
@@ -49,14 +46,13 @@ pub struct Config {
     pub rpc_logging: RpcLogging,
     pub zmq_addr: Option<SocketAddr>,
 
-    /// RocksDB block cache size in MB (per database)
+    /// RocksDB block cache size in MB (shared across all column families)
     /// Caches decompressed data blocks, plus index and filter blocks (via cache_index_and_filter_blocks).
-    /// Total memory usage = cache_size * 3_databases (txstore, history, cache)
     /// Recommendation: 1024 MB for steady-state; 4096 MB+ for initial sync (L0 SST
     /// files accumulate up to the compaction trigger — their index, filter (Bloom),
     /// and data blocks must fit in this cache). With 10 bits/key bloom filters and
-    /// a 512 MB write buffer, each L0 file's filter block is ~9.75 MB, so 64 L0
-    /// files need ~625 MB of filter blocks on top of index blocks.
+    /// a 128 MB write buffer, each L0 file's filter block is ~4.9 MB, so 32 L0
+    /// files need ~157 MB of filter blocks on top of index blocks.
     pub db_block_cache_mb: usize,
 
     /// RocksDB parallelism level (background compaction and flush threads)
@@ -64,13 +60,13 @@ pub struct Config {
     /// This configures max_background_jobs and thread pools automatically
     pub db_parallelism: usize,
 
-    /// RocksDB write buffer size in MB (per database)
-    /// Each database uses this much RAM for in-memory writes before flushing to disk
-    /// Total RAM usage = write_buffer_size * max_write_buffer_number * 3_databases
+    /// RocksDB write buffer size in MB (per column family)
+    /// Each column family uses this much RAM for in-memory writes before flushing to disk
+    /// Total RAM usage = write_buffer_size * max_write_buffer_number * 3 CFs
     /// Larger buffers = fewer flushes (less CPU) but more RAM usage
     pub db_write_buffer_size_mb: usize,
 
-    /// Number of blocks per batch during initial sync (bitcoind fetch mode).
+    /// Number of blocks per batch during initial sync (for the legacy and Liquid modes).
     /// Larger batches keep more O rows in the write buffer when index() runs lookup_txos(),
     /// improving cache hit rate for outputs spent within the same batch window.
     /// Must stay within db_write_buffer_size_mb to avoid mid-batch flushes.
@@ -82,6 +78,23 @@ pub struct Config {
     /// may never be evicted, giving better read performance at the cost of ~18 MB
     /// per SST file of unbounded memory.
     pub db_cache_index_filter_blocks: bool,
+
+    /// RocksDB target_file_size_base in MB (per CF). Smaller values produce smaller
+    /// L1+ SST files at the cost of more files and more compactions overall. Default
+    /// 1024 (1 GiB).
+    pub db_target_file_size_mb: usize,
+
+    /// Used during initial sync.
+    /// RocksDB soft_pending_compaction_bytes_limit in GiB (per CF). When the estimated
+    /// compaction backlog exceeds this, RocksDB rate-limits writes. 0 disables the limit.
+    /// A finite value (e.g. 8) provides automatic backpressure when compaction falls behind.
+    pub db_soft_pending_compaction_gb: u64,
+
+    /// Used during initial sync.
+    /// RocksDB hard_pending_compaction_bytes_limit in GiB (per CF). When the estimated
+    /// compaction backlog exceeds this, RocksDB stops writes entirely until compaction
+    /// catches up. 0 disables. Should be 3-4x the soft limit (e.g. 32 with soft=8).
+    pub db_hard_pending_compaction_gb: u64,
 
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
@@ -132,12 +145,6 @@ impl Config {
                 Arg::with_name("daemon_dir")
                     .long("daemon-dir")
                     .help("Data directory of Bitcoind (default: ~/.bitcoin/)")
-                    .takes_value(true),
-            )
-            .arg(
-                Arg::with_name("blocks_dir")
-                    .long("blocks-dir")
-                    .help("Analogous to bitcoind's -blocksdir option, this specifies the directory containing the raw blocks files (blk*.dat) (default: ~/.bitcoin/blocks/)")
                     .takes_value(true),
             )
             .arg(
@@ -205,12 +212,7 @@ impl Config {
             .arg(
                 Arg::with_name("jsonrpc_import")
                     .long("jsonrpc-import")
-                    .help("Use JSONRPC instead of directly importing blk*.dat files. Useful for remote full node or low memory system"),
-            )
-            .arg(
-                Arg::with_name("light_mode")
-                    .long("lightmode")
-                    .help("Enable light mode for reduced storage")
+                    .help("This option is deprecated and has no effect."),
             )
             .arg(
                 Arg::with_name("address_search")
@@ -279,7 +281,7 @@ impl Config {
             ).arg(
                 Arg::with_name("db_block_cache_mb")
                     .long("db-block-cache-mb")
-                    .help("RocksDB block cache size in MB (shared across all databases). Bounds index/filter block memory; use 4096+ for initial sync to avoid table-reader heap growth.")
+                    .help("RocksDB block cache size in MB (shared across all column families). Bounds index/filter block memory; use 4096+ for initial sync to avoid table-reader heap growth.")
                     .takes_value(true)
                     .default_value("24")
             ).arg(
@@ -291,19 +293,37 @@ impl Config {
             ).arg(
                 Arg::with_name("db_write_buffer_size_mb")
                     .long("db-write-buffer-size-mb")
-                    .help("RocksDB write buffer size in MB per database. RAM usage = size * max_write_buffers(2) * 3_databases")
+                    .help("RocksDB write buffer size in MB per column family. RAM usage = size * max_write_buffers(2) * 3 CFs")
                     .takes_value(true)
-                    .default_value("256")
+                    .default_value("128")
              ).arg(
                 Arg::with_name("initial_sync_batch_size")
                     .long("initial-sync-batch-size")
-                    .help("Number of blocks per batch during initial sync. Larger values keep more txo rows in the write buffer during indexing, improving lookup_txos cache hit rate for recently-created outputs.")
+                    .help("Number of blocks per batch during initial sync (for the legacy and Liquid modes). Larger values keep more txo rows in the write buffer during indexing, improving lookup_txos cache hit rate for recently-created outputs.")
                     .takes_value(true)
                     .default_value("250")
              ).arg(
                 Arg::with_name("cache_index_filter_blocks")
                     .long("cache-index-filter-blocks")
                     .help("Store index/filter blocks in the block cache instead of on the heap. Bounds memory but allows eviction under cache pressure.")
+             ).arg(
+                Arg::with_name("db_target_file_size_mb")
+                    .long("db-target-file-size-mb")
+                    .help("RocksDB target_file_size_base in MB per CF. Smaller values produce more, smaller L1+ SST files. Default 1024.")
+                    .takes_value(true)
+                    .default_value("1024")
+             ).arg(
+                Arg::with_name("db_soft_pending_compaction_gb")
+                    .long("db-soft-pending-compaction-gb")
+                    .help("RocksDB soft_pending_compaction_bytes_limit in GiB per CF during initial sync. RocksDB rate-limits writes above this. 0 disables.")
+                    .takes_value(true)
+                    .default_value("8")
+             ).arg(
+                Arg::with_name("db_hard_pending_compaction_gb")
+                    .long("db-hard-pending-compaction-gb")
+                    .help("RocksDB hard_pending_compaction_bytes_limit in GiB per CF during initial sync. RocksDB stops writes above this. 0 disables.")
+                    .takes_value(true)
+                    .default_value("32")
              ).arg(
                 Arg::with_name("zmq_addr")
                     .long("zmq-addr")
@@ -499,10 +519,6 @@ impl Config {
         if let Some(network_subdir) = get_network_subdir(network_type) {
             daemon_dir.push(network_subdir);
         }
-        let blocks_dir = m
-            .value_of("blocks_dir")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| daemon_dir.join("blocks"));
         let cookie = m.value_of("cookie").map(|s| s.to_owned());
 
         let electrum_banner = m.value_of("electrum_banner").map_or_else(
@@ -519,6 +535,20 @@ impl Config {
         // Base verbosity is 2 (Info), each -v flag adds one level:
         // no flags = Info, -v = Debug, -vv = Trace
         log.verbosity(2 + m.occurrences_of("verbosity") as usize);
+
+        // Use a white-list to exclude ureq-proto, which dumps binary REST responses in its trace logs
+        log.modules([
+            // local binaries
+            "electrs",
+            "popular_scripts",
+            "tx_fingerprint_stats",
+            // external crates
+            "electrum_client",
+            "reqwest",
+            "rustls",
+            "tiny_http",
+            "ureq",
+        ]);
         log.timestamp(if m.is_present("timestamp") {
             stderrlog::Timestamp::Millisecond
         } else {
@@ -526,12 +556,17 @@ impl Config {
         });
         log.init().expect("logging initialization failed");
 
+        if m.is_present("jsonrpc_import") {
+            warn!(
+                "The --jsonrpc-import option is deprecated and has no effect. It may be removed in a future release."
+            );
+        }
+
         let config = Config {
             log,
             network_type,
             db_path,
             daemon_dir,
-            blocks_dir,
             daemon_rpc_addr,
             daemon_rpc_fallback_addr,
             daemon_parallelism: value_t_or_exit!(m, "daemon_parallelism", usize),
@@ -555,8 +590,6 @@ impl Config {
             http_addr,
             http_socket_file,
             monitoring_addr,
-            jsonrpc_import: m.is_present("jsonrpc_import"),
-            light_mode: m.is_present("light_mode"),
             address_search: m.is_present("address_search"),
             index_unspendables: m.is_present("index_unspendables"),
             enable_mining_rest: m.is_present("enable_mining_rest"),
@@ -567,6 +600,17 @@ impl Config {
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
             initial_sync_batch_size: value_t_or_exit!(m, "initial_sync_batch_size", usize),
             db_cache_index_filter_blocks: m.is_present("cache_index_filter_blocks"),
+            db_target_file_size_mb: value_t_or_exit!(m, "db_target_file_size_mb", usize),
+            db_soft_pending_compaction_gb: value_t_or_exit!(
+                m,
+                "db_soft_pending_compaction_gb",
+                u64
+            ),
+            db_hard_pending_compaction_gb: value_t_or_exit!(
+                m,
+                "db_hard_pending_compaction_gb",
+                u64
+            ),
             zmq_addr,
 
             #[cfg(feature = "liquid")]

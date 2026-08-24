@@ -30,15 +30,6 @@ Creating the indexes should take a few hours on a beefy machine with SSD.
 
 To deploy with Docker, follow the [instructions here](https://github.com/Blockstream/esplora#how-to-build-the-docker-image).
 
-### Light mode
-
-For personal or low-volume use, you may set `--lightmode` to reduce disk storage requirements
-by roughly 50% at the cost of slower and more expensive lookups.
-
-With this option set, raw transactions and metadata associated with blocks will not be kept in rocksdb
-(the `T`, `X` and `M` indexes),
-but instead queried from bitcoind on demand.
-
 ### Notable changes from Electrs:
 
 - HTTP REST API in addition to the Electrum JSON-RPC protocol, with extended transaction information
@@ -63,7 +54,6 @@ but instead queried from bitcoind on demand.
 In addition to electrs's original configuration options, a few new options are also available:
 
 - `--http-addr <addr:port>` - HTTP server address/port to listen on (default: `127.0.0.1:3000`).
-- `--lightmode` - enable light mode (see above)
 - `--cors <origins>` - origins allowed to make cross-site request (optional, defaults to none).
 - `--address-search` - enables the by-prefix address search index.
 - `--index-unspendables` - enables indexing of provably unspendable outputs.

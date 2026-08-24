@@ -1,5 +1,4 @@
 use bitcoin::hashes::{sha256, sha256d::Hash as Sha256dHash, Hash};
-use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 
@@ -17,11 +16,10 @@ use elements::{
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
+#[cfg(not(feature = "liquid"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use crate::{chain::{
-    BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
-}, new_index::db_metrics::RocksDbMetrics};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
@@ -30,12 +28,21 @@ use crate::util::{
     bincode, full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta,
     BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
 };
+use crate::{
+    chain::{
+        Block, BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
+    },
+    new_index::db_metrics::RocksDbMetrics,
+};
 
-use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
-use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
+use crate::new_index::db::{self, DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
+use crate::new_index::fetch::{start_fetcher, BlockEntry};
 
 #[cfg(feature = "liquid")]
-use crate::elements::{asset, ebcompact::TxidCompat, peg};
+use crate::elements::{asset, peg};
+
+#[cfg(feature = "liquid")]
+use crate::elements::ebcompact::SizeMethod;
 
 #[cfg(feature = "liquid")]
 use elements::encode::VarInt;
@@ -46,7 +53,8 @@ use bitcoin::VarInt;
 const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
 pub struct Store {
-    // TODO: should be column families
+    db: Arc<rocksdb::DB>,
+    default_db: DB,
     txstore_db: DB,
     history_db: DB,
     cache_db: DB,
@@ -56,60 +64,73 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(config: &Config, metrics: &Metrics, verify_compat: bool) -> Self {
-        let path = config.db_path.join("newindex");
+    pub fn open(config: &Config, metrics: &Metrics) -> Self {
+        let db = Arc::new(db::open_rocksdb(&config.db_path, config));
+        let store = Self::from_db(db);
 
-        // Create a single shared LRU cache for all three DBs. The total size is
-        // --db-block-cache-mb (not multiplied by 3). RocksDB's LRU cache is
-        // thread-safe, so all DBs share one eviction pool. This lets the
-        // txstore (which holds the bulk of the data) claim as much cache as it
-        // needs without being artificially capped at 1/3 of the total.
-        let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
-        let shared_cache = rocksdb::Cache::new_lru_cache(cache_size_bytes);
-        debug!("shared LRU block cache: db_block_cache_mb='{}'", config.db_block_cache_mb);
+        let db_metrics = Arc::new(RocksDbMetrics::new(&metrics));
+        store
+            .txstore_db
+            .start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");
+        store
+            .history_db
+            .start_stats_exporter(Arc::clone(&db_metrics), "history_db");
+        store
+            .cache_db
+            .start_stats_exporter(Arc::clone(&db_metrics), "cache_db");
 
-        let txstore_db = DB::open(&path.join("txstore"), config, verify_compat, &shared_cache);
+        store
+    }
+
+    fn from_db(db: Arc<rocksdb::DB>) -> Self {
+        let default_db = DB::default_cf(Arc::clone(&db));
+        let txstore_db = DB::txstore_cf(Arc::clone(&db));
+        let history_db = DB::history_cf(Arc::clone(&db));
+        let cache_db = DB::cache_cf(Arc::clone(&db));
+
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         info!("{} blocks were added", added_blockhashes.len());
 
-        let history_db = DB::open(&path.join("history"), config, verify_compat, &shared_cache);
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         info!("{} blocks were indexed", indexed_blockhashes.len());
 
-        let cache_db = DB::open(&path.join("cache"), config, verify_compat, &shared_cache);
-
-        let db_metrics = Arc::new(RocksDbMetrics::new(&metrics));
-        txstore_db.start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");
-        history_db.start_stats_exporter(Arc::clone(&db_metrics), "history_db");
-        cache_db.start_stats_exporter(Arc::clone(&db_metrics), "cache_db");
-
-        let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
-            let mut tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
+        // Construct the `HeaderList` from persisted `t` and `D` markers
+        let headers = if let Some(tip_hash) = default_db.get(b"t") {
+            let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
             let headers_map = load_blockheaders(&txstore_db);
 
-            // Move the tip back until we reach a block that is indexed in the history db.
-            // It is possible for the tip recorded under the db "t" key to be un-indexed if electrs
-            // shuts down during reorg handling. Normally this wouldn't matter because the non-indexed
-            // block would be stale, but it could matter if the chain later re-orged back to
-            // include the previously stale block because more blocks were built on top of it.
-            // Without this, the stale-then-not-stale block(s) would not get re-indexed correctly.
-            while !indexed_blockhashes.contains(&tip_hash) {
-                tip_hash = headers_map
-                    .get(&tip_hash)
-                    .expect("invalid header chain")
-                    .prev_blockhash;
-            }
             info!(
                 "{} headers were loaded, tip at {:?}",
                 headers_map.len(),
                 tip_hash
             );
-            HeaderList::new(headers_map, tip_hash)
+            // First build and validate the header chain by walking backwards from `t`.
+            let mut headers = HeaderList::new(headers_map, tip_hash);
+
+            // Then, walk forward from genesis and roll back to the last block
+            // with both completion markers. Under normal publication rules this
+            // should keep the whole `t` chain. The trim is a fail-closed guard
+            // if `t` and completion markers disagree.
+            let fully_indexed_blockhashes: HashSet<_> = added_blockhashes
+                .intersection(&indexed_blockhashes)
+                .copied()
+                .collect();
+            let fully_indexed_len = headers
+                .iter()
+                .take_while(|entry| fully_indexed_blockhashes.contains(entry.hash()))
+                .count();
+            let _ = headers.pop(fully_indexed_len);
+            // The popped headers are only hidden from the Store::open() midstate.
+            // Their rows remain in RocksDB. The first daemon-aware update() can
+            // finish still-best work or undo hidden stale history.
+            headers
         } else {
             HeaderList::empty()
         };
 
         Store {
+            db,
+            default_db,
             txstore_db,
             history_db,
             cache_db,
@@ -135,8 +156,13 @@ impl Store {
         self.indexed_headers.read().unwrap()
     }
 
-    pub fn done_initial_sync(&self) -> bool {
-        self.txstore_db.get(b"t").is_some()
+    fn flush_block_writes(&self) {
+        let cfs = [self.txstore_db.cf(), self.history_db.cf()];
+        self.db.flush_cfs_opt(&cfs, &Default::default()).unwrap();
+    }
+
+    fn update_tip(&self, tip: &BlockHash) {
+        self.default_db.put_sync(b"t", &serialize(tip));
     }
 }
 
@@ -201,32 +227,38 @@ impl ScriptStats {
 pub struct Indexer {
     store: Arc<Store>,
     flush: DBFlush,
-    from: FetchFrom,
     iconfig: IndexerConfig,
     duration: HistogramVec,
     tip_metric: Gauge,
     sync_height: Gauge,
     sync_progress: prometheus::Gauge,
+    // Always true initially, cleared after the first update() completes the startup stale sweep
+    pending_startup_recovery: bool,
 }
 
 struct IndexerConfig {
-    light_mode: bool,
     address_search: bool,
     index_unspendables: bool,
     network: Network,
     block_batch_size: usize,
+    #[cfg(not(feature = "liquid"))]
+    use_spenttxouts: bool,
     #[cfg(feature = "liquid")]
     parent_network: crate::chain::BNetwork,
 }
 
-impl From<&Config> for IndexerConfig {
-    fn from(config: &Config) -> Self {
+impl IndexerConfig {
+    fn new(config: &Config, use_spenttxouts: bool) -> Self {
+        #[cfg(feature = "liquid")]
+        assert!(!use_spenttxouts);
+
         IndexerConfig {
-            light_mode: config.light_mode,
             address_search: config.address_search,
             index_unspendables: config.index_unspendables,
             network: config.network_type,
             block_batch_size: config.initial_sync_batch_size,
+            #[cfg(not(feature = "liquid"))]
+            use_spenttxouts,
             #[cfg(feature = "liquid")]
             parent_network: config.parent_network,
         }
@@ -235,20 +267,22 @@ impl From<&Config> for IndexerConfig {
 
 pub struct ChainQuery {
     store: Arc<Store>, // TODO: should be used as read-only
-    daemon: Arc<Daemon>,
-    light_mode: bool,
     duration: HistogramVec,
     network: Network,
 }
 
 // TODO: &[Block] should be an iterator / a queue.
 impl Indexer {
-    pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
+    pub fn open(store: Arc<Store>, config: &Config, metrics: &Metrics, daemon: &Daemon) -> Self {
+        let use_spenttxouts = daemon.supports_spenttxouts();
+        if !use_spenttxouts && !cfg!(feature = "liquid") {
+            warn!("REST spenttxouts unavailable, using legacy indexer (upgrade to Bitcoin Core 30+ for the new, more efficient indexer)");
+        }
+
         Indexer {
             store,
             flush: DBFlush::Disable,
-            from,
-            iconfig: IndexerConfig::from(config),
+            iconfig: IndexerConfig::new(config, use_spenttxouts),
             duration: metrics.histogram_vec(
                 HistogramOpts::new("index_duration", "Index update duration (in seconds)"),
                 &["step"],
@@ -262,6 +296,7 @@ impl Indexer {
                 "initial_sync_progress_pct",
                 "Initial sync progress as a percentage of the best known chain height",
             )),
+            pending_startup_recovery: true,
         }
     }
 
@@ -270,13 +305,21 @@ impl Indexer {
     }
 
     // Headers that need any work: either not yet added to txstore or not yet indexed to history.
-    fn headers_to_process(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
+    fn headers_to_process(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderWork> {
         let added = self.store.added_blockhashes.read().unwrap();
         let indexed = self.store.indexed_blockhashes.read().unwrap();
         new_headers
             .iter()
-            .filter(|e| !added.contains(e.hash()) || !indexed.contains(e.hash()))
-            .cloned()
+            .filter_map(|entry| {
+                let hash = entry.hash();
+                let need_txstore = !added.contains(hash);
+                let need_history = !indexed.contains(hash);
+                (need_txstore || need_history).then(|| HeaderWork {
+                    entry: entry.clone(),
+                    need_txstore,
+                    need_history,
+                })
+            })
             .collect()
     }
 
@@ -327,6 +370,15 @@ impl Indexer {
         let (new_headers, reorged_since) = self.get_new_headers(&daemon, &tip)?;
         let chain_tip_height = new_headers.last().map(|h| h.height()).unwrap_or(0);
 
+        // Run a one-time recovery on the first startup to sweep stale history db entries
+        // from blocks not part of the `indexed_headers` chain loaded from DB or the `new_headers`.
+        // This can be necessary if electrs crashes while processing a reorg, or if it partially
+        // processed new blocks that became stale while electrs was down.
+        if self.pending_startup_recovery {
+            self.stale_history_startup_recovery(&new_headers)?;
+            self.pending_startup_recovery = false;
+        }
+
         // Handle reorgs by undoing the reorged (stale) blocks first
         if let Some(reorged_since) = reorged_since {
             // Remove reorged headers from the in-memory HeaderList.
@@ -334,7 +386,7 @@ impl Indexer {
             // (even before the rows are deleted below), since they reference block heights that will no longer exist.
             // This ensures consistency - it is not possible for blocks to be available (e.g. in GET /blocks/tip or /block/:hash)
             // without the corresponding history entries for these blocks (e.g. in GET /address/:address/txs), or vice-versa.
-            let mut reorged_headers = self
+            let (reorged_headers, common_ancestor) = self
                 .store
                 .indexed_headers
                 .write()
@@ -349,18 +401,120 @@ impl Indexer {
                 reorged_since,
             );
 
-            // Reorged blocks are undone in chunks of 100, processed in serial, each as an atomic batch.
-            // Reverse them so that chunks closest to the chain tip are processed first,
-            // which is necessary to properly recover from crashes during reorg handling.
-            // Also see the comment under `Store::open()`.
-            reorged_headers.reverse();
+            // Persist the common ancestor tip before deleting reorged history rows. If electrs crashes before
+            // reorg cleanup completes, the next startup will recover from this tip and complete the cleanup.
+            self.store.update_tip(&common_ancestor);
 
-            // Fetch the reorged blocks, then undo their history index db rows.
+            // Reconstruct the reorged blocks locally, then undo their history index db rows.
             // The txstore db rows are kept for reorged blocks/transactions.
-            start_fetcher(self.from, &daemon, reorged_headers, self.iconfig.block_batch_size, chain_tip_height)?
-                .map(|blocks| self.undo_index(&blocks));
+            self.process_stale(reorged_headers)?;
+
+            // Flush deletions prior to processing new blocks
+            self.store.history_db.flush();
         }
 
+        self.process_blocks(&daemon, &new_headers, chain_tip_height)?;
+
+        // Compact after all add+index work is done, not between passes.
+        self.start_auto_compactions(&self.store.txstore_db);
+        self.start_auto_compactions(&self.store.history_db);
+        self.start_auto_compactions(&self.store.cache_db);
+
+        if let DBFlush::Disable = self.flush {
+            let t = std::time::Instant::now();
+            info!("flushing block writes to disk");
+            self.store.flush_block_writes();
+            info!("flushing block writes complete in {:.1?}", t.elapsed());
+
+            self.flush = DBFlush::Enable;
+        }
+
+        // Update the synced tip after all db writes are flushed
+        debug!("updating synced tip to {:?}", tip);
+        self.store.update_tip(&tip);
+
+        // Finally, append the new headers to the in-memory HeaderList.
+        // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
+        let mut headers = self.store.indexed_headers.write().unwrap();
+        headers.append(new_headers);
+        assert_eq!(tip, *headers.tip());
+
+        self.tip_metric.set(headers.best_height() as i64);
+
+        Ok(tip)
+    }
+
+    fn stale_history_startup_recovery(&self, new_headers: &[HeaderEntry]) -> Result<()> {
+        // Store::open() has no daemon view, so it only finds a safe chain tip that's fully
+        // indexed but does not attempt to clean up stale history db entries. On the first
+        // update(), new_headers identify bitcoind's best chain so stale blocks can be
+        // reconstructed locally and cleaned up without asking bitcoind for stale data.
+        let stale_blockhashes: Vec<_> = {
+            let to_keep_blockhashes = new_headers
+                .iter()
+                .chain(self.store.indexed_headers.read().unwrap().iter())
+                .map(|entry| *entry.hash())
+                .collect::<HashSet<_>>();
+            let indexed_blockhashes = self.store.indexed_blockhashes.read().unwrap();
+
+            indexed_blockhashes
+                .difference(&to_keep_blockhashes)
+                .copied()
+                .collect()
+        };
+
+        if !stale_blockhashes.is_empty() {
+            let stale_headers: Vec<_> = stale_blockhashes
+                .iter()
+                .map(|hash| load_header_entry(&self.store.txstore_db, hash))
+                .collect();
+            info!("cleaning up {} stale blocks", stale_headers.len());
+            self.process_stale(stale_headers)?;
+            self.store.history_db.flush();
+        }
+
+        Ok(())
+    }
+
+    fn process_stale(&self, headers: Vec<HeaderEntry>) -> Result<()> {
+        for headers in &headers.into_iter().chunks(self.iconfig.block_batch_size) {
+            let blocks = headers
+                .map(|entry| load_block_entry(&self.store.txstore_db, entry))
+                .collect::<Result<Vec<_>>>()?;
+            let block_refs = blocks.iter().collect::<Vec<_>>();
+            self.undo_index(&block_refs);
+        }
+
+        Ok(())
+    }
+
+    fn process_blocks(
+        &self,
+        daemon: &Daemon,
+        new_headers: &[HeaderEntry],
+        chain_tip_height: usize,
+    ) -> Result<()> {
+        let to_process = self.headers_to_process(new_headers);
+
+        if to_process.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "liquid"))]
+        if self.iconfig.use_spenttxouts {
+            return self.process_blocks_spenttxouts(daemon, to_process, chain_tip_height);
+        }
+
+        self.process_blocks_legacy(daemon, to_process, chain_tip_height)
+    }
+
+    fn process_blocks_legacy(
+        &self,
+        daemon: &Daemon,
+        to_process: Vec<HeaderWork>,
+        chain_tip_height: usize,
+    ) -> Result<()> {
+        let _timer = self.start_timer("process_blocks");
         // Single-pass: add to txstore and index to history in the same per-batch loop.
         //
         // In the old two-pass approach, txstore_db was fully compacted between the add
@@ -375,17 +529,20 @@ impl Indexer {
         // Crash safety: added_blockhashes / indexed_blockhashes are persisted via the
         // "D" done-marker rows. On restart, headers_to_process() re-derives which
         // blocks still need work, so partially-processed batches are re-processed safely.
-        let to_process = self.headers_to_process(&new_headers);
-        debug!(
-            "processing {} blocks (add + index) using {:?}",
-            to_process.len(),
-            self.from
-        );
+        debug!("processing {} blocks (add + index)", to_process.len());
 
         let mut fetcher_count = 0;
         let to_process_total = to_process.len();
+        let headers_to_fetch = to_process.iter().map(|work| work.entry.clone()).collect();
+        let mut to_process_batches = to_process.chunks(self.iconfig.block_batch_size);
 
-        start_fetcher(self.from, &daemon, to_process, self.iconfig.block_batch_size, chain_tip_height)?.map(|blocks| {
+        start_fetcher(
+            daemon,
+            headers_to_fetch,
+            self.iconfig.block_batch_size,
+            chain_tip_height,
+        )?
+        .map(|blocks| {
             if fetcher_count % 25 == 0 && to_process_total > 20 {
                 let batch_height = blocks.last().map(|b| b.entry.height()).unwrap_or(0);
                 info!(
@@ -397,25 +554,23 @@ impl Indexer {
             }
             fetcher_count += 1;
 
+            let to_process_batch = to_process_batches.next().unwrap();
+
             // Add blocks not yet in txstore (idempotent: crash recovery skips already-added blocks)
-            let to_add: Vec<_> = {
-                let added = self.store.added_blockhashes.read().unwrap();
-                blocks
-                    .iter()
-                    .filter(|b| !added.contains(b.entry.hash()))
-                    .cloned()
-                    .collect()
-            };
+            let to_add: Vec<_> = blocks
+                .iter()
+                .zip_eq(to_process_batch.iter())
+                .filter(|(_, work)| work.need_txstore)
+                .map(|(block, _)| block)
+                .collect();
 
             // Index blocks not yet in history (O rows for to_add are now in the write buffer)
-            let to_index: Vec<_> = {
-                let indexed = self.store.indexed_blockhashes.read().unwrap();
-                blocks
-                    .iter()
-                    .filter(|b| !indexed.contains(b.entry.hash()))
-                    .cloned()
-                    .collect()
-            };
+            let to_index: Vec<_> = blocks
+                .iter()
+                .zip_eq(to_process_batch.iter())
+                .filter(|(_, work)| work.need_history)
+                .map(|(block, _)| block)
+                .collect();
 
             if !to_add.is_empty() || !to_index.is_empty() {
                 let _batch_timer = self.start_timer("batch_total");
@@ -430,61 +585,119 @@ impl Indexer {
                 let h = last.entry.height();
                 self.sync_height.set(h as i64);
                 if chain_tip_height > 0 {
-                    self.sync_progress.set(h as f64 / chain_tip_height as f64 * 100.0);
+                    self.sync_progress
+                        .set(h as f64 / chain_tip_height as f64 * 100.0);
                 }
             }
         });
+        assert!(to_process_batches.next().is_none());
 
-        // Compact after all add+index work is done, not between passes.
-        self.start_auto_compactions(&self.store.txstore_db);
-        self.start_auto_compactions(&self.store.history_db);
-        self.start_auto_compactions(&self.store.cache_db);
-
-        if let DBFlush::Disable = self.flush {
-            let t = std::time::Instant::now();
-            info!("flushing txstore_db to disk");
-            self.store.txstore_db.flush();
-            info!("flushing txstore_db complete in {:.1?}", t.elapsed());
-
-            let t = std::time::Instant::now();
-            info!("flushing history_db to disk");
-            self.store.history_db.flush();
-            info!("flushing history_db complete in {:.1?}", t.elapsed());
-
-            // cache_db receives WAL-disabled writes when --address-search is enabled,
-            // so it needs the same explicit flush to ensure durability.
-            let t = std::time::Instant::now();
-            info!("flushing cache_db to disk");
-            self.store.cache_db.flush();
-            info!("flushing cache_db complete in {:.1?}", t.elapsed());
-
-            self.flush = DBFlush::Enable;
-        }
-
-        // Update the synced tip after all db writes are flushed
-        debug!("updating synced tip to {:?}", tip);
-        self.store.txstore_db.put_sync(b"t", &serialize(&tip));
-
-        // Finally, append the new headers to the in-memory HeaderList.
-        // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
-        let mut headers = self.store.indexed_headers.write().unwrap();
-        headers.append(new_headers);
-        assert_eq!(tip, *headers.tip());
-
-        if let FetchFrom::BlkFiles = self.from {
-            self.from = FetchFrom::Bitcoind;
-        }
-
-        self.tip_metric.set(headers.best_height() as i64);
-
-        Ok(tip)
+        Ok(())
     }
 
-    fn add(&self, blocks: &[BlockEntry]) {
+    #[cfg(not(feature = "liquid"))]
+    fn process_blocks_spenttxouts(
+        &self,
+        daemon: &Daemon,
+        to_process: Vec<HeaderWork>,
+        chain_tip_height: usize,
+    ) -> Result<()> {
+        let _timer = self.start_timer("process_blocks");
+        debug!("processing {} blocks (spenttxouts)", to_process.len());
+
+        let total_blocks = to_process.len();
+        let processed_blocks = AtomicUsize::new(0);
+        let highest_completed = AtomicUsize::new(0);
+
+        daemon.with_request_pool(|| {
+            to_process.into_par_iter().try_for_each(|work| {
+                self.process_block_spenttxouts(
+                    daemon,
+                    work,
+                    total_blocks,
+                    chain_tip_height,
+                    &processed_blocks,
+                    &highest_completed,
+                )
+            })
+        })?;
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    fn process_block_spenttxouts(
+        &self,
+        daemon: &Daemon,
+        work: HeaderWork,
+        total_blocks: usize,
+        chain_tip_height: usize,
+        processed_blocks: &AtomicUsize,
+        highest_completed: &AtomicUsize,
+    ) -> Result<()> {
+        let block_entry = fetch_block_entry(daemon, work.entry)?;
+
+        if work.need_txstore {
+            self.store
+                .txstore_db
+                .write_rows(add_block(&block_entry, &self.iconfig), self.flush);
+            self.store
+                .added_blockhashes
+                .write()
+                .unwrap()
+                .insert(*block_entry.entry.hash());
+        }
+
+        if work.need_history {
+            // Need to flatten() because Bitcoin Core returns spenttxouts as a per-tx vector of
+            // prevouts, while the indexer expects a per-block prevouts vector.
+            let previous_txos: Vec<TxOut> = daemon
+                .get_spent_txouts(block_entry.entry.hash())?
+                .into_iter()
+                .flatten()
+                .collect();
+            self.store.history_db.write_rows(
+                index_block(&block_entry, &previous_txos, &self.iconfig),
+                self.flush,
+            );
+            self.store
+                .indexed_blockhashes
+                .write()
+                .unwrap()
+                .insert(*block_entry.entry.hash());
+        }
+
+        let processed = processed_blocks.fetch_add(1, Ordering::Relaxed) + 1;
+        self.sync_progress
+            .set(processed as f64 / total_blocks.max(1) as f64 * 100.0);
+        let height = block_entry.entry.height();
+        // Workers complete out of order, so this is only a best-effort highest completed height,
+        // not the last contiguous fully-processed best-chain height.
+        let highest = highest_completed
+            .fetch_max(height, Ordering::Relaxed)
+            .max(height);
+        self.sync_height.set(highest as i64);
+        if processed % 6000 == 0 && total_blocks > 20 {
+            info!(
+                "processing blocks {}/{} ({:.1}%)",
+                highest,
+                chain_tip_height,
+                processed as f32 / total_blocks.max(1) as f32 * 100.0
+            );
+        }
+
+        Ok(())
+    }
+
+    fn add(&self, blocks: &[&BlockEntry]) {
         // TODO: skip orphaned blocks?
         let rows = {
             let _timer = self.start_timer("add_process");
-            add_blocks(blocks, &self.iconfig)
+            blocks
+                .par_iter() // serialization is CPU-intensive
+                .map(|b| add_block(b, &self.iconfig))
+                .flatten()
+                .collect()
         };
         {
             let _timer = self.start_timer("add_write");
@@ -498,7 +711,7 @@ impl Indexer {
             .extend(blocks.iter().map(|b| b.entry.hash()));
     }
 
-    fn index(&self, blocks: &[BlockEntry]) {
+    fn index(&self, blocks: &[&BlockEntry]) {
         self.store
             .history_db
             .write_rows(self._index(blocks), self.flush);
@@ -513,7 +726,7 @@ impl Indexer {
     //
     // This does *not* remove any txstore db entries, which are intentionally kept
     // even for reorged blocks.
-    fn undo_index(&self, blocks: &[BlockEntry]) {
+    fn undo_index(&self, blocks: &[&BlockEntry]) {
         self.store
             .history_db
             .delete_rows(self._index(blocks), self.flush);
@@ -529,37 +742,45 @@ impl Indexer {
         }
     }
 
-    fn _index(&self, blocks: &[BlockEntry]) -> Vec<DBRow> {
-        let previous_txos_map = {
+    fn _index(&self, blocks: &[&BlockEntry]) -> Vec<DBRow> {
+        let previous_txos_by_block: Vec<Vec<TxOut>> = {
             let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
+            let previous_outpoints_by_block = get_prev_outpoints_by_block(blocks);
+            // Use a multi_get to fetch previous txos for the whole block batch as a flat vector,
+            // then split it back into the per-block vectors expected by the indexer.
+            let mut previous_txos = lookup_txos(
+                &self.store.txstore_db,
+                previous_outpoints_by_block.iter().flatten(),
+            )
+            .unwrap()
+            .into_iter();
+            previous_outpoints_by_block
+                .iter()
+                .map(|outpoints| previous_txos.by_ref().take(outpoints.len()).collect())
+                .collect()
         };
-        let rows = {
-            let _timer = self.start_timer("index_process");
-            let added_blockhashes = self.store.added_blockhashes.read().unwrap();
-            for b in blocks {
-                let blockhash = b.entry.hash();
-                // TODO: replace by lookup into txstore_db?
-                if !added_blockhashes.contains(blockhash) {
-                    panic!("cannot index block {} (missing from store)", blockhash);
-                }
+        let _timer = self.start_timer("index_process");
+        let added_blockhashes = self.store.added_blockhashes.read().unwrap();
+        for b in blocks {
+            let blockhash = b.entry.hash();
+            // TODO: replace by lookup into txstore_db?
+            if !added_blockhashes.contains(blockhash) {
+                panic!("cannot index block {} (missing from store)", blockhash);
             }
-            index_blocks(blocks, &previous_txos_map, &self.iconfig)
-        };
-        rows
-    }
-
-    pub fn fetch_from(&mut self, from: FetchFrom) {
-        self.from = from;
+        }
+        blocks
+            .par_iter() // serialization is CPU-intensive
+            .zip_eq(&previous_txos_by_block)
+            .map(|(b, previous_txos)| index_block(b, previous_txos, &self.iconfig))
+            .flatten()
+            .collect()
     }
 }
 
 impl ChainQuery {
-    pub fn new(store: Arc<Store>, daemon: Arc<Daemon>, config: &Config, metrics: &Metrics) -> Self {
+    pub fn new(store: Arc<Store>, config: &Config, metrics: &Metrics) -> Self {
         ChainQuery {
             store,
-            daemon,
-            light_mode: config.light_mode,
             network: config.network_type,
             duration: metrics.histogram_vec(
                 HistogramOpts::new("query_duration", "Index query duration (in seconds)"),
@@ -582,16 +803,7 @@ impl ChainQuery {
 
     pub fn get_block_txids(&self, hash: &BlockHash) -> Option<Vec<Txid>> {
         let _timer = self.start_timer("get_block_txids");
-        if self.light_mode {
-            // TODO fetch block as binary from REST API instead of as hex
-            let mut blockinfo = self.daemon.getblock_raw(hash, 1).ok()?;
-            Some(serde_json::from_value(blockinfo["tx"].take()).unwrap())
-        } else {
-            self.store
-                .txstore_db
-                .get(&BlockRow::txids_key(full_hash(&hash[..])))
-                .map(|val| bincode::deserialize_little(&val).expect("failed to parse block txids"))
-        }
+        load_block_txids(&self.store.txstore_db, hash)
     }
 
     pub fn get_block_txs(
@@ -602,62 +814,44 @@ impl ChainQuery {
     ) -> Result<Vec<Transaction>> {
         let txids = self.get_block_txids(hash).chain_err(|| "block not found")?;
         ensure!(start_index < txids.len(), "start index out of range");
-
-        let txids_with_blockhash = txids
-            .into_iter()
-            .skip(start_index)
-            .take(limit)
-            .map(|txid| (txid, *hash))
-            .collect::<Vec<_>>();
-
-        self.lookup_txns(&txids_with_blockhash)
-
-        // XXX use getblock in lightmode? a single RPC call, but would fetch all txs to get one page
-        // self.daemon.getblock(hash)?.txdata.into_iter().skip(start_index).take(limit).collect()
+        lookup_txns(
+            &self.store.txstore_db,
+            &txids
+                .into_iter()
+                .skip(start_index)
+                .take(limit)
+                .collect::<Vec<_>>(),
+        )
     }
 
     pub fn get_block_meta(&self, hash: &BlockHash) -> Option<BlockMeta> {
         let _timer = self.start_timer("get_block_meta");
-
-        if self.light_mode {
-            let blockinfo = self.daemon.getblock_raw(hash, 1).ok()?;
-            Some(serde_json::from_value(blockinfo).unwrap())
-        } else {
-            self.store
-                .txstore_db
-                .get(&BlockRow::meta_key(full_hash(&hash[..])))
-                .map(|val| bincode::deserialize_little(&val).expect("failed to parse BlockMeta"))
-        }
+        self.store
+            .txstore_db
+            .get(&BlockRow::meta_key(full_hash(&hash[..])))
+            .map(|val| bincode::deserialize_little(&val).expect("failed to parse BlockMeta"))
     }
 
     pub fn get_block_raw(&self, hash: &BlockHash) -> Option<Vec<u8>> {
         let _timer = self.start_timer("get_block_raw");
 
-        if self.light_mode {
-            let blockval = self.daemon.getblock_raw(hash, 0).ok()?;
-            let blockhex = blockval.as_str().expect("valid block from bitcoind");
-            Some(Vec::from_hex(blockhex).expect("valid block from bitcoind"))
-        } else {
-            let entry = self.header_by_hash(hash)?;
-            let meta = self.get_block_meta(hash)?;
-            let txids = self.get_block_txids(hash)?;
-            let txids_with_blockhash: Vec<_> =
-                txids.into_iter().map(|txid| (txid, *hash)).collect();
-            let raw_txs = self.lookup_raw_txns(&txids_with_blockhash).ok()?; // TODO avoid hiding all errors as None, return a Result
+        let entry = self.header_by_hash(hash)?;
+        let meta = self.get_block_meta(hash)?;
+        let txids = self.get_block_txids(hash)?;
+        let raw_txs = lookup_raw_txns(&self.store.txstore_db, &txids).ok()?; // TODO avoid hiding all errors as None, return a Result
 
-            // Reconstruct the raw block using the header and txids,
-            // as <raw header><tx count varint><raw txs>
-            let mut raw = Vec::with_capacity(meta.size as usize);
+        // Reconstruct the raw block using the header and txids,
+        // as <raw header><tx count varint><raw txs>
+        let mut raw = Vec::with_capacity(meta.size as usize);
 
-            raw.append(&mut serialize(entry.header()));
-            raw.append(&mut serialize(&VarInt(raw_txs.len() as u64)));
+        raw.append(&mut serialize(entry.header()));
+        raw.append(&mut serialize(&VarInt(raw_txs.len() as u64)));
 
-            for mut raw_tx in raw_txs {
-                raw.append(&mut raw_tx);
-            }
-
-            Some(raw)
+        for mut raw_tx in raw_txs {
+            raw.append(&mut raw_tx);
         }
+
+        Some(raw)
     }
 
     pub fn get_block_header(&self, hash: &BlockHash) -> Option<BlockHeader> {
@@ -737,15 +931,15 @@ impl ChainQuery {
             .filter_map(|(txid, height)| Some((txid, headers.header_by_height(height)?)))
             .take(limit);
 
-        let mut txids_with_blockhash = Vec::with_capacity(limit);
+        let mut txids = Vec::with_capacity(limit);
         let mut blockids = Vec::with_capacity(limit);
         for (txid, header) in history_iter {
-            txids_with_blockhash.push((txid, *header.hash()));
+            txids.push(txid);
             blockids.push(BlockId::from(header));
         }
         drop(headers);
 
-        self.lookup_txns(&txids_with_blockhash)
+        self.lookup_txns(&txids)
             .expect("failed looking up txs in history index")
             .into_iter()
             .zip(blockids)
@@ -1062,59 +1256,25 @@ impl ChainQuery {
             .clone()
     }
 
-    pub fn lookup_txns(&self, txids: &[(Txid, BlockHash)]) -> Result<Vec<Transaction>> {
+    pub fn lookup_txns(&self, txids: &[Txid]) -> Result<Vec<Transaction>> {
         let _timer = self.start_timer("lookup_txns");
-        Ok(self
-            .lookup_raw_txns(txids)?
-            .into_iter()
-            .map(|rawtx| deserialize(&rawtx).expect("failed to parse Transaction"))
-            .collect())
+        lookup_txns(&self.store.txstore_db, txids)
     }
 
-    pub fn lookup_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Transaction> {
+    pub fn lookup_txn(&self, txid: &Txid) -> Option<Transaction> {
         let _timer = self.start_timer("lookup_txn");
-        let rawtx = self.lookup_raw_txn(txid, blockhash)?;
+        let rawtx = self.lookup_raw_txn(txid)?;
         Some(deserialize(&rawtx).expect("failed to parse Transaction"))
     }
 
-    pub fn lookup_raw_txns(&self, txids: &[(Txid, BlockHash)]) -> Result<Vec<Bytes>> {
+    pub fn lookup_raw_txns(&self, txids: &[Txid]) -> Result<Vec<Bytes>> {
         let _timer = self.start_timer("lookup_raw_txns");
-        if self.light_mode {
-            txids
-                .par_iter()
-                .map(|(txid, blockhash)| {
-                    self.lookup_raw_txn(txid, Some(blockhash))
-                        .chain_err(|| "missing tx")
-                })
-                .collect()
-        } else {
-            let keys = txids.iter().map(|(txid, _)| TxRow::key(&txid[..]));
-            self.store
-                .txstore_db
-                .multi_get(keys)
-                .into_iter()
-                .map(|val| val.unwrap().chain_err(|| "missing tx"))
-                .collect()
-        }
+        lookup_raw_txns(&self.store.txstore_db, txids)
     }
 
-    pub fn lookup_raw_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Bytes> {
+    pub fn lookup_raw_txn(&self, txid: &Txid) -> Option<Bytes> {
         let _timer = self.start_timer("lookup_raw_txn");
-
-        if self.light_mode {
-            let queried_blockhash =
-                blockhash.map_or_else(|| self.tx_confirming_block(txid).map(|b| b.hash), |_| None);
-            let blockhash = blockhash.or_else(|| queried_blockhash.as_ref())?;
-            // TODO fetch transaction as binary from REST API instead of as hex
-            let txval = self
-                .daemon
-                .gettransaction_raw(txid, blockhash, false)
-                .ok()?;
-            let txhex = txval.as_str().expect("valid tx from bitcoind");
-            Some(Bytes::from_hex(txhex).expect("valid tx from bitcoind"))
-        } else {
-            self.store.txstore_db.get(&TxRow::key(&txid[..]))
-        }
+        self.store.txstore_db.get(&TxRow::key(&txid[..]))
     }
 
     pub fn lookup_txo(&self, outpoint: &OutPoint) -> Option<TxOut> {
@@ -1122,9 +1282,10 @@ impl ChainQuery {
         lookup_txo(&self.store.txstore_db, outpoint)
     }
 
-    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
+    pub fn lookup_txos(&self, outpoints: Vec<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self.start_timer("lookup_txos");
-        lookup_txos(&self.store.txstore_db, outpoints)
+        let txos = lookup_txos(&self.store.txstore_db, &outpoints)?;
+        Ok(outpoints.into_iter().zip_eq(txos).collect())
     }
 
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
@@ -1241,47 +1402,105 @@ fn load_blockheaders(db: &DB) -> HashMap<BlockHash, BlockHeader> {
         .map(BlockRow::from_row)
         .map(|r| {
             let key: BlockHash = deserialize(&r.key.hash).expect("failed to parse BlockHash");
-            let value: BlockHeader = deserialize(&r.value).expect("failed to parse BlockHeader");
-            (key, value)
+            let (_height, header_bytes): (u32, Bytes) =
+                bincode::deserialize_little(&r.value).expect("failed to parse stored BlockHeader");
+            let header = deserialize(&header_bytes).expect("failed to parse stored BlockHeader");
+            (key, header)
         })
         .collect()
 }
 
-fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRow> {
+fn load_header_entry(db: &DB, hash: &BlockHash) -> HeaderEntry {
+    let row = db
+        .get(&BlockRow::header_key(full_hash(&hash[..])))
+        .unwrap_or_else(|| panic!("missing block header row for {}", hash));
+    BlockRow::header_entry_from_value(hash, &row)
+}
+
+fn load_block_txids(db: &DB, hash: &BlockHash) -> Option<Vec<Txid>> {
+    db.get(&BlockRow::txids_key(full_hash(&hash[..])))
+        .map(|val| bincode::deserialize_little(&val).expect("failed to parse block txids"))
+}
+
+fn lookup_raw_txns(txstore_db: &DB, txids: &[Txid]) -> Result<Vec<Bytes>> {
+    let keys = txids.iter().map(|txid| TxRow::key(&txid[..]));
+    txstore_db
+        .multi_get(keys)
+        .into_iter()
+        .map(|val| val.unwrap().chain_err(|| "missing tx"))
+        .collect()
+}
+
+fn lookup_txns(txstore_db: &DB, txids: &[Txid]) -> Result<Vec<Transaction>> {
+    Ok(lookup_raw_txns(txstore_db, txids)?
+        .into_iter()
+        .map(|rawtx| deserialize(&rawtx).expect("failed to parse Transaction"))
+        .collect())
+}
+
+fn load_block_entry(txstore_db: &DB, header_entry: HeaderEntry) -> Result<BlockEntry> {
+    let hash = *header_entry.hash();
+    let txids = load_block_txids(txstore_db, &hash).chain_err(|| "missing block txids")?;
+    let txdata = lookup_txns(txstore_db, &txids)?;
+    let block = Block {
+        header: header_entry.header().clone(),
+        txdata,
+    };
+    Ok(BlockEntry {
+        entry: header_entry,
+        size: block.total_size() as u32,
+        txids,
+        block,
+    })
+}
+
+struct HeaderWork {
+    entry: HeaderEntry,
+    need_txstore: bool,
+    need_history: bool,
+}
+
+#[cfg(not(feature = "liquid"))]
+fn fetch_block_entry(daemon: &Daemon, entry: HeaderEntry) -> Result<BlockEntry> {
+    let block = daemon.getblock(entry.hash())?;
+    let txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+    Ok(BlockEntry {
+        size: block.total_size() as u32,
+        txids,
+        block,
+        entry,
+    })
+}
+
+fn add_block(block_entry: &BlockEntry, iconfig: &IndexerConfig) -> Vec<DBRow> {
+    assert_eq!(block_entry.txids.len(), block_entry.block.txdata.len());
+    let mut rows = vec![];
+    let blockhash = full_hash(&block_entry.entry.hash()[..]);
     // persist individual transactions:
     //      T{txid} → {rawtx}
     //      O{txid}{index} → {txout}
+    for (tx, txid) in block_entry
+        .block
+        .txdata
+        .iter()
+        .zip(block_entry.txids.iter())
+    {
+        add_transaction(*txid, tx, &mut rows, iconfig);
+    }
+
     // persist block headers', block txids' and metadata rows:
-    //      B{blockhash} → {header}
+    //      B{blockhash} → {height, header}
     //      X{blockhash} → {txid1}...{txidN}
     //      M{blockhash} → {tx_count}{size}{weight}
-    block_entries
-        .par_iter() // serialization is CPU-intensive
-        .map(|b| {
-            assert_eq!(b.txids.len(), b.block.txdata.len());
-            let mut rows = vec![];
-            let blockhash = full_hash(&b.entry.hash()[..]);
-            for (tx, txid) in b.block.txdata.iter().zip(b.txids.iter()) {
-                add_transaction(*txid, tx, &mut rows, iconfig);
-            }
-
-            if !iconfig.light_mode {
-                rows.push(BlockRow::new_txids(blockhash, &b.txids).into_row());
-                rows.push(BlockRow::new_meta(blockhash, &BlockMeta::from(b)).into_row());
-            }
-
-            rows.push(BlockRow::new_header(&b).into_row());
-            rows.push(BlockRow::new_done(blockhash).into_row()); // mark block as "added"
-            rows
-        })
-        .flatten()
-        .collect()
+    rows.push(BlockRow::new_txids(blockhash, &block_entry.txids).into_row());
+    rows.push(BlockRow::new_meta(blockhash, &BlockMeta::from(block_entry)).into_row());
+    rows.push(BlockRow::new_header(block_entry).into_row());
+    rows.push(BlockRow::new_done(blockhash).into_row()); // mark block as "added"
+    rows
 }
 
 fn add_transaction(txid: Txid, tx: &Transaction, rows: &mut Vec<DBRow>, iconfig: &IndexerConfig) {
-    if !iconfig.light_mode {
-        rows.push(TxRow::new(txid, tx).into_row());
-    }
+    rows.push(TxRow::new(txid, tx).into_row());
 
     let txid = full_hash(&txid[..]);
     for (txo_index, txo) in tx.output.iter().enumerate() {
@@ -1297,30 +1516,35 @@ fn add_transaction(txid: Txid, tx: &Transaction, rows: &mut Vec<DBRow>, iconfig:
     }
 }
 
-fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
+fn get_prev_outpoints_by_block(block_entries: &[&BlockEntry]) -> Vec<Vec<OutPoint>> {
     block_entries
         .iter()
-        .flat_map(|b| b.block.txdata.iter())
-        .flat_map(|tx| {
-            tx.input
+        .map(|b| {
+            b.block
+                .txdata
                 .iter()
-                .filter(|txin| has_prevout(txin))
-                .map(|txin| txin.previous_output)
+                .flat_map(|tx| {
+                    tx.input
+                        .iter()
+                        .filter(|txin| has_prevout(txin))
+                        .map(|txin| txin.previous_output)
+                })
+                .collect()
         })
         .collect()
 }
 
-fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
-    let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
+fn lookup_txos<'a, I>(txstore_db: &DB, outpoints: I) -> Result<Vec<TxOut>>
+where
+    I: IntoIterator<Item = &'a OutPoint>,
+{
+    let keys = outpoints.into_iter().map(TxOutRow::key).collect::<Vec<_>>();
     txstore_db
         .multi_get(keys)
         .into_iter()
-        .zip(outpoints)
-        .map(|(res, outpoint)| {
-            let txo = res
-                .unwrap()
-                .ok_or_else(|| format!("missing txo {}", outpoint))?;
-            Ok((outpoint, deserialize(&txo).expect("failed to parse TxOut")))
+        .map(|res| {
+            let txo = res.unwrap().chain_err(|| "missing txo")?;
+            Ok(deserialize(&txo).expect("failed to parse TxOut"))
         })
         .collect()
 }
@@ -1348,26 +1572,38 @@ pub fn lookup_confirmations(
         .collect()
 }
 
-fn index_blocks(
-    block_entries: &[BlockEntry],
-    previous_txos_map: &HashMap<OutPoint, TxOut>,
+fn index_block(
+    block_entry: &BlockEntry,
+    previous_txos: &[TxOut],
     iconfig: &IndexerConfig,
 ) -> Vec<DBRow> {
-    block_entries
-        .par_iter() // serialization is CPU-intensive
-        .map(|b| {
-            assert_eq!(b.txids.len(), b.block.txdata.len());
-            let mut rows = vec![];
-            let height = b.entry.height() as u32;
-            for (tx, txid) in b.block.txdata.iter().zip(b.txids.iter()) {
-                let txid_hash = full_hash(&txid[..]);
-                index_transaction(tx, txid_hash, height, previous_txos_map, &mut rows, iconfig);
-            }
-            rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
-            rows
-        })
-        .flatten()
-        .collect()
+    assert_eq!(block_entry.txids.len(), block_entry.block.txdata.len());
+    let mut rows = vec![];
+    let height = block_entry.entry.height() as u32;
+    let mut previous_txos = previous_txos.iter();
+    for (tx, txid) in block_entry
+        .block
+        .txdata
+        .iter()
+        .zip(block_entry.txids.iter())
+    {
+        let txid_hash = full_hash(&txid[..]);
+        index_transaction(
+            tx,
+            txid_hash,
+            height,
+            &mut previous_txos,
+            &mut rows,
+            iconfig,
+        );
+    }
+    assert!(
+        previous_txos.next().is_none(),
+        "unexpected trailing previous txos for block {}",
+        block_entry.entry.hash()
+    );
+    rows.push(BlockRow::new_done(full_hash(&block_entry.entry.hash()[..])).into_row()); // mark block as "indexed"
+    rows
 }
 
 // TODO: return an iterator?
@@ -1375,11 +1611,10 @@ fn index_transaction(
     tx: &Transaction,
     txid: FullHash,
     confirmed_height: u32,
-    previous_txos_map: &HashMap<OutPoint, TxOut>,
+    previous_txos: &mut std::slice::Iter<'_, TxOut>,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
 ) {
-
     // persist tx confirmation row:
     //      C{txid} → "{block_height}"
     rows.push(TxConfRow::new(txid, confirmed_height).into_row());
@@ -1407,8 +1642,8 @@ fn index_transaction(
         if !has_prevout(txi) {
             continue;
         }
-        let prev_txo = previous_txos_map
-            .get(&txi.previous_output)
+        let prev_txo = previous_txos
+            .next()
             .unwrap_or_else(|| panic!("missing previous txo {}", txi.previous_output));
 
         let history = TxHistoryRow::new(
@@ -1592,12 +1827,14 @@ struct BlockRow {
 
 impl BlockRow {
     fn new_header(block_entry: &BlockEntry) -> BlockRow {
+        let height = block_entry.entry.height() as u32;
+        let header_bytes = serialize(&block_entry.block.header);
         BlockRow {
             key: BlockKey {
                 code: b'B',
                 hash: full_hash(&block_entry.entry.hash()[..]),
             },
-            value: serialize(&block_entry.block.header),
+            value: bincode::serialize_little(&(height, header_bytes)).unwrap(),
         }
     }
 
@@ -1626,6 +1863,10 @@ impl BlockRow {
         b"B".to_vec()
     }
 
+    fn header_key(hash: FullHash) -> Bytes {
+        [b"B", &hash[..]].concat()
+    }
+
     fn txids_key(hash: FullHash) -> Bytes {
         [b"X", &hash[..]].concat()
     }
@@ -1650,6 +1891,13 @@ impl BlockRow {
             key: bincode::deserialize_little(&row.key).unwrap(),
             value: row.value,
         }
+    }
+
+    fn header_entry_from_value(hash: &BlockHash, value: &[u8]) -> HeaderEntry {
+        let (height, header_bytes): (u32, Bytes) =
+            bincode::deserialize_little(value).expect("failed to parse stored BlockHeader");
+        let header = deserialize(&header_bytes).expect("failed to parse stored BlockHeader");
+        HeaderEntry::new(height as usize, *hash, header)
     }
 }
 
@@ -1818,8 +2066,7 @@ impl TxEdgeRow {
     }
 
     fn key(outpoint: &OutPoint) -> Bytes {
-        bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout))
-            .unwrap()
+        bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout)).unwrap()
     }
 
     pub fn into_row(self) -> DBRow {
@@ -1968,11 +2215,12 @@ pub mod bench {
     impl Data {
         pub fn new(block: Block) -> Data {
             let iconfig = IndexerConfig {
-                light_mode: false,
                 address_search: false,
                 index_unspendables: false,
                 network: crate::chain::Network::Regtest,
                 block_batch_size: 250,
+                #[cfg(not(feature = "liquid"))]
+                use_spenttxouts: false,
             };
             let height = 702861;
             let hash = block.block_hash();
@@ -1993,13 +2241,139 @@ pub mod bench {
     }
 
     pub fn add_blocks(data: &Data) -> Vec<DBRow> {
-        super::add_blocks(&[data.block_entry.clone()], &data.iconfig)
+        super::add_block(&data.block_entry, &data.iconfig)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::hex::FromHex;
+
     use super::*;
+
+    #[cfg(not(feature = "liquid"))]
+    mod store_recovery {
+        use bitcoin::blockdata::constants::genesis_block;
+        use bitcoin::Network as BitcoinNetwork;
+
+        use super::*;
+
+        fn test_store() -> (tempfile::TempDir, Store) {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Arc::new(db::open_test_rocksdb(dir.path()));
+            (dir, Store::from_db(db))
+        }
+
+        fn write_headers(db: &DB, entries: &[HeaderEntry]) {
+            let rows = entries
+                .iter()
+                .cloned()
+                .map(|entry| {
+                    let block_entry = BlockEntry {
+                        block: Block {
+                            header: entry.header().clone(),
+                            txdata: vec![],
+                        },
+                        entry,
+                        size: 0,
+                        txids: vec![],
+                    };
+                    BlockRow::new_header(&block_entry).into_row()
+                })
+                .collect();
+            db.write_rows(rows, DBFlush::Enable);
+        }
+
+        fn write_done<'a>(db: &DB, entries: impl IntoIterator<Item = &'a HeaderEntry>) {
+            let rows = entries
+                .into_iter()
+                .map(|entry| BlockRow::new_done(full_hash(&entry.hash()[..])).into_row())
+                .collect();
+            db.write_rows(rows, DBFlush::Enable);
+        }
+
+        fn header_chain(len: usize) -> Vec<HeaderEntry> {
+            let mut header = genesis_block(BitcoinNetwork::Regtest).header;
+            let mut chain: Vec<HeaderEntry> = vec![];
+
+            for height in 0..len {
+                if let Some(previous) = chain.last() {
+                    header.prev_blockhash = *previous.hash();
+                }
+                let entry = HeaderEntry::new(height, header.block_hash(), header.clone());
+                chain.push(entry);
+            }
+
+            chain
+        }
+
+        #[test]
+        fn completed_blocks_without_tip_remain_hidden() {
+            let chain = header_chain(3);
+            let (_dir, store) = test_store();
+            write_headers(&store.txstore_db, &chain);
+            write_done(&store.txstore_db, &chain);
+            write_done(&store.history_db, &chain);
+
+            let store = Store::from_db(Arc::clone(&store.db));
+
+            assert!(store.headers().is_empty());
+            let expected: HashSet<_> = chain.iter().map(|entry| *entry.hash()).collect();
+            assert_eq!(*store.added_blockhashes.read().unwrap(), expected);
+            assert_eq!(*store.indexed_blockhashes.read().unwrap(), expected);
+        }
+
+        #[test]
+        fn tip_hides_suffix_and_preserves_completion_markers() {
+            let chain = header_chain(6);
+            let (_dir, store) = test_store();
+            write_headers(&store.txstore_db, &chain);
+            store.update_tip(chain[1].hash());
+            // Save both markers for blocks 0-2, txstore-only for 3, history-only for 4 and neither for 5.
+            write_done(&store.txstore_db, chain[..=3].iter());
+            write_done(&store.history_db, chain[..=2].iter().chain(&chain[4..=4]));
+
+            let store = Store::from_db(Arc::clone(&store.db));
+
+            assert_eq!(store.headers().len(), 2);
+            assert_eq!(store.headers().tip(), chain[1].hash());
+
+            let added = store.added_blockhashes.read().unwrap();
+            let indexed = store.indexed_blockhashes.read().unwrap();
+            assert!(added.contains(chain[2].hash()));
+            assert!(indexed.contains(chain[2].hash()));
+            assert!(added.contains(chain[3].hash()));
+            assert!(!indexed.contains(chain[3].hash()));
+            assert!(!added.contains(chain[4].hash()));
+            assert!(indexed.contains(chain[4].hash()));
+            assert!(!added.contains(chain[5].hash()));
+            assert!(!indexed.contains(chain[5].hash()));
+        }
+
+        #[test]
+        fn visibility_stops_at_first_one_sided_completion() {
+            for missing_txstore in [false, true] {
+                let chain = header_chain(4);
+                let (_dir, store) = test_store();
+                write_headers(&store.txstore_db, &chain);
+                store.update_tip(chain[3].hash());
+
+                // Save both markers for blocks 0, 1 and 3, plus a single-sided marker for 2.
+                if missing_txstore {
+                    write_done(&store.txstore_db, chain[..2].iter().chain(&chain[3..]));
+                    write_done(&store.history_db, &chain);
+                } else {
+                    write_done(&store.txstore_db, &chain);
+                    write_done(&store.history_db, chain[..2].iter().chain(&chain[3..]));
+                }
+
+                let store = Store::from_db(Arc::clone(&store.db));
+
+                assert_eq!(store.headers().len(), 2);
+                assert_eq!(store.headers().tip(), chain[1].hash());
+            }
+        }
+    }
 
     #[test]
     fn test_compute_script_hash_p2pkh() {

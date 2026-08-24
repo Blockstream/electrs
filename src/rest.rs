@@ -689,9 +689,9 @@ fn is_block_template_request(method: &Method, uri: &hyper::Uri) -> bool {
 /// Dispatch a request, keeping blocking work off the async worker threads.
 ///
 /// Almost every handler is synchronous: it reads RocksDB, and some of them (transaction
-/// broadcast, package submission, and any lookup in `--lightmode`) make a blocking JSON-RPC
-/// call to the daemon. Running those directly on a Tokio worker lets a slow or unresponsive
-/// daemon park every worker the runtime has, at which point even fully in-memory endpoints
+/// broadcast and package submission) make a blocking JSON-RPC call to the daemon. Running
+/// those directly on a Tokio worker lets a slow or unresponsive daemon park every worker
+/// the runtime has, at which point even fully in-memory endpoints
 /// such as `GET /blocks/tip/height` stop being served. Moving them to the blocking pool
 /// keeps the runtime free to answer everything else.
 ///
@@ -849,7 +849,7 @@ fn handle_blocking_request(
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txs"), start_index, None) => {
             let hash = BlockHash::from_str(hash)?;
-            
+
             // Add lightweight validation that block exists before fetching transactions,
             // to avoid expensive lookups in case of invalid block hash
             query.chain().get_block_header(&hash)

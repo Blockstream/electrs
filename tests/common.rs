@@ -1,6 +1,6 @@
+use std::net;
 use std::str::FromStr;
 use std::sync::{Arc, Once, RwLock};
-use std::{env, net};
 
 use log::LevelFilter;
 use stderrlog::StdErrLog;
@@ -24,7 +24,7 @@ use electrs::{
     daemon::Daemon,
     electrum::RPC as ElectrumRPC,
     metrics::Metrics,
-    new_index::{ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
+    new_index::{ChainQuery, Indexer, Mempool, Query, Store},
     rest,
     signal::Waiter,
 };
@@ -56,6 +56,8 @@ impl TestRunner {
 
             #[cfg(feature = "liquid")]
             node_conf.args.push("-anyonecanspendaremine=1");
+
+            node_conf.args.push("-rest=1");
 
             node_conf.view_stdout = std::env::var_os("RUST_LOG").is_some();
         }
@@ -95,7 +97,6 @@ impl TestRunner {
             daemon_dir: daemon_subdir.clone(),
             daemon_parallelism: 3,
             daemon_conn_max_age: None,
-            blocks_dir: daemon_subdir.join("blocks"),
             daemon_rpc_addr: params.rpc_socket.into(),
             daemon_rpc_fallback_addr: None,
             cookie: None,
@@ -104,8 +105,6 @@ impl TestRunner {
             http_addr: rand_available_addr(),
             http_socket_file: None, // XXX test with socket file or tcp?
             monitoring_addr: rand_available_addr(),
-            jsonrpc_import: false,
-            light_mode: false,
             address_search: true,
             index_unspendables: false,
             enable_mining_rest: true,
@@ -127,6 +126,9 @@ impl TestRunner {
             db_write_buffer_size_mb: 256,
             initial_sync_batch_size: 250,
             db_cache_index_filter_blocks: false,
+            db_target_file_size_mb: 1024,
+            db_soft_pending_compaction_gb: 0,
+            db_hard_pending_compaction_gb: 0,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]
@@ -141,7 +143,6 @@ impl TestRunner {
 
         let daemon = Arc::new(Daemon::new(
             &config.daemon_dir,
-            &config.blocks_dir,
             config.daemon_rpc_addr,
             config.daemon_rpc_fallback_addr,
             config.daemon_parallelism,
@@ -152,29 +153,11 @@ impl TestRunner {
             config.daemon_conn_max_age,
         )?);
 
-        let store = Arc::new(Store::open(&config, &metrics, true));
-
-        let fetch_from = if !env::var("JSONRPC_IMPORT").is_ok() && !cfg!(feature = "liquid") {
-            // run the initial indexing from the blk files then switch to using the jsonrpc,
-            // similarly to how electrs is typically used.
-            FetchFrom::BlkFiles
-        } else {
-            // when JSONRPC_IMPORT is set, use the jsonrpc for the initial indexing too.
-            // this runs faster on small regtest chains and can be useful for quicker local development iteration.
-            // this is also used on liquid regtest, which currently fails to parse the BlkFiles due to the magic bytes
-            FetchFrom::Bitcoind
-        };
-
-        let mut indexer = Indexer::open(Arc::clone(&store), fetch_from, &config, &metrics);
+        let store = Arc::new(Store::open(&config, &metrics));
+        let mut indexer = Indexer::open(Arc::clone(&store), &config, &metrics, &daemon);
         let tip = indexer.update(&daemon)?;
-        indexer.fetch_from(FetchFrom::Bitcoind);
 
-        let chain = Arc::new(ChainQuery::new(
-            Arc::clone(&store),
-            Arc::clone(&daemon),
-            &config,
-            &metrics,
-        ));
+        let chain = Arc::new(ChainQuery::new(Arc::clone(&store), &config, &metrics));
 
         let mempool = Arc::new(RwLock::new(Mempool::new(
             Arc::clone(&chain),

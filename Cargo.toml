@@ -17,6 +17,7 @@ default-run = "electrs"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(has_error_description_deprecated)"] }
 
 [features]
+default = ["test-core-30"]
 liquid = ["elements"]
 electrum-discovery = ["electrum-client"]
 bench = []
@@ -29,6 +30,8 @@ otlp-tracing = [
     "opentelemetry-semantic-conventions",
     "electrs_macros/otlp-tracing"
 ]
+test-core-30 = ["corepc-node?/30_2"]
+test-core-29 = ["corepc-node?/29_0"]
 
 [dependencies]
 arraydeque = "0.5.1"
@@ -73,17 +76,21 @@ tracing-subscriber = { version = "0.3.17", default-features = false, features = 
 opentelemetry-semantic-conventions = { version = "0.12.0", optional = true }
 tracing = { version = "0.1.40", default-features = false, features = ["attributes"], optional = true }
 rand = "0.9.1"
+ureq = { version = "3.1", default-features = false, features = ["json"] }
 
 # optional dependencies for electrum-discovery
 electrum-client = { version = "0.8", optional = true }
 zmq = "0.10.0"
 electrs_macros = { path = "electrs_macros", default-features = false }
 
+# only used for tests, but also declared as an optional (never activated) non-dev dependency
+# so weak test-core-* feature forwarding remains valid when `cargo install` omits the dev-deps
+corepc-node = { version = "0.12", optional = true }
+
 [dev-dependencies]
-corepc-node = { version = "0.10", features = ["download", "29_0"] }
+corepc-node = { version = "0.12", features = ["download"] }
 elementsd = { version = "0.11", features = ["22_1_1"] }
 electrumd = { version = "0.1.0", features = ["4_6_2"] }
-ureq = { version = "3.1", default-features = false, features = ["json"] }
 tempfile = "3.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 bitcoin-test-data = { version = "*" }

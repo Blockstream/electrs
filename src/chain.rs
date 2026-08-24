@@ -44,19 +44,6 @@ pub enum Network {
 }
 
 impl Network {
-    #[cfg(not(feature = "liquid"))]
-    pub fn magic(self) -> u32 {
-        u32::from_le_bytes(BNetwork::from(self).magic().to_bytes())
-    }
-
-    #[cfg(feature = "liquid")]
-    pub fn magic(self) -> u32 {
-        match self {
-            Network::Liquid | Network::LiquidRegtest => 0xDAB5_BFFA,
-            Network::LiquidTestnet => 0x62DD_0E41,
-        }
-    }
-
     pub fn is_regtest(self) -> bool {
         match self {
             #[cfg(not(feature = "liquid"))]

@@ -7,23 +7,23 @@ extern crate log;
 
 extern crate electrs;
 
-use crossbeam_channel::{self as channel};
-use error_chain::ChainedError;
-use std::{env, process, thread};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use bitcoin::hex::DisplayHex;
-use rand::{rng, RngCore};
+use crossbeam_channel::{self as channel};
 use electrs::{
     config::Config,
     daemon::Daemon,
     electrum::RPC as ElectrumRPC,
     errors::*,
     metrics::Metrics,
-    new_index::{precache, zmq, ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
+    new_index::{precache, zmq, ChainQuery, Indexer, Mempool, Query, Store},
     rest,
     signal::Waiter,
 };
+use error_chain::ChainedError;
+use rand::{rng, RngCore};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use std::{env, process, thread};
 
 #[cfg(feature = "otlp-tracing")]
 use electrs::otlp_trace;
@@ -34,22 +34,6 @@ use electrs::metrics::MetricOpts;
 
 /// Default salt rotation interval in seconds (24 hours)
 const DEFAULT_SALT_ROTATION_INTERVAL_SECS: u64 = 24 * 3600;
-
-fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
-    let mut jsonrpc_import = config.jsonrpc_import;
-    if !jsonrpc_import {
-        // switch over to jsonrpc after the initial sync is done
-        jsonrpc_import = store.done_initial_sync();
-    }
-
-    if jsonrpc_import {
-        // slower, uses JSONRPC (good for incremental updates)
-        FetchFrom::Bitcoind
-    } else {
-        // faster, uses blk*.dat files (good for initial indexing)
-        FetchFrom::BlkFiles
-    }
-}
 
 fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<()> {
     let (block_hash_notify, block_hash_receive) = channel::bounded(1);
@@ -66,7 +50,6 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     info!("connecting to daemon at {}", config.daemon_rpc_addr);
     let daemon = Arc::new(Daemon::new(
         &config.daemon_dir,
-        &config.blocks_dir,
         config.daemon_rpc_addr,
         config.daemon_rpc_fallback_addr,
         config.daemon_parallelism,
@@ -77,23 +60,13 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         config.daemon_conn_max_age,
     )?);
     info!("opening database at {}", config.db_path.display());
-    let store = Arc::new(Store::open(&config, &metrics, true));
-    let mut indexer = Indexer::open(
-        Arc::clone(&store),
-        fetch_from(&config, &store),
-        &config,
-        &metrics,
-    );
+    let store = Arc::new(Store::open(&config, &metrics));
+    let mut indexer = Indexer::open(Arc::clone(&store), &config, &metrics, &daemon);
     info!("starting initial sync");
     let mut tip = indexer.update(&daemon)?;
     info!("initial sync complete, tip at {}", tip);
 
-    let chain = Arc::new(ChainQuery::new(
-        Arc::clone(&store),
-        Arc::clone(&daemon),
-        &config,
-        &metrics,
-    ));
+    let chain = Arc::new(ChainQuery::new(Arc::clone(&store), &config, &metrics));
 
     if let Some(ref precache_file) = config.precache_scripts {
         let precache_scripthashes = precache::scripthashes_from_file(precache_file.to_string())

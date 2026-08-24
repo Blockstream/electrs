@@ -45,7 +45,6 @@ pub struct HeaderEntry {
 }
 
 impl HeaderEntry {
-    #[cfg(feature = "bench")]
     pub fn new(height: usize, hash: BlockHash, header: BlockHeader) -> Self {
         Self {
             height,
@@ -186,9 +185,10 @@ impl HeaderList {
         (header_entries, reorged_since)
     }
 
-    /// Pop off reorged blocks since (including) the given height and return them.
+    /// Pop off reorged blocks since (including) the given height and return them
+    /// alongside the new chain tip (the common ancestor)
     #[trace]
-    pub fn pop(&mut self, since_height: usize) -> Vec<HeaderEntry> {
+    pub fn pop(&mut self, since_height: usize) -> (Vec<HeaderEntry>, BlockHash) {
         let reorged_headers = self.headers.split_off(since_height);
 
         for header in &reorged_headers {
@@ -200,7 +200,7 @@ impl HeaderList {
             .map(|h| *h.hash())
             .unwrap_or_else(|| *DEFAULT_BLOCKHASH);
 
-        reorged_headers
+        (reorged_headers, self.tip)
     }
 
     /// Append new headers. Expected to always extend the tip (stale blocks must be removed first)

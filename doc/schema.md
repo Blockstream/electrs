@@ -1,25 +1,46 @@
 # Index Schema
 
-The index is stored as three RocksDB databases:
+The index is stored as a RocksDB database with four column families:
 
-- `txstore`
-- `history`
-- `cache`
+- `default` - global metadata
+- `txstore` - block, transaction and output rows
+- `history` - scripthash history and spend rows
+- `cache` - aggregated script and asset caches
 
 ### Indexing process
 
-The indexing is done in the two phase, where each can be done concurrently within itself.
-The first phase populates the `txstore` database, the second phase populates the `history` database.
+Electrs indexes blocks using the bitcoind binary REST `block` endpoint,
+storing blocks, transactions, outputs and scripthash funding/spending history.
 
-NOTE: in order to construct the history rows for spending inputs in phase #2, we rely on having the transactions being processed at phase #1, so they can be looked up efficiently (using parallel point lookups).
+There are two indexing modes:
 
-After the indexing is completed, both funding and spending are indexed as independent rows under `H{scripthash}`, so that they can be queried in-order in one go.
+- Default (non-Elements) mode: when supported by Bitcoin Core (v30+), fetches
+  previous outputs from its binary REST `spenttxouts` endpoint. Because indexing
+  does not depend on local RocksDB TXO lookups, blocks can be fully processed in
+  parallel and in any order.
+
+- Legacy mode: used automatically for Elements or when Bitcoin Core does not
+  support `spenttxouts`. Indexing is done in two phases, where each can be done
+  concurrently within itself: first populate `txstore` with
+  block/transaction/output data, then populate `history` by looking up spent
+  TXOs in `txstore`.
+
+After the indexing is completed, both funding and spending are indexed as independent
+rows under `H{scripthash}`, so that they can be queried in-order in one go.
+
+### `default`
+
+Global metadata rows:
+
+ * `"t" → "{blockhash}"` (the synced tip)
+
+ * `"V" → "{db-version}"` (compatibility marker)
 
 ### `txstore`
 
 Each block results in the following new rows:
 
- * `"B{blockhash}" → "{header}"`
+ * `"B{blockhash}" → "{height, header}"`
 
  * `"X{blockhash}" → "{txids}"` (list of txids included in the block)
 
@@ -35,10 +56,6 @@ Each output results in the following new rows:
 
  * `"O{txid}{vout}" → "{scriptpubkey}{value}"`
  * `"a{funding-address-str}" → ""` (for prefix address search, only saved when `--address-search` is enabled)
-
-When the indexer is synced up to the tip of the chain, the hash of the tip is saved as following:
-
- * `"t" →  "{blockhash}"`
 
 ### `history`
 

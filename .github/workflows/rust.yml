@@ -29,6 +29,16 @@ jobs:
     - name: Run tests (Bitcoin mode, REST+Electrum)
       run: RUST_LOG=debug cargo test
 
+  test-core-29:
+    runs-on: ubuntu-22.04
+    steps:
+    - run: sudo apt-get update && sudo apt-get install libfuse2
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run tests (Bitcoin Core 29, legacy indexer)
+      run: RUST_LOG=debug cargo test --no-default-features --features test-core-29
+
   test-electrum-raw:
     runs-on: ubuntu-22.04
     steps:
