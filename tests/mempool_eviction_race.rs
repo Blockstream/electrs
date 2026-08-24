@@ -7,11 +7,9 @@
 //! was evicted in between -- e.g. by an RBF replacement -- the second lookup
 //! could come back empty and hit an `.expect("failed loading txos")`.
 //!
-//! This test drives those two separate snapshots directly: SELECT via
-//! `Query::lookup_txn()`, then LOOKUP via `Query::mempool().lookup_txos()`.
-//! The fix in this MR removes the panic by propagating the miss as a
-//! `MissingTxo` error and by holding a single snapshot across both steps in
-//! the REST handlers themselves.
+//! This test verifies both parts of the fix: a writer cannot enter while the
+//! REST-style read snapshot spans SELECT and LOOKUP, and a lookup performed
+//! after an explicit eviction returns `MissingTxo` instead of panicking.
 //!
 //! Rather than racing real wall-clock timing against electrs's background
 //! mempool-sync thread (which only runs on a fixed poll interval and makes
@@ -75,10 +73,11 @@ fn prevout_lookup_survives_ancestor_eviction() -> Result<()> {
 
     let query = tester.query();
 
-    // SELECT: mirrors the GET /tx/:txid handler's `query.lookup_txn()` --
-    // one mempool snapshot, cloning out the child tx.
-    let child_tx = query
-        .lookup_txn(&child_txid)?
+    // Mirror the atomic section in GET /tx/:txid: keep the same read guard
+    // from transaction selection through prevout resolution.
+    let mempool = query.mempool();
+    let child_tx = mempool
+        .lookup_txn(&child_txid)
         .expect("child tx should be indexed before eviction");
     let outpoints: BTreeSet<OutPoint> = child_tx
         .input
@@ -87,11 +86,15 @@ fn prevout_lookup_survives_ancestor_eviction() -> Result<()> {
         .collect();
     assert!(outpoints.contains(&OutPoint::new(parent_txid, parent_vout as u32)));
 
-    // Sanity check: resolving prevouts works fine right now, before any
-    // eviction -- proves the graceful error below is caused by the
-    // eviction, not by some unrelated test-setup mistake.
-    let prevouts_before = query.mempool().lookup_txos(outpoints.clone())?;
+    // A writer that represents the mempool updater must not enter between
+    // selection and prevout lookup. `try_write` makes the assertion
+    // deterministic without racing the updater's normal polling interval.
+    assert!(tester.mempool().try_write().is_err());
+
+    let prevouts_before = mempool.lookup_txos(outpoints.clone())?;
     assert!(prevouts_before.contains_key(&OutPoint::new(parent_txid, parent_vout as u32)));
+    drop(mempool);
+    assert!(tester.mempool().try_write().is_ok());
 
     // EVICT: RBF-replace the parent on the node by directly double-spending
     // its inputs (not via `bumpfee`, which refuses once the wallet sees a
