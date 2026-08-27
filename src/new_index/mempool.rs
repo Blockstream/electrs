@@ -373,6 +373,19 @@ impl Mempool {
         // Fails if any are missing.
         txos.extend(self.lookup_txos(remain_prevouts)?);
 
+        // Transactions submitted through broadcast_raw()/submit_package() are inserted into the
+        // local view immediately, before the next periodic sync has a chance to remove transactions
+        // they replaced in bitcoind. Reconcile those conflicts here so the indexes never contain two
+        // spenders for one outpoint. Descendants of a replaced transaction are no longer valid either.
+        let conflicts = self.conflicts_and_descendants(&txs_map)?;
+        if !conflicts.is_empty() {
+            debug!(
+                "removing {} conflicting mempool transactions before insertion",
+                conflicts.len()
+            );
+            self.remove(conflicts.iter().collect());
+        }
+
         // Add to txstore and indexes
         for (txid, tx) in txs_map {
             self.txstore.insert(txid, tx);
@@ -462,6 +475,58 @@ impl Mempool {
         }
 
         Ok(())
+    }
+
+    fn conflicts_and_descendants(
+        &self,
+        txs_map: &HashMap<Txid, Transaction>,
+    ) -> Result<HashSet<Txid>> {
+        let mut incoming_spends = HashMap::new();
+        let mut to_remove = HashSet::new();
+
+        for (txid, tx) in txs_map {
+            for txin in &tx.input {
+                if let Some(other_txid) = incoming_spends.insert(txin.previous_output, *txid) {
+                    if other_txid != *txid {
+                        bail!(
+                            "incoming mempool transactions {} and {} both spend outpoint {}:{}",
+                            other_txid,
+                            txid,
+                            txin.previous_output.txid,
+                            txin.previous_output.vout
+                        );
+                    }
+                }
+
+                if let Some((indexed_txid, _)) = self.edges.get(&txin.previous_output) {
+                    if indexed_txid != txid && !txs_map.contains_key(indexed_txid) {
+                        to_remove.insert(*indexed_txid);
+                    }
+                }
+            }
+        }
+
+        // Follow spend edges from every output of each conflict to collect the full descendant
+        // closure without scanning the whole mempool.
+        let mut pending = to_remove.iter().copied().collect::<Vec<_>>();
+        while let Some(txid) = pending.pop() {
+            let Some(tx) = self.txstore.get(&txid) else {
+                continue;
+            };
+            for vout in 0..tx.output.len() {
+                let outpoint = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                if let Some((descendant_txid, _)) = self.edges.get(&outpoint) {
+                    if to_remove.insert(*descendant_txid) {
+                        pending.push(*descendant_txid);
+                    }
+                }
+            }
+        }
+
+        Ok(to_remove)
     }
 
     fn lookup_txo(&self, outpoint: &OutPoint) -> Option<TxOut> {
