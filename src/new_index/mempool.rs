@@ -313,7 +313,7 @@ impl Mempool {
             if let Ok(tx) = daemon.getmempooltx(&txid) {
                 let mut txs_map = HashMap::new();
                 txs_map.insert(txid, tx);
-                self.add(txs_map)
+                self.add_submitted(txs_map)
             } else {
                 bail!("add_by_txid cannot find {}", txid);
             }
@@ -341,6 +341,24 @@ impl Mempool {
         if txs_map.is_empty() {
             return Ok(());
         }
+        self.add_submitted(txs_map)
+    }
+
+    /// Add transactions submitted through broadcast_raw()/submit_package().
+    ///
+    /// Unlike the periodic full-snapshot update, manual insertion can race with
+    /// bitcoind removing transactions that the submission replaced. Reconcile
+    /// those conflicts before inserting the submitted transactions locally.
+    fn add_submitted(&mut self, txs_map: HashMap<Txid, Transaction>) -> Result<()> {
+        let conflicts = self.conflicts_and_descendants(&txs_map)?;
+        if !conflicts.is_empty() {
+            debug!(
+                "removing {} conflicting mempool transactions before insertion",
+                conflicts.len()
+            );
+            self.remove(conflicts.iter().collect());
+        }
+
         self.add(txs_map)
     }
 
@@ -372,19 +390,6 @@ impl Mempool {
         // Lookup remaining spent prevouts in mempool & on-chain
         // Fails if any are missing.
         txos.extend(self.lookup_txos(remain_prevouts)?);
-
-        // Transactions submitted through broadcast_raw()/submit_package() are inserted into the
-        // local view immediately, before the next periodic sync has a chance to remove transactions
-        // they replaced in bitcoind. Reconcile those conflicts here so the indexes never contain two
-        // spenders for one outpoint. Descendants of a replaced transaction are no longer valid either.
-        let conflicts = self.conflicts_and_descendants(&txs_map)?;
-        if !conflicts.is_empty() {
-            debug!(
-                "removing {} conflicting mempool transactions before insertion",
-                conflicts.len()
-            );
-            self.remove(conflicts.iter().collect());
-        }
 
         // Add to txstore and indexes
         for (txid, tx) in txs_map {
