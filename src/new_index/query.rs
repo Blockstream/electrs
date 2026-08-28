@@ -83,7 +83,7 @@ impl Query {
         let _ = self
             .mempool
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .add_by_txid(&self.daemon, txid);
         Ok(txid)
     }
@@ -103,7 +103,7 @@ impl Query {
             let _ = self
                 .mempool
                 .write()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .add_by_txids(&self.daemon, &accepted_txids);
         }
         Ok(result)
