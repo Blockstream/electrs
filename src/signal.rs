@@ -38,38 +38,42 @@ impl Waiter {
     }
 
     pub fn wait(&self, duration: Duration, accept_block_notification: bool) -> Result<()> {
-        let start = Instant::now();
-        select! {
-            recv(self.receiver) -> msg => {
-                match msg {
-                    Ok(sig) if sig == SIGUSR1 => {
-                        trace!("notified via SIGUSR1");
-                        if accept_block_notification {
-                            Ok(())
-                        } else {
-                            let wait_more = duration.saturating_sub(start.elapsed());
-                            self.wait(wait_more, accept_block_notification)
-                        }
-                    }
-                    Ok(sig) => bail!(ErrorKind::Interrupt(sig)),
-                    Err(_) => bail!("signal hook channel disconnected"),
-                }
-            },
-            recv(self.zmq_receiver) -> msg => {
-                match msg {
-                    Ok(_) => {
-                        if accept_block_notification {
-                            Ok(())
-                        } else {
-                            let wait_more = duration.saturating_sub(start.elapsed());
-                            self.wait(wait_more, accept_block_notification)
-                        }
-                    }
-                    Err(_) => bail!("signal hook channel disconnected"),
-                }
-            },
-            recv(after(duration)) -> _ => Ok(()),
+        // Iterative rather than recursive. A caller that is not accepting block
+        // notifications keeps waiting out the rest of its budget after each one,
+        // and recursing there meant one stack frame per notification - a flood of
+        // them could exhaust the stack before the deadline ever expired.
+        let mut remaining = duration;
 
+        loop {
+            let start = Instant::now();
+
+            // `false` means we were woken by a notification rather than by the
+            // deadline, so the loop goes round again unless we accept those.
+            let deadline_expired = select! {
+                recv(self.receiver) -> msg => {
+                    match msg {
+                        Ok(sig) if sig == SIGUSR1 => {
+                            trace!("notified via SIGUSR1");
+                            false
+                        }
+                        Ok(sig) => bail!(ErrorKind::Interrupt(sig)),
+                        Err(_) => bail!("signal hook channel disconnected"),
+                    }
+                },
+                recv(self.zmq_receiver) -> msg => {
+                    match msg {
+                        Ok(_) => false,
+                        Err(_) => bail!("signal hook channel disconnected"),
+                    }
+                },
+                recv(after(remaining)) -> _ => true,
+            };
+
+            if deadline_expired || accept_block_notification {
+                return Ok(());
+            }
+
+            remaining = remaining.saturating_sub(start.elapsed());
         }
     }
 }
