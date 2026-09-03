@@ -111,6 +111,7 @@ impl TestRunner {
             enable_mining_rest: true,
             cors: None,
             precache_scripts: None,
+            serve_during_mempool_sync: false,
             utxos_limit: 100,
             electrum_txs_limit: 100,
             electrum_subscription_limit: 10_000,

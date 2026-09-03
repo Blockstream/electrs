@@ -70,6 +70,11 @@ pub struct Config {
     pub enable_mining_rest: bool,
     pub cors: Option<String>,
     pub precache_scripts: Option<String>,
+    /// Start the REST and Electrum servers before the initial mempool sync completes.
+    /// Chain-based queries are fully correct during the sync; mempool-derived data is
+    /// incomplete until /health/ready reports mempool_synced=true, so readiness probes
+    /// must use that endpoint instead of a TCP check when this is enabled.
+    pub serve_during_mempool_sync: bool,
     pub utxos_limit: usize,
     pub electrum_txs_limit: usize,
     pub electrum_subscription_limit: usize,
@@ -266,6 +271,11 @@ impl Config {
                     .long("precache-scripts")
                     .help("Path to file with list of scripts to pre-cache")
                     .takes_value(true)
+            )
+            .arg(
+                Arg::with_name("serve_during_mempool_sync")
+                    .long("serve-during-mempool-sync")
+                    .help("Start the REST/Electrum servers before the initial mempool sync completes. Requires readiness checks to use /health/ready instead of a TCP probe.")
             )
             .arg(
                 Arg::with_name("utxos_limit")
@@ -592,6 +602,7 @@ impl Config {
             enable_mining_rest: m.is_present("enable_mining_rest"),
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
+            serve_during_mempool_sync: m.is_present("serve_during_mempool_sync"),
             db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
             db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
