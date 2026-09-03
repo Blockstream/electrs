@@ -21,12 +21,19 @@ const BLOCK_HASH_BYTES: usize = 32;
 
 /// bitcoind publishes `hashblock` as three frames - topic, 32-byte hash, 4-byte
 /// sequence number - roughly 45 bytes in total. Anything materially larger is not
-/// something we have a use for, so let libzmq discard it before it reaches us.
-const MAX_FRAME_BYTES: i64 = 1024;
+/// something we have a use for, so it is dropped instead of being copied out.
+///
+/// Enforced here rather than with `ZMQ_MAXMSGSIZE`, deliberately. libzmq treats an
+/// oversized message as a *protocol* error: it tears down the session and does not
+/// reconnect afterwards. A single hostile message would therefore disable block
+/// notifications for the lifetime of the process, silently - no error is returned
+/// to `recv`, so nothing logs and nothing retries. Checking the frame ourselves
+/// costs one comparison and leaves the connection usable.
+const MAX_FRAME_BYTES: usize = 1024;
 
-/// Upper bound on frames buffered from one multipart message. `maxmsgsize` caps
-/// the size of each frame but not how many frames a publisher may send, so cap
-/// that separately.
+/// Upper bound on frames buffered from one multipart message. A size limit bounds
+/// each frame but not how many a publisher may send, so cap that separately -
+/// otherwise unbounded small frames add up to the same thing.
 const MAX_FRAMES: usize = 8;
 
 /// Bound on libzmq's own receive queue. SUB sockets discard messages past the
@@ -91,21 +98,33 @@ fn parse_hashblock(frames: &[Vec<u8>]) -> Option<BlockHash> {
     BlockHash::from_slice(&reversed).ok()
 }
 
-/// Receive one complete multipart message, buffering at most [`MAX_FRAMES`].
+/// Whether a frame is worth copying out of libzmq, given how many we already hold.
 ///
-/// Frames past the cap are drained and discarded rather than accumulated, so a
-/// publisher sending an unbounded number of parts cannot grow our memory. Returns
-/// `None` when the message exceeded the cap and was therefore dropped.
+/// Rejects a frame that is too large or that is past the count we are willing to
+/// buffer. Both bounds matter: the size limit alone leaves a publisher free to send
+/// unlimited small parts, and the count limit alone leaves each part unbounded.
+fn frame_admissible(frame_len: usize, already_buffered: usize) -> bool {
+    frame_len <= MAX_FRAME_BYTES && already_buffered < MAX_FRAMES
+}
+
+/// Receive one complete multipart message, buffering at most [`MAX_FRAMES`] frames
+/// of at most [`MAX_FRAME_BYTES`] each.
+///
+/// Inadmissible frames are drained and dropped where they land rather than copied,
+/// so neither an oversized part nor an unbounded number of parts can grow our
+/// memory. The whole message is still read to completion - leaving parts queued
+/// would desynchronise the next read. Returns `None` when anything was rejected,
+/// which discards the message rather than acting on a partial one.
 fn recv_message(subscriber: &zmq::Socket) -> zmq::Result<Option<Vec<Vec<u8>>>> {
     let mut frames = Vec::new();
-    let mut over_cap = false;
+    let mut rejected = false;
 
     loop {
         let frame = subscriber.recv_msg(0)?;
-        if frames.len() < MAX_FRAMES {
+        if frame_admissible(frame.len(), frames.len()) {
             frames.push(frame.to_vec());
         } else {
-            over_cap = true;
+            rejected = true;
         }
 
         // libzmq delivers a multipart message atomically, so the remaining parts
@@ -115,7 +134,7 @@ fn recv_message(subscriber: &zmq::Socket) -> zmq::Result<Option<Vec<Vec<u8>>>> {
         }
     }
 
-    Ok(if over_cap { None } else { Some(frames) })
+    Ok(if rejected { None } else { Some(frames) })
 }
 
 /// Connect a SUB socket to `url` and forward `hashblock` notifications.
@@ -132,9 +151,6 @@ pub fn start(url: &str, block_hash_notify: &Sender<BlockHash>, metrics: &Metrics
         .socket(zmq::SUB)
         .chain_err(|| format!("failed creating ZMQ subscriber for url='{url}'"))?;
 
-    subscriber
-        .set_maxmsgsize(MAX_FRAME_BYTES)
-        .chain_err(|| "failed setting ZMQ maxmsgsize")?;
     subscriber
         .set_rcvhwm(RCVHWM)
         .chain_err(|| "failed setting ZMQ rcvhwm")?;
@@ -262,6 +278,45 @@ mod tests {
     fn rejects_a_message_missing_frames() {
         assert!(parse_hashblock(&[TOPIC_HASHBLOCK.to_vec()]).is_none());
         assert!(parse_hashblock(&[]).is_none());
+    }
+
+    #[test]
+    fn admits_a_frame_of_the_size_bitcoind_actually_sends() {
+        // topic, 32-byte hash, 4-byte sequence.
+        assert!(frame_admissible(TOPIC_HASHBLOCK.len(), 0));
+        assert!(frame_admissible(BLOCK_HASH_BYTES, 1));
+        assert!(frame_admissible(4, 2));
+    }
+
+    #[test]
+    fn rejects_a_frame_over_the_size_limit() {
+        assert!(frame_admissible(MAX_FRAME_BYTES, 0));
+        assert!(!frame_admissible(MAX_FRAME_BYTES + 1, 0));
+        assert!(!frame_admissible(1024 * 1024, 0));
+    }
+
+    #[test]
+    fn rejects_a_frame_past_the_count_limit() {
+        assert!(frame_admissible(32, MAX_FRAMES - 1));
+        assert!(!frame_admissible(32, MAX_FRAMES));
+        assert!(!frame_admissible(32, MAX_FRAMES + 1));
+    }
+
+    /// Setup failure has to be reported, not panicked, and it must leave the
+    /// caller's sender alive. If `start` consumed the sender, this failure would
+    /// drop it, disconnect the channel, and turn a misconfigured endpoint into a
+    /// fatal error on the next `Waiter::wait` - the opposite of falling back to
+    /// polling.
+    #[test]
+    fn a_failed_start_reports_an_error_and_leaves_the_sender_usable() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let metrics = Metrics::new("127.0.0.1:0".parse().unwrap());
+
+        assert!(start("nosuchtransport://endpoint", &tx, &metrics).is_err());
+
+        let hash = BlockHash::from_slice(&[0u8; BLOCK_HASH_BYTES]).unwrap();
+        assert!(tx.try_send(hash).is_ok());
+        assert_eq!(rx.try_recv().unwrap(), hash);
     }
 
     #[test]
