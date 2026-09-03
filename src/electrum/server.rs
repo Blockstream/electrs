@@ -25,6 +25,8 @@ use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{Query, Utxo};
+#[cfg(not(feature = "liquid"))]
+use crate::util::electrum_merkle::get_tx_witness_merkle_proof;
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
 use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
 
@@ -551,6 +553,33 @@ impl Connection {
         }))
     }
 
+    /// Witness-tree twin of get_merkle: proves the tx against the block's
+    /// BIP-141 witness merkle tree (wtxids, zeroed coinbase leaf), binding the
+    /// full serialization including witness data.
+    #[cfg(not(feature = "liquid"))]
+    #[trace]
+    fn blockchain_transaction_get_witness_merkle(&self, params: &[Value]) -> Result<Value> {
+        let txid = Txid::from(hash_from_value(params.get(0))?);
+        let height = usize_from_value(params.get(1), "height")?;
+        let blockid = self
+            .query
+            .chain()
+            .tx_confirming_block(&txid)
+            .ok_or_else(|| "tx not found or is unconfirmed")?;
+        if blockid.height != height {
+            return Err(invalid_params("invalid confirmation height provided"));
+        }
+        let (merkle, pos, witness_root) =
+            get_tx_witness_merkle_proof(self.query.chain(), &txid, &blockid.hash)
+                .chain_err(|| "cannot create witness merkle proof")?;
+        Ok(json!({
+            "block_height": blockid.height,
+            "merkle": merkle,
+            "pos": pos,
+            "witness_root": witness_root,
+        }))
+    }
+
     fn blockchain_transaction_id_from_pos(&self, params: &[Value]) -> Result<Value> {
         let height = usize_from_value(params.get(0), "height")?;
         let tx_pos = usize_from_value(params.get(1), "tx_pos")?;
@@ -595,6 +624,10 @@ impl Connection {
             }
             "blockchain.transaction.get" => self.blockchain_transaction_get(&params),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(&params),
+            #[cfg(not(feature = "liquid"))]
+            "blockchain.transaction.get_witness_merkle" => {
+                self.blockchain_transaction_get_witness_merkle(&params)
+            }
             "blockchain.transaction.id_from_pos" => {
                 self.blockchain_transaction_id_from_pos(&params)
             }

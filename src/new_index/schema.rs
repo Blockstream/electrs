@@ -594,6 +594,32 @@ impl ChainQuery {
         }
     }
 
+    /// Leaves of the block's BIP-141 witness tree: the coinbase leaf is the
+    /// zero hash (its wtxid is defined as 0x00…00 for commitment purposes),
+    /// every other leaf is the transaction's wtxid.
+    #[cfg(not(feature = "liquid"))]
+    pub fn get_block_wtxids(
+        &self,
+        hash: &BlockHash,
+    ) -> Result<Vec<bitcoin::hashes::sha256d::Hash>> {
+        use bitcoin::hashes::Hash;
+        let _timer = self.start_timer("get_block_wtxids");
+        let txids = self.get_block_txids(hash).chain_err(|| "block not found")?;
+        let txids_with_blockhash: Vec<_> = txids.into_iter().map(|txid| (txid, *hash)).collect();
+        let txs = self.lookup_txns(&txids_with_blockhash)?;
+        Ok(txs
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| {
+                if i == 0 {
+                    bitcoin::hashes::sha256d::Hash::all_zeros()
+                } else {
+                    tx.compute_wtxid().to_raw_hash()
+                }
+            })
+            .collect())
+    }
+
     pub fn get_block_txs(
         &self,
         hash: &BlockHash,

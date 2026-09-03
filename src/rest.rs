@@ -1079,6 +1079,29 @@ fn handle_blocking_request(
             )
         }
         #[cfg(not(feature = "liquid"))]
+        (&Method::GET, Some(&"tx"), Some(hash), Some(&"witness-merkle-proof"), None, None) => {
+            let hash = Txid::from_str(hash)?;
+            let blockid = query.chain().tx_confirming_block(&hash).ok_or_else(|| {
+                HttpError::not_found("Transaction not found or is unconfirmed".to_string())
+            })?;
+            let (merkle, pos, witness_root) = electrum_merkle::get_tx_witness_merkle_proof(
+                query.chain(),
+                &hash,
+                &blockid.hash,
+            )?;
+            let merkle: Vec<String> = merkle.into_iter().map(|hash| hash.to_string()).collect();
+            let ttl = ttl_by_depth(Some(blockid.height), query);
+            json_response(
+                json!({
+                    "block_height": blockid.height,
+                    "merkle": merkle,
+                    "pos": pos,
+                    "witness_root": witness_root.to_string(),
+                }),
+                ttl,
+            )
+        }
+        #[cfg(not(feature = "liquid"))]
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"merkleblock-proof"), None, None) => {
             let hash = Txid::from_str(hash)?;
 
