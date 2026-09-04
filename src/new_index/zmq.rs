@@ -157,6 +157,11 @@ struct Subscriber {
     url: String,
     socket: zmq::Socket,
     monitor: zmq::Socket,
+    /// Whether a rebuild is owed. Latched rather than inferred from the monitor,
+    /// because the monitor only reports the *transition* and a torn-down socket
+    /// never reports a second one - so a rebuild that fails has to leave the
+    /// fact behind, or nothing will ever ask for another.
+    dead: bool,
 }
 
 impl Subscriber {
@@ -193,6 +198,7 @@ impl Subscriber {
             url: url.to_owned(),
             socket,
             monitor,
+            dead: false,
         })
     }
 
@@ -211,9 +217,13 @@ impl Subscriber {
     /// having to distinguish it, and costs nothing when libzmq would have
     /// recovered on its own.
     ///
-    /// Returns whether a rebuild was attempted.
+    /// Returns whether a rebuild was attempted, successfully or not.
     fn reconnect_if_peer_dropped(&mut self) -> bool {
-        if !self.peer_dropped() {
+        // `|=` rather than a short-circuiting `||`: the monitor has to be drained
+        // on every pass, including while a rebuild is already owed, so a backlog
+        // cannot accumulate behind the flag.
+        self.dead |= self.peer_dropped();
+        if !self.dead {
             return false;
         }
 
@@ -225,10 +235,15 @@ impl Subscriber {
             Ok(replacement) => {
                 self.socket = replacement.socket;
                 self.monitor = replacement.monitor;
+                self.dead = false;
             }
             Err(e) => {
+                // Deliberately still dead. The socket left in place has had its
+                // session terminated, so it will neither deliver anything nor
+                // report a second disconnect - only the flag can ask for the
+                // retry, and the caller's backoff paces it.
                 log::warn!(
-                    "failed reconnecting ZMQ subscriber: url='{}' err='{}'",
+                    "failed reconnecting ZMQ subscriber, will retry: url='{}' err='{}'",
                     self.url,
                     e.display_chain()
                 );
@@ -507,6 +522,52 @@ mod tests {
         assert!(
             expect_notification(&mut subscriber, &publisher),
             "subscriber never recovered from the oversized frame"
+        );
+    }
+
+    /// The rebuild itself can fail - `EMFILE` on either socket it creates is the
+    /// realistic way - and the attempt consumes the disconnect event that asked
+    /// for it. Since the socket left in place has had its session terminated, it
+    /// will never report a second disconnect, so nothing would ever ask again:
+    /// one transient failure would end block notifications permanently.
+    ///
+    /// Failure is induced by pointing the rebuild at a transport libzmq rejects,
+    /// which fails at the same place fd exhaustion would - after the event has
+    /// been taken off the monitor.
+    #[test]
+    fn a_failed_rebuild_is_retried_rather_than_latching_off() {
+        let ctx = zmq::Context::new();
+        let publisher = ctx.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let url = publisher.get_last_endpoint().unwrap().unwrap();
+
+        let mut subscriber = Subscriber::connect(&ctx, &url).unwrap();
+        assert!(
+            expect_notification(&mut subscriber, &publisher),
+            "no notification received before the oversized frame"
+        );
+
+        let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
+        publisher
+            .send_multipart([TOPIC_HASHBLOCK, &oversized[..]], 0)
+            .unwrap();
+
+        subscriber.url = "bogus://not-a-transport".to_owned();
+        let mut attempted = false;
+        for _ in 0..20 {
+            if subscriber.reconnect_if_peer_dropped() {
+                attempted = true;
+                break;
+            }
+            // Bounded by the receive timeout, so this paces the retries.
+            let _ = subscriber.recv();
+        }
+        assert!(attempted, "the teardown was never observed");
+
+        subscriber.url = url;
+        assert!(
+            expect_notification(&mut subscriber, &publisher),
+            "subscriber never recovered from a failed rebuild"
         );
     }
 
