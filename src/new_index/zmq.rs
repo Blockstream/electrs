@@ -6,11 +6,13 @@
 //! and bounds what it can cost us - there is no transport authentication here, so
 //! anyone able to reach or impersonate the endpoint can publish to us.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bitcoin::{hashes::Hash, BlockHash};
 use crossbeam_channel::{Sender, TrySendError};
+use error_chain::ChainedError;
 
 use crate::errors::*;
 use crate::metrics::{CounterVec, MetricOpts, Metrics};
@@ -21,14 +23,20 @@ const BLOCK_HASH_BYTES: usize = 32;
 
 /// bitcoind publishes `hashblock` as three frames - topic, 32-byte hash, 4-byte
 /// sequence number - roughly 45 bytes in total. Anything materially larger is not
-/// something we have a use for, so it is dropped instead of being copied out.
+/// something we have a use for.
 ///
-/// Enforced here rather than with `ZMQ_MAXMSGSIZE`, deliberately. libzmq treats an
-/// oversized message as a *protocol* error: it tears down the session and does not
-/// reconnect afterwards. A single hostile message would therefore disable block
-/// notifications for the lifetime of the process, silently - no error is returned
-/// to `recv`, so nothing logs and nothing retries. Checking the frame ourselves
-/// costs one comparison and leaves the connection usable.
+/// This bound is applied in two places and needs both. `ZMQ_MAXMSGSIZE` is the only
+/// one that acts before libzmq allocates: the length prefix is checked as it is
+/// decoded, so a publisher declaring a huge frame is refused without the body being
+/// read or allocated. A check after `recv` cannot do that - by then the allocation
+/// has already happened, and a large enough declared length aborts the process
+/// rather than failing. The second application, in [`frame_admissible`], covers what
+/// a size limit inherently cannot: how *many* frames arrive in one message.
+///
+/// The catch is that libzmq classes an oversized message as a *protocol* error, so
+/// it tears the session down, does not reconnect, and reports nothing to `recv` -
+/// notifications would simply stop, silently and permanently. That is what
+/// [`Subscriber::reconnect_if_peer_dropped`] exists to notice.
 const MAX_FRAME_BYTES: usize = 1024;
 
 /// Upper bound on frames buffered from one multipart message. A size limit bounds
@@ -100,9 +108,11 @@ fn parse_hashblock(frames: &[Vec<u8>]) -> Option<BlockHash> {
 
 /// Whether a frame is worth copying out of libzmq, given how many we already hold.
 ///
-/// Rejects a frame that is too large or that is past the count we are willing to
-/// buffer. Both bounds matter: the size limit alone leaves a publisher free to send
-/// unlimited small parts, and the count limit alone leaves each part unbounded.
+/// The count is the part that matters here: `ZMQ_MAXMSGSIZE` bounds how large a
+/// frame may be but says nothing about how many of them one message may contain, so
+/// a publisher is otherwise free to send unlimited small parts. The size check is
+/// kept alongside it as a backstop, since it also covers transports that do not go
+/// through the wire decoder that enforces `ZMQ_MAXMSGSIZE`.
 fn frame_admissible(frame_len: usize, already_buffered: usize) -> bool {
     frame_len <= MAX_FRAME_BYTES && already_buffered < MAX_FRAMES
 }
@@ -137,6 +147,137 @@ fn recv_message(subscriber: &zmq::Socket) -> zmq::Result<Option<Vec<Vec<u8>>>> {
     Ok(if rejected { None } else { Some(frames) })
 }
 
+/// A SUB socket together with the monitor used to notice it losing its peer.
+///
+/// The two are kept as a unit because they are rebuilt as a unit: a monitor is
+/// bound to one specific socket, so replacing the socket means replacing the
+/// monitor with it.
+struct Subscriber {
+    ctx: zmq::Context,
+    url: String,
+    socket: zmq::Socket,
+    monitor: zmq::Socket,
+}
+
+impl Subscriber {
+    fn connect(ctx: &zmq::Context, url: &str) -> Result<Self> {
+        let socket = ctx
+            .socket(zmq::SUB)
+            .chain_err(|| format!("failed creating ZMQ subscriber for url='{url}'"))?;
+
+        // Refuse an oversized frame while its length prefix is being decoded,
+        // before libzmq reads or allocates the body. A check after `recv` is too
+        // late to prevent the allocation.
+        socket
+            .set_maxmsgsize(MAX_FRAME_BYTES as i64)
+            .chain_err(|| "failed setting ZMQ maxmsgsize")?;
+        socket
+            .set_rcvhwm(RCVHWM)
+            .chain_err(|| "failed setting ZMQ rcvhwm")?;
+        socket
+            .set_rcvtimeo(RCVTIMEO_MS)
+            .chain_err(|| "failed setting ZMQ rcvtimeo")?;
+
+        // Attached before connecting, so no event can be missed in between.
+        let monitor = attach_monitor(ctx, &socket)?;
+
+        socket
+            .connect(url)
+            .chain_err(|| format!("failed connecting ZMQ subscriber to url='{url}'"))?;
+        socket
+            .set_subscribe(TOPIC_HASHBLOCK)
+            .chain_err(|| "failed subscribing to ZMQ hashblock")?;
+
+        Ok(Subscriber {
+            ctx: ctx.clone(),
+            url: url.to_owned(),
+            socket,
+            monitor,
+        })
+    }
+
+    fn recv(&self) -> zmq::Result<Option<Vec<Vec<u8>>>> {
+        recv_message(&self.socket)
+    }
+
+    /// Rebuild the socket if libzmq has dropped the connection to the publisher.
+    ///
+    /// Reconnecting is normally libzmq's job, and for an ordinary disconnect it
+    /// does it. It makes an exception for a protocol error - an oversized message
+    /// being the one a publisher can trigger at will - where it terminates the
+    /// session instead and neither reconnects nor surfaces an error. `recv` just
+    /// returns `EAGAIN` forever, so the only evidence is the monitor event emitted
+    /// on the way down. Rebuilding on any disconnect covers that case without
+    /// having to distinguish it, and costs nothing when libzmq would have
+    /// recovered on its own.
+    ///
+    /// Returns whether a rebuild was attempted.
+    fn reconnect_if_peer_dropped(&mut self) -> bool {
+        if !self.peer_dropped() {
+            return false;
+        }
+
+        log::warn!(
+            "ZMQ publisher connection dropped, reconnecting: url='{}'",
+            self.url
+        );
+        match Subscriber::connect(&self.ctx, &self.url) {
+            Ok(replacement) => {
+                self.socket = replacement.socket;
+                self.monitor = replacement.monitor;
+            }
+            Err(e) => {
+                log::warn!(
+                    "failed reconnecting ZMQ subscriber: url='{}' err='{}'",
+                    self.url,
+                    e.display_chain()
+                );
+            }
+        }
+        true
+    }
+
+    /// Whether any disconnect event is queued on the monitor, draining it either
+    /// way so a backlog cannot build up.
+    fn peer_dropped(&self) -> bool {
+        let mut dropped = false;
+        while let Ok(event) = self.monitor.recv_multipart(zmq::DONTWAIT) {
+            if let Some(raw) = event.first().filter(|frame| frame.len() >= 2) {
+                let id = u16::from_ne_bytes([raw[0], raw[1]]);
+                dropped |= id == zmq::SocketEvent::DISCONNECTED.to_raw();
+            }
+        }
+        dropped
+    }
+}
+
+/// Attach a disconnect monitor to `socket` and return the end we read events from.
+fn attach_monitor(ctx: &zmq::Context, socket: &zmq::Socket) -> Result<zmq::Socket> {
+    // One endpoint per socket: a monitor binds its own inproc address, and sockets
+    // are rebuilt over the process lifetime, so the name has to be unique.
+    static NEXT_MONITOR_ID: AtomicUsize = AtomicUsize::new(0);
+    let endpoint = format!(
+        "inproc://zmq-subscriber-monitor-{}",
+        NEXT_MONITOR_ID.fetch_add(1, Ordering::Relaxed)
+    );
+
+    socket
+        .monitor(
+            &endpoint,
+            i32::from(zmq::SocketEvent::DISCONNECTED.to_raw()),
+        )
+        .chain_err(|| format!("failed monitoring ZMQ subscriber on endpoint='{endpoint}'"))?;
+
+    let monitor = ctx
+        .socket(zmq::PAIR)
+        .chain_err(|| "failed creating ZMQ monitor socket")?;
+    monitor
+        .connect(&endpoint)
+        .chain_err(|| format!("failed connecting ZMQ monitor to endpoint='{endpoint}'"))?;
+
+    Ok(monitor)
+}
+
 /// Connect a SUB socket to `url` and forward `hashblock` notifications.
 ///
 /// Takes the sender by reference deliberately. If setup fails the caller's sender
@@ -147,23 +288,7 @@ pub fn start(url: &str, block_hash_notify: &Sender<BlockHash>, metrics: &Metrics
     log::debug!("starting ZMQ subscriber: url='{url}'");
 
     let ctx = zmq::Context::new();
-    let subscriber = ctx
-        .socket(zmq::SUB)
-        .chain_err(|| format!("failed creating ZMQ subscriber for url='{url}'"))?;
-
-    subscriber
-        .set_rcvhwm(RCVHWM)
-        .chain_err(|| "failed setting ZMQ rcvhwm")?;
-    subscriber
-        .set_rcvtimeo(RCVTIMEO_MS)
-        .chain_err(|| "failed setting ZMQ rcvtimeo")?;
-
-    subscriber
-        .connect(url)
-        .chain_err(|| format!("failed connecting ZMQ subscriber to url='{url}'"))?;
-    subscriber
-        .set_subscribe(TOPIC_HASHBLOCK)
-        .chain_err(|| "failed subscribing to ZMQ hashblock")?;
+    let subscriber = Subscriber::connect(&ctx, url)?;
 
     let notifications = metrics.counter_vec(
         MetricOpts::new(
@@ -173,18 +298,16 @@ pub fn start(url: &str, block_hash_notify: &Sender<BlockHash>, metrics: &Metrics
         &["result"],
     );
 
-    let url = url.to_owned();
     let block_hash_notify = block_hash_notify.clone();
     spawn_thread("zmq", move || {
-        subscriber_loop(&url, subscriber, block_hash_notify, notifications)
+        subscriber_loop(subscriber, block_hash_notify, notifications)
     });
 
     Ok(())
 }
 
 fn subscriber_loop(
-    url: &str,
-    subscriber: zmq::Socket,
+    mut subscriber: Subscriber,
     block_hash_notify: Sender<BlockHash>,
     notifications: CounterVec,
 ) {
@@ -192,7 +315,19 @@ fn subscriber_loop(
     let mut backoff = MIN_ERROR_BACKOFF;
 
     loop {
-        match recv_message(&subscriber) {
+        // Checked every iteration, and `recv` returns at least once per
+        // `RCVTIMEO_MS`, so a silent teardown is picked up within that window.
+        if subscriber.reconnect_if_peer_dropped() {
+            notifications.with_label_values(&["reconnected"]).inc();
+            // Spaced out deliberately: a publisher sending oversized frames can
+            // force a teardown per message, and rebuilding flat out would turn
+            // that into a hot loop. Backing off degrades to the tip poll instead.
+            thread::sleep(backoff);
+            backoff = (backoff * 2).min(MAX_ERROR_BACKOFF);
+            continue;
+        }
+
+        match subscriber.recv() {
             Ok(received) => {
                 backoff = MIN_ERROR_BACKOFF;
 
@@ -229,7 +364,8 @@ fn subscriber_loop(
             Err(zmq::Error::EAGAIN) => continue,
             Err(e) => {
                 log::warn!(
-                    "ZMQ receive failed, backing off: url='{url}' err='{e}' backoff='{backoff:?}'"
+                    "ZMQ receive failed, backing off: url='{}' err='{e}' backoff='{backoff:?}'",
+                    subscriber.url
                 );
                 thread::sleep(backoff);
                 backoff = (backoff * 2).min(MAX_ERROR_BACKOFF);
@@ -317,6 +453,61 @@ mod tests {
         let hash = BlockHash::from_slice(&[0u8; BLOCK_HASH_BYTES]).unwrap();
         assert!(tx.try_send(hash).is_ok());
         assert_eq!(rx.try_recv().unwrap(), hash);
+    }
+
+    /// Publish `hashblock` until one is received, rebuilding the socket the way
+    /// the loop does. Retried because PUB drops anything published before the
+    /// subscription has reached it, so early attempts can be lost legitimately.
+    fn expect_notification(subscriber: &mut Subscriber, publisher: &zmq::Socket) -> bool {
+        let body = [7u8; BLOCK_HASH_BYTES];
+
+        for _ in 0..20 {
+            subscriber.reconnect_if_peer_dropped();
+            publisher
+                .send_multipart([TOPIC_HASHBLOCK, &body[..]], 0)
+                .unwrap();
+
+            // Bounded by the receive timeout, so this paces the retries too.
+            if let Ok(Some(frames)) = subscriber.recv() {
+                if parse_hashblock(&frames).is_some() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// An oversized frame is a *protocol* error to libzmq: it terminates the
+    /// session, does not reconnect, and reports nothing to `recv`, which just
+    /// returns `EAGAIN` from then on. Nothing at the receive layer can observe
+    /// that, so without the monitor the second `expect_notification` never
+    /// succeeds - one hostile message would end block notifications for the life
+    /// of the process.
+    ///
+    /// Deliberately over TCP: the size limit is applied by the wire decoder, and
+    /// inproc does not go through it.
+    #[test]
+    fn recovers_after_an_oversized_frame_tears_the_session_down() {
+        let ctx = zmq::Context::new();
+        let publisher = ctx.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let url = publisher.get_last_endpoint().unwrap().unwrap();
+
+        let mut subscriber = Subscriber::connect(&ctx, &url).unwrap();
+        assert!(
+            expect_notification(&mut subscriber, &publisher),
+            "no notification received before the oversized frame"
+        );
+
+        let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
+        publisher
+            .send_multipart([TOPIC_HASHBLOCK, &oversized[..]], 0)
+            .unwrap();
+
+        assert!(
+            expect_notification(&mut subscriber, &publisher),
+            "subscriber never recovered from the oversized frame"
+        );
     }
 
     #[test]
