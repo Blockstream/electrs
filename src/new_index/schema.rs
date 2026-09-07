@@ -45,6 +45,10 @@ use bitcoin::VarInt;
 
 const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
+fn completed_prefix_len<T>(items: &[T], mut is_complete: impl FnMut(&T) -> bool) -> usize {
+    items.iter().take_while(|item| is_complete(item)).count()
+}
+
 pub struct Store {
     // TODO: should be column families
     txstore_db: DB,
@@ -280,6 +284,15 @@ impl Indexer {
             .collect()
     }
 
+    fn completed_header_prefix(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
+        let added = self.store.added_blockhashes.read().unwrap();
+        let indexed = self.store.indexed_blockhashes.read().unwrap();
+        let len = completed_prefix_len(new_headers, |e| {
+            added.contains(e.hash()) && indexed.contains(e.hash())
+        });
+        new_headers[..len].to_vec()
+    }
+
     fn start_auto_compactions(&self, db: &DB) {
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
@@ -358,7 +371,10 @@ impl Indexer {
             // Fetch the reorged blocks, then undo their history index db rows.
             // The txstore db rows are kept for reorged blocks/transactions.
             start_fetcher(self.from, &daemon, reorged_headers, self.iconfig.block_batch_size, chain_tip_height)?
-                .map(|blocks| self.undo_index(&blocks));
+                .map(|blocks| {
+                    self.undo_index(&blocks);
+                    Ok(())
+                })?;
         }
 
         // Single-pass: add to txstore and index to history in the same per-batch loop.
@@ -385,7 +401,14 @@ impl Indexer {
         let mut fetcher_count = 0;
         let to_process_total = to_process.len();
 
-        start_fetcher(self.from, &daemon, to_process, self.iconfig.block_batch_size, chain_tip_height)?.map(|blocks| {
+        let fetch_result = start_fetcher(
+            self.from,
+            &daemon,
+            to_process,
+            self.iconfig.block_batch_size,
+            chain_tip_height,
+        )?
+        .map(|blocks| {
             if fetcher_count % 25 == 0 && to_process_total > 20 {
                 let batch_height = blocks.last().map(|b| b.entry.height()).unwrap_or(0);
                 info!(
@@ -433,7 +456,28 @@ impl Indexer {
                     self.sync_progress.set(h as f64 / chain_tip_height as f64 * 100.0);
                 }
             }
+            Ok(())
         });
+
+        if let FetchFrom::BlkFiles = self.from {
+            self.from = FetchFrom::Bitcoind;
+        }
+
+        if let Err(ref e) = fetch_result {
+            warn!(
+                "block fetch incomplete, advancing only completed prefix and retrying on next index update: {:?}",
+                e
+            );
+        }
+
+        let completed_headers = self.completed_header_prefix(&new_headers);
+        if fetch_result.is_ok() && completed_headers.len() != new_headers.len() {
+            bail!(
+                "block fetch completed without indexing all headers: completed={} requested={}",
+                completed_headers.len(),
+                new_headers.len()
+            );
+        }
 
         // Compact after all add+index work is done, not between passes.
         self.start_auto_compactions(&self.store.txstore_db);
@@ -461,23 +505,30 @@ impl Indexer {
             self.flush = DBFlush::Enable;
         }
 
-        // Update the synced tip after all db writes are flushed
-        debug!("updating synced tip to {:?}", tip);
-        self.store.txstore_db.put_sync(b"t", &serialize(&tip));
-
-        // Finally, append the new headers to the in-memory HeaderList.
+        // Finally, append the completed headers to the in-memory HeaderList.
         // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
         let mut headers = self.store.indexed_headers.write().unwrap();
-        headers.append(new_headers);
-        assert_eq!(tip, *headers.tip());
+        headers.append(completed_headers);
+        let synced_tip = *headers.tip();
 
-        if let FetchFrom::BlkFiles = self.from {
-            self.from = FetchFrom::Bitcoind;
+        // Update the synced tip only after all db writes are flushed and only as far
+        // as the contiguous prefix that was both added and indexed.
+        debug!("updating synced tip to {:?}", synced_tip);
+        if !headers.is_empty() {
+            self.store
+                .txstore_db
+                .put_sync(b"t", &serialize(&synced_tip));
         }
 
-        self.tip_metric.set(headers.best_height() as i64);
+        if fetch_result.is_ok() {
+            assert_eq!(tip, synced_tip);
+        }
 
-        Ok(tip)
+        if !headers.is_empty() {
+            self.tip_metric.set(headers.best_height() as i64);
+        }
+
+        Ok(synced_tip)
     }
 
     fn add(&self, blocks: &[BlockEntry]) {
@@ -2000,6 +2051,12 @@ pub mod bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_completed_prefix_stops_at_first_gap() {
+        let items = [true, true, false, true];
+        assert_eq!(completed_prefix_len(&items, |complete| *complete), 2);
+    }
 
     #[test]
     fn test_compute_script_hash_p2pkh() {
