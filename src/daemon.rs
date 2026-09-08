@@ -1507,8 +1507,7 @@ impl Daemon {
             format!("bitcoind returned out-of-range tip_height='{tip_height}'")
         })?;
 
-        // Materialise one chunk of heights at a time, rather than every height up front,
-        // so the allocation stays bounded regardless of the height bitcoind reports.
+        // Chunked so the height allocation stays bounded whatever height bitcoind reports.
         let mut result = vec![];
         for start in (0..=tip_height).step_by(CHUNK_SIZE) {
             let end = start.saturating_add(CHUNK_SIZE - 1).min(tip_height);
