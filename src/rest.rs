@@ -9,8 +9,8 @@ use crate::new_index::{compute_script_hash, Query, SpendingInput, Utxo};
 use crate::util::optional_value_for_newer_blocks;
 use crate::util::{
     create_socket, electrum_merkle, extract_tx_prevouts, get_innerscripts, get_tx_fee, has_prevout,
-    is_coinbase, BlockHeaderMeta, BlockId, FullHash, ScriptToAddr, ScriptToAsm, TransactionStatus,
-    DEFAULT_BLOCKHASH,
+    is_coinbase, BlockHeaderMeta, BlockId, FullHash, IsProvablyUnspendable, ScriptToAddr,
+    ScriptToAsm, TransactionStatus, DEFAULT_BLOCKHASH,
 };
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode;
@@ -334,30 +334,7 @@ impl TxOutValue {
         let script_asm = script.to_asm();
         let script_addr = script.to_address_str(config.network_type);
 
-        // TODO should the following something to put inside rust-elements lib?
-        let script_type = if is_fee {
-            "fee"
-        } else if script.is_empty() {
-            "empty"
-        } else if script.is_op_return() {
-            "op_return"
-        } else if script.is_p2pk() {
-            "p2pk"
-        } else if script.is_p2pkh() {
-            "p2pkh"
-        } else if script.is_p2sh() {
-            "p2sh"
-        } else if script.is_p2wpkh() {
-            "v0_p2wpkh"
-        } else if script.is_p2wsh() {
-            "v0_p2wsh"
-        } else if script.is_p2tr() {
-            "v1_p2tr"
-        } else if script.is_op_return() {
-            "provably_unspendable"
-        } else {
-            "unknown"
-        };
+        let script_type = script_type(script, is_fee);
 
         #[cfg(feature = "liquid")]
         let pegout = PegoutValue::from_txout(txout, config.network_type, config.parent_network);
@@ -377,6 +354,34 @@ impl TxOutValue {
             #[cfg(feature = "liquid")]
             pegout,
         }
+    }
+}
+
+fn script_type(script: &Script, is_fee: bool) -> &'static str {
+    // OP_RETURN has a dedicated API type and must precede the broader
+    // provably-unspendable check.
+    if is_fee {
+        "fee"
+    } else if script.is_empty() {
+        "empty"
+    } else if script.is_op_return() {
+        "op_return"
+    } else if script.is_p2pk() {
+        "p2pk"
+    } else if script.is_p2pkh() {
+        "p2pkh"
+    } else if script.is_p2sh() {
+        "p2sh"
+    } else if script.is_p2wpkh() {
+        "v0_p2wpkh"
+    } else if script.is_p2wsh() {
+        "v0_p2wsh"
+    } else if script.is_p2tr() {
+        "v1_p2tr"
+    } else if script.is_provably_unspendable_() {
+        "provably_unspendable"
+    } else {
+        "unknown"
     }
 }
 
@@ -1621,8 +1626,12 @@ impl From<address::AddressError> for HttpError {
 
 #[cfg(test)]
 mod tests {
-    use crate::rest::{is_block_template_request, HttpError};
-    use crate::{errors, errors::ErrorKind};
+    use crate::{
+        chain::Script,
+        errors,
+        errors::ErrorKind,
+        rest::{is_block_template_request, script_type, HttpError},
+    };
     use http_body_util::BodyExt;
     use hyper::{Method, StatusCode};
     use serde_json::Value;
@@ -1737,6 +1746,25 @@ mod tests {
             .ok_or(HttpError::from("notexist absent or not a u64".to_string()));
 
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_script_type_unspendable_classification() {
+        let op_return = Script::from(vec![0x6a]);
+        assert_eq!(script_type(&op_return, false), "op_return");
+
+        #[cfg(not(feature = "liquid"))]
+        let provably_unspendable = Script::from(vec![0x50]); // OP_RESERVED
+        #[cfg(feature = "liquid")]
+        let provably_unspendable = Script::from(vec![0x51; 10_001]);
+        assert_eq!(
+            script_type(&provably_unspendable, false),
+            "provably_unspendable"
+        );
+
+        // OP_TRUE is spendable but does not match a recognized output type.
+        let unknown = Script::from(vec![0x51]);
+        assert_eq!(script_type(&unknown, false), "unknown");
     }
 
     #[test]

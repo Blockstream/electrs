@@ -10,7 +10,7 @@ pub use self::block::{
     BlockHeaderMeta, BlockId, BlockMeta, BlockStatus, HeaderEntry, HeaderList, DEFAULT_BLOCKHASH,
 };
 pub use self::fees::get_tx_fee;
-pub use self::script::{get_innerscripts, ScriptToAddr, ScriptToAsm};
+pub use self::script::{get_innerscripts, IsProvablyUnspendable, ScriptToAddr, ScriptToAsm};
 pub use self::transaction::{
     extract_tx_prevouts, get_prev_outpoints, has_prevout, is_coinbase, is_spendable,
     serialize_outpoint, TransactionStatus, TxInput,

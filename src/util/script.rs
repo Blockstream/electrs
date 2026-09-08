@@ -11,6 +11,37 @@ pub struct InnerScripts {
     pub witness_script: Option<Script>,
 }
 
+pub trait IsProvablyUnspendable {
+    fn is_provably_unspendable_(&self) -> bool;
+}
+
+#[cfg(not(feature = "liquid"))]
+impl IsProvablyUnspendable for bitcoin::Script {
+    // Keep the existing rust-bitcoin behavior without calling its deprecated API.
+    fn is_provably_unspendable_(&self) -> bool {
+        use bitcoin::blockdata::opcodes::{
+            Class::{IllegalOp, ReturnOp},
+            ClassifyContext, Opcode,
+        };
+
+        match self.as_bytes().first() {
+            Some(byte) => {
+                let class = Opcode::from(*byte).classify(ClassifyContext::Legacy);
+                class == ReturnOp || class == IllegalOp
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(feature = "liquid")]
+impl IsProvablyUnspendable for elements::Script {
+    #[inline(always)]
+    fn is_provably_unspendable_(&self) -> bool {
+        self.is_provably_unspendable()
+    }
+}
+
 pub trait ScriptToAsm: std::fmt::Debug {
     fn to_asm(&self) -> String {
         let asm = format!("{:?}", self);
