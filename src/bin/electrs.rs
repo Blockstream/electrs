@@ -114,10 +114,8 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         Arc::clone(&config),
     )));
 
-    // Mempool syncing is aborted whenever the chain tip moves, so index the new block(s)
-    // and try again. An update that cannot advance the tip never will here, so start up
-    // on the prefix that is indexed rather than spin with no listeners bound - the main
-    // loop below keeps retrying the outstanding blocks every 5 seconds.
+    // A mempool update is retried whenever the tip moves, so index and try again. An update
+    // that cannot advance the tip never will here, and no listener is bound yet.
     while !Mempool::update(&mempool, &daemon, &tip)? {
         let new_tip = indexer.update(&daemon)?;
         if new_tip == tip {
