@@ -1305,14 +1305,21 @@ impl Daemon {
                        || err_msg.contains("Block not available")
                     {
                         // There is a small chance the node returns the header but didn't finish to index the block
-                        log::warn!("getblocks failing with: {e:?} trying {attempts} more time")
+                        if attempts == 0 {
+                            bail!(
+                                "failed to get blocks from bitcoind attempts='0' err='{}'",
+                                err_msg
+                            );
+                        }
+                        log::warn!(
+                            "getblocks failed, retrying err='{}' attempts_left='{}'",
+                            err_msg,
+                            attempts
+                        );
                     } else {
                         bail!("failed to get blocks from bitcoind err='{}'", err_msg);
                     }
                 }
-            }
-            if attempts == 0 {
-                bail!("failed to get blocks from bitcoind attempts='0'");
             }
             std::thread::sleep(RETRY_WAIT_DURATION);
         };
@@ -1489,26 +1496,23 @@ impl Daemon {
 
     #[trace]
     fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
-        const MAX_TIP_HEIGHT: u64 = 100_000_000;
+        const CHUNK_SIZE: usize = 100_000;
 
         let info: Value = self.request("getblockheader", json!([tip]))?;
         let tip_height = info
             .get("height")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| format!("bitcoind returned malformed getblockheader info='{:?}'", info))?
-            as u64;
-        if tip_height > MAX_TIP_HEIGHT {
-            bail!(
-                "bitcoind returned implausible tip_height='{}' cap='{}'",
-                tip_height,
-                MAX_TIP_HEIGHT
-            );
-        }
-        let tip_height = tip_height as usize;
-        let all_heights: Vec<usize> = (0..=tip_height).collect();
-        let chunk_size = 100_000;
+            .ok_or_else(|| format!("bitcoind returned malformed getblockheader info='{:?}'", info))?;
+        let tip_height = usize::try_from(tip_height).map_err(|_| {
+            format!("bitcoind returned out-of-range tip_height='{tip_height}'")
+        })?;
+
+        // Materialise one chunk of heights at a time, rather than every height up front,
+        // so the allocation stays bounded regardless of the height bitcoind reports.
         let mut result = vec![];
-        for heights in all_heights.chunks(chunk_size) {
+        for start in (0..=tip_height).step_by(CHUNK_SIZE) {
+            let end = start.saturating_add(CHUNK_SIZE - 1).min(tip_height);
+            let heights: Vec<usize> = (start..=end).collect();
             let headers = self.getblockheaders(&heights)?;
             if headers.len() != heights.len() {
                 bail!(
