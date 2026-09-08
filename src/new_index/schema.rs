@@ -142,6 +142,55 @@ impl Store {
     pub fn done_initial_sync(&self) -> bool {
         self.txstore_db.get(b"t").is_some()
     }
+
+    // Headers that need any work: either not yet added to txstore or not yet indexed to history.
+    fn headers_to_process(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
+        let added = self.added_blockhashes.read().unwrap();
+        let indexed = self.indexed_blockhashes.read().unwrap();
+        new_headers
+            .iter()
+            .filter(|e| !added.contains(e.hash()) || !indexed.contains(e.hash()))
+            .cloned()
+            .collect()
+    }
+
+    // The contiguous prefix of `new_headers` that was both added and indexed. Blocks
+    // after the first gap stay outstanding, for the next index update to re-request.
+    fn completed_header_prefix(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
+        let added = self.added_blockhashes.read().unwrap();
+        let indexed = self.indexed_blockhashes.read().unwrap();
+        let len = completed_prefix_len(new_headers, |e| {
+            added.contains(e.hash()) && indexed.contains(e.hash())
+        });
+        new_headers[..len].to_vec()
+    }
+
+    // Append the completed prefix to the in-memory HeaderList and persist the resulting
+    // tip under `t`. Errors on an empty index rather than returning the all-zeroes hash
+    // that `HeaderList::tip()` yields there, which reads as a real tip to the caller.
+    fn advance_synced_tip(&self, completed_headers: Vec<HeaderEntry>) -> Result<BlockHash> {
+        let mut headers = self.indexed_headers.write().unwrap();
+        headers.append(completed_headers);
+        if headers.is_empty() {
+            bail!("no blocks were indexed, the index is still empty");
+        }
+        let synced_tip = *headers.tip();
+        debug!("updating synced tip to synced_tip='{}'", synced_tip);
+        self.txstore_db.put_sync(b"t", &serialize(&synced_tip));
+        Ok(synced_tip)
+    }
+
+    #[cfg(test)]
+    fn open_test(path: &std::path::Path) -> Self {
+        Store {
+            txstore_db: DB::open_test(&path.join("txstore")),
+            history_db: DB::open_test(&path.join("history")),
+            cache_db: DB::open_test(&path.join("cache")),
+            added_blockhashes: RwLock::new(HashSet::new()),
+            indexed_blockhashes: RwLock::new(HashSet::new()),
+            indexed_headers: RwLock::new(HeaderList::empty()),
+        }
+    }
 }
 
 type UtxoMap = HashMap<OutPoint, (BlockId, Value)>;
@@ -273,26 +322,6 @@ impl Indexer {
         self.duration.with_label_values(&[name]).start_timer()
     }
 
-    // Headers that need any work: either not yet added to txstore or not yet indexed to history.
-    fn headers_to_process(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
-        let added = self.store.added_blockhashes.read().unwrap();
-        let indexed = self.store.indexed_blockhashes.read().unwrap();
-        new_headers
-            .iter()
-            .filter(|e| !added.contains(e.hash()) || !indexed.contains(e.hash()))
-            .cloned()
-            .collect()
-    }
-
-    fn completed_header_prefix(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
-        let added = self.store.added_blockhashes.read().unwrap();
-        let indexed = self.store.indexed_blockhashes.read().unwrap();
-        let len = completed_prefix_len(new_headers, |e| {
-            added.contains(e.hash()) && indexed.contains(e.hash())
-        });
-        new_headers[..len].to_vec()
-    }
-
     fn start_auto_compactions(&self, db: &DB) {
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
@@ -391,7 +420,7 @@ impl Indexer {
         // Crash safety: added_blockhashes / indexed_blockhashes are persisted via the
         // "D" done-marker rows. On restart, headers_to_process() re-derives which
         // blocks still need work, so partially-processed batches are re-processed safely.
-        let to_process = self.headers_to_process(&new_headers);
+        let to_process = self.store.headers_to_process(&new_headers);
         debug!(
             "processing {} blocks (add + index) using {:?}",
             to_process.len(),
@@ -470,7 +499,7 @@ impl Indexer {
             );
         }
 
-        let completed_headers = self.completed_header_prefix(&new_headers);
+        let completed_headers = self.store.completed_header_prefix(&new_headers);
         if fetch_result.is_ok() && completed_headers.len() != new_headers.len() {
             bail!(
                 "block fetch completed without indexing all headers: completed={} requested={}",
@@ -507,26 +536,19 @@ impl Indexer {
 
         // Finally, append the completed headers to the in-memory HeaderList.
         // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
-        let mut headers = self.store.indexed_headers.write().unwrap();
-        headers.append(completed_headers);
-        let synced_tip = *headers.tip();
+        // Done only once all the db writes above are flushed.
+        let synced_tip = self.store.advance_synced_tip(completed_headers)?;
 
-        // Update the synced tip only after all db writes are flushed and only as far
-        // as the contiguous prefix that was both added and indexed.
-        debug!("updating synced tip to {:?}", synced_tip);
-        if !headers.is_empty() {
-            self.store
-                .txstore_db
-                .put_sync(b"t", &serialize(&synced_tip));
+        if fetch_result.is_ok() && synced_tip != tip {
+            bail!(
+                "synced tip does not match the daemon tip after a complete fetch daemon_tip='{}' synced_tip='{}'",
+                tip,
+                synced_tip
+            );
         }
 
-        if fetch_result.is_ok() {
-            assert_eq!(tip, synced_tip);
-        }
-
-        if !headers.is_empty() {
-            self.tip_metric.set(headers.best_height() as i64);
-        }
+        self.tip_metric
+            .set(self.store.headers().best_height() as i64);
 
         Ok(synced_tip)
     }
@@ -2056,6 +2078,150 @@ mod tests {
     fn test_completed_prefix_stops_at_first_gap() {
         let items = [true, true, false, true];
         assert_eq!(completed_prefix_len(&items, |complete| *complete), 2);
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    fn test_header(prev_blockhash: BlockHash) -> BlockHeader {
+        BlockHeader {
+            version: bitcoin::block::Version::ONE,
+            prev_blockhash,
+            merkle_root: crate::chain::TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        }
+    }
+
+    #[cfg(feature = "liquid")]
+    fn test_header(prev_blockhash: BlockHash) -> BlockHeader {
+        BlockHeader {
+            version: 1,
+            prev_blockhash,
+            merkle_root: crate::chain::TxMerkleNode::all_zeros(),
+            time: 0,
+            height: 0,
+            ext: elements::BlockExtData::Proof {
+                challenge: Script::new(),
+                solution: Script::new(),
+            },
+        }
+    }
+
+    /// A chain of `count` linked headers starting at height 0.
+    fn test_chain(count: usize) -> Vec<HeaderEntry> {
+        let mut prev = *crate::util::DEFAULT_BLOCKHASH;
+        (0..count)
+            .map(|height| {
+                let header = test_header(prev);
+                prev = header.block_hash();
+                HeaderEntry::new(height, prev, header)
+            })
+            .collect()
+    }
+
+    /// Mark a block as both added to txstore and indexed to history.
+    fn mark_complete(store: &Store, entry: &HeaderEntry) {
+        store
+            .added_blockhashes
+            .write()
+            .unwrap()
+            .insert(*entry.hash());
+        store
+            .indexed_blockhashes
+            .write()
+            .unwrap()
+            .insert(*entry.hash());
+    }
+
+    fn persisted_tip(store: &Store) -> Option<BlockHash> {
+        store
+            .txstore_db
+            .get(b"t")
+            .map(|raw| deserialize(&raw).unwrap())
+    }
+
+    #[test]
+    fn test_synced_tip_stops_at_the_first_unindexed_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_test(dir.path());
+        let headers = test_chain(4);
+
+        // Heights 0, 1 and 3 completed; height 2 was lost to a failed fetch. The tip
+        // must stop at height 1, not run on to the completed block above the gap.
+        mark_complete(&store, &headers[0]);
+        mark_complete(&store, &headers[1]);
+        mark_complete(&store, &headers[3]);
+
+        let completed = store.completed_header_prefix(&headers);
+        assert_eq!(completed.len(), 2);
+
+        let synced_tip = store.advance_synced_tip(completed).unwrap();
+        assert_eq!(synced_tip, *headers[1].hash());
+        assert_eq!(persisted_tip(&store), Some(*headers[1].hash()));
+        assert_eq!(store.headers().len(), 2);
+
+        // Only the block that actually failed is outstanding. Height 3 is already in the
+        // db and merely needs the gap below it filled before it can be appended.
+        let outstanding = store.headers_to_process(&headers);
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].height(), 2);
+
+        // Once the refetch of height 2 lands, the next update carries the tip past the gap.
+        mark_complete(&store, &headers[2]);
+        let completed = store.completed_header_prefix(&headers[2..]);
+        assert_eq!(completed.len(), 2);
+
+        let synced_tip = store.advance_synced_tip(completed).unwrap();
+        assert_eq!(synced_tip, *headers[3].hash());
+        assert_eq!(persisted_tip(&store), Some(*headers[3].hash()));
+    }
+
+    #[test]
+    fn test_completed_prefix_requires_both_added_and_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_test(dir.path());
+        let headers = test_chain(2);
+
+        // Added to txstore but never indexed to history.
+        store
+            .added_blockhashes
+            .write()
+            .unwrap()
+            .insert(*headers[0].hash());
+
+        assert!(store.completed_header_prefix(&headers).is_empty());
+    }
+
+    #[test]
+    fn test_advance_synced_tip_errs_when_nothing_was_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_test(dir.path());
+
+        // Every block of the first batch failed to fetch, so the prefix is empty and
+        // there is no tip to report. `HeaderList::tip()` would hand back the all-zeroes
+        // default hash here, which reads as a successful sync to the caller.
+        assert!(store.advance_synced_tip(vec![]).is_err());
+        assert_eq!(persisted_tip(&store), None);
+    }
+
+    #[test]
+    fn test_advance_synced_tip_keeps_the_existing_tip_when_nothing_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_test(dir.path());
+        let headers = test_chain(3);
+
+        for entry in &headers[..2] {
+            mark_complete(&store, entry);
+        }
+        store
+            .advance_synced_tip(store.completed_header_prefix(&headers))
+            .unwrap();
+
+        // A later update whose very first block fails to fetch must hold the tip where
+        // it is, not error out on an index that already has blocks in it.
+        let synced_tip = store.advance_synced_tip(vec![]).unwrap();
+        assert_eq!(synced_tip, *headers[1].hash());
+        assert_eq!(persisted_tip(&store), Some(*headers[1].hash()));
     }
 
     #[test]
