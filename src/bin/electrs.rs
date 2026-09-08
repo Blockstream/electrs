@@ -92,7 +92,15 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     );
     info!("starting initial sync");
     let mut tip = indexer.update(&daemon)?;
-    info!("initial sync complete, tip at {}", tip);
+    let daemon_tip = daemon.getbestblockhash()?;
+    if tip == daemon_tip {
+        info!("initial sync complete, tip at {}", tip);
+    } else {
+        info!(
+            "initial sync incomplete, serving a partial index and retrying outstanding blocks in the background tip='{}' daemon_tip='{}'",
+            tip, daemon_tip
+        );
+    }
 
     let chain = Arc::new(ChainQuery::new(
         Arc::clone(&store),
