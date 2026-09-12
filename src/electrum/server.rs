@@ -585,11 +585,7 @@ impl Connection {
 
     #[trace(method = %method)]
     fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
-        let timer = self
-            .stats
-            .latency
-            .with_label_values(&[method])
-            .start_timer();
+        let started = Instant::now();
 
         let result = match method {
             "blockchain.block.header" => self.blockchain_block_header(&params),
@@ -626,7 +622,11 @@ impl Connection {
             "server.add_peer" => self.server_add_peer(&params),
 
             &_ => {
-                warn!("rpc #{} unknown method {} {:?}", id, method, params);
+                debug!("rpc #{} unknown method {} {:?}", id, method, params);
+                self.stats
+                    .latency
+                    .with_label_values(&["unknown"])
+                    .observe(started.elapsed().as_secs_f64());
                 return Ok(json_rpc_error(
                     format!("unknown method {}", method),
                     Some(id),
@@ -634,7 +634,12 @@ impl Connection {
                 ));
             }
         };
-        timer.observe_duration();
+
+        self.stats
+            .latency
+            .with_label_values(&[method])
+            .observe(started.elapsed().as_secs_f64());
+
         Ok(match result {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err(e) => {
