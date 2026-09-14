@@ -33,6 +33,11 @@ error_chain! {
             display("Too many unspent outputs")
         }
 
+        TooBigHistory {
+            description("Scripthash history too large to scan")
+            display("Scripthash history too large to scan")
+        }
+
         TooManySubscriptions(limit: usize) {
             description("Too many subscriptions")
             display("Too many subscriptions on this connection (limit: {})", limit)

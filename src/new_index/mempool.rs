@@ -179,14 +179,18 @@ impl Mempool {
     }
 
     #[trace]
-    pub fn utxo(&self, scripthash: &[u8]) -> Vec<Utxo> {
+    pub fn utxo(&self, scripthash: &[u8]) -> Result<Vec<Utxo>> {
         let _timer = self.latency.with_label_values(&["utxo"]).start_timer();
         let entries = match self.history.get(scripthash) {
-            None => return vec![],
+            None => return Ok(vec![]),
             Some(entries) => entries,
         };
+        ensure!(
+            entries.len() <= self.config.utxos_limit,
+            ErrorKind::TooManyUtxos
+        );
 
-        entries
+        Ok(entries
             .iter()
             .filter_map(|entry| match entry {
                 TxHistoryInfo::Funding(info) => {
@@ -218,20 +222,24 @@ impl Mempool {
                 | TxHistoryInfo::Pegout(_) => unreachable!(),
             })
             .filter(|utxo| !self.has_spend(&OutPoint::from(utxo)))
-            .collect()
+            .collect())
     }
 
     #[trace]
     // @XXX avoid code duplication with ChainQuery::stats()?
-    pub fn stats(&self, scripthash: &[u8]) -> ScriptStats {
+    pub fn stats(&self, scripthash: &[u8]) -> Result<ScriptStats> {
         let _timer = self.latency.with_label_values(&["stats"]).start_timer();
         let mut stats = ScriptStats::default();
         let mut seen_txids = HashSet::new();
 
         let entries = match self.history.get(scripthash) {
-            None => return stats,
+            None => return Ok(stats),
             Some(entries) => entries,
         };
+        ensure!(
+            entries.len() <= self.config.utxos_limit,
+            ErrorKind::TooBigHistory
+        );
 
         for entry in entries {
             if seen_txids.insert(entry.get_txid()) {
@@ -268,7 +276,7 @@ impl Mempool {
             };
         }
 
-        stats
+        Ok(stats)
     }
 
     #[trace]

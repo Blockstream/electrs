@@ -32,7 +32,7 @@ pub fn precache(chain: &ChainQuery, scripthashes: Vec<FullHash>) {
                 if i % 5 == 0 {
                     info!("running pre-cache for scripthash {}/{}", i + 1, total);
                 }
-                chain.stats(&scripthash[..]);
+                let _ = chain.stats(&scripthash[..]);
                 //chain.utxo(&scripthash[..]);
             })
     });

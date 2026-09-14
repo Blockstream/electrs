@@ -108,6 +108,7 @@ fn jsonrpc_code(e: &Error) -> JsonRpcV2Error {
         ErrorKind::InvalidParams(_) => JsonRpcV2Error::InvalidParams,
         ErrorKind::TooPopular
         | ErrorKind::TooManyUtxos
+        | ErrorKind::TooBigHistory
         | ErrorKind::TooManySubscriptions(_) => JsonRpcV2Error::BadRequest,
         // The daemon could not be reached (or we refused to queue for it) for a request
         // made on the client's behalf. This is a downstream failure, not a client error.
@@ -415,7 +416,7 @@ impl Connection {
     #[cfg(not(feature = "liquid"))]
     fn blockchain_scripthash_get_balance(&self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.get(0))?;
-        let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..]);
+        let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..])?;
 
         Ok(json!({
             "confirmed": chain_stats.funded_txo_sum - chain_stats.spent_txo_sum,

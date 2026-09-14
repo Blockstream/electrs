@@ -125,7 +125,11 @@ impl Query {
         let mut utxos = self.chain.utxo(scripthash, self.config.utxos_limit)?;
         let mempool = self.mempool();
         utxos.retain(|utxo| !mempool.has_spend(&OutPoint::from(utxo)));
-        utxos.extend(mempool.utxo(scripthash));
+        utxos.extend(mempool.utxo(scripthash)?);
+        ensure!(
+            utxos.len() <= self.config.utxos_limit,
+            ErrorKind::TooManyUtxos
+        );
         Ok(utxos)
     }
 
@@ -144,11 +148,11 @@ impl Query {
         confirmed_txids.chain(mempool_txids).collect()
     }
 
-    pub fn stats(&self, scripthash: &[u8]) -> (ScriptStats, ScriptStats) {
-        (
-            self.chain.stats(scripthash),
-            self.mempool().stats(scripthash),
-        )
+    pub fn stats(&self, scripthash: &[u8]) -> Result<(ScriptStats, ScriptStats)> {
+        Ok((
+            self.chain.stats(scripthash)?,
+            self.mempool().stats(scripthash)?,
+        ))
     }
 
     #[trace]

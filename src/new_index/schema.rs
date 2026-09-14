@@ -292,6 +292,7 @@ pub struct ChainQuery {
     light_mode: bool,
     duration: HistogramVec,
     network: Network,
+    history_scan_limit: usize,
 }
 
 // TODO: &[Block] should be an iterator / a queue.
@@ -634,6 +635,7 @@ impl ChainQuery {
             daemon,
             light_mode: config.light_mode,
             network: config.network_type,
+            history_scan_limit: config.history_scan_limit,
             duration: metrics.histogram_vec(
                 HistogramOpts::new("query_duration", "Index query duration (in seconds)"),
                 &["name"],
@@ -884,12 +886,12 @@ impl ChainQuery {
         let had_cache = cache.is_some();
 
         // update utxo set with new transactions since
-        let (newutxos, lastblock, processed_items) = cache.map_or_else(
-            || self.utxo_delta(scripthash, HashMap::new(), 0, limit),
-            |(oldutxos, blockheight)| self.utxo_delta(scripthash, oldutxos, blockheight + 1, limit),
-        )?;
+        let (newutxos, lastblock, processed_items, hit_scan_limit) = cache.map_or_else(
+            || self.utxo_delta(scripthash, HashMap::new(), 0),
+            |(oldutxos, blockheight)| self.utxo_delta(scripthash, oldutxos, blockheight + 1),
+        );
 
-        // save updated utxo set to cache
+        // save updated utxo set to cache, even if we bail out below
         if let Some(lastblock) = lastblock {
             if had_cache || processed_items > MIN_HISTORY_ITEMS_TO_CACHE {
                 self.store.cache_db.write_rows(
@@ -897,6 +899,15 @@ impl ChainQuery {
                     DBFlush::Enable,
                 );
             }
+        }
+
+        if hit_scan_limit {
+            bail!(ErrorKind::TooBigHistory)
+        }
+
+        // check against the final resolved set, not against any point in time during the replay
+        if newutxos.len() > limit {
+            bail!(ErrorKind::TooManyUtxos)
         }
 
         // format as Utxo objects
@@ -931,8 +942,7 @@ impl ChainQuery {
         scripthash: &[u8],
         init_utxos: UtxoMap,
         start_height: usize,
-        limit: usize,
-    ) -> Result<(UtxoMap, Option<BlockHash>, usize)> {
+    ) -> (UtxoMap, Option<BlockHash>, usize, bool) {
         let _timer = self.start_timer("utxo_delta");
         let headers = self.store.indexed_headers.read().unwrap();
         let history_iter = self
@@ -947,9 +957,22 @@ impl ChainQuery {
         let mut utxos = init_utxos;
         let mut processed_items = 0;
         let mut lastblock = None;
+        // the last height we're sure is fully scanned: all of its rows for this scripthash
+        // are guaranteed to be contiguous (rows are ordered by height), so it's only safe
+        // once we've seen a row belonging to the height that follows it
+        let mut safe_lastblock = None;
+        let mut hit_scan_limit = false;
 
         for (history, blockid) in history_iter {
+            if processed_items >= self.history_scan_limit {
+                hit_scan_limit = true;
+                break;
+            }
             processed_items += 1;
+
+            if lastblock.is_some_and(|hash| hash != blockid.hash) {
+                safe_lastblock = lastblock;
+            }
             lastblock = Some(blockid.hash);
 
             match history.key.txinfo {
@@ -963,17 +986,18 @@ impl ChainQuery {
                 | TxHistoryInfo::Pegin(_)
                 | TxHistoryInfo::Pegout(_) => unreachable!(),
             };
-
-            // abort if the utxo set size excedees the limit at any point in time
-            if utxos.len() > limit {
-                bail!(ErrorKind::TooManyUtxos)
-            }
         }
 
-        Ok((utxos, lastblock, processed_items))
+        // the scan ran to completion (not cut off by the cap): the last height seen is
+        // fully in too, since there's nothing left in the iterator for this scripthash
+        if !hit_scan_limit {
+            safe_lastblock = lastblock;
+        }
+
+        (utxos, safe_lastblock, processed_items, hit_scan_limit)
     }
 
-    pub fn stats(&self, scripthash: &[u8]) -> ScriptStats {
+    pub fn stats(&self, scripthash: &[u8]) -> Result<ScriptStats> {
         let _timer = self.start_timer("stats");
 
         // get the last known stats and the blockhash they are updated for.
@@ -989,12 +1013,12 @@ impl ChainQuery {
             });
 
         // update stats with new transactions since
-        let (newstats, lastblock) = cache.map_or_else(
+        let (newstats, lastblock, hit_scan_limit) = cache.map_or_else(
             || self.stats_delta(scripthash, ScriptStats::default(), 0),
             |(oldstats, blockheight)| self.stats_delta(scripthash, oldstats, blockheight + 1),
         );
 
-        // save updated stats to cache
+        // save updated stats to cache, even if we bail out below
         if let Some(lastblock) = lastblock {
             if newstats.funded_txo_count + newstats.spent_txo_count > MIN_HISTORY_ITEMS_TO_CACHE {
                 self.store.cache_db.write_rows(
@@ -1004,7 +1028,11 @@ impl ChainQuery {
             }
         }
 
-        newstats
+        if hit_scan_limit {
+            bail!(ErrorKind::TooBigHistory)
+        }
+
+        Ok(newstats)
     }
 
     fn stats_delta(
@@ -1012,7 +1040,7 @@ impl ChainQuery {
         scripthash: &[u8],
         init_stats: ScriptStats,
         start_height: usize,
-    ) -> (ScriptStats, Option<BlockHash>) {
+    ) -> (ScriptStats, Option<BlockHash>, bool) {
         let _timer = self.start_timer("stats_delta"); // TODO: measure also the number of txns processed.
         let headers = self.store.indexed_headers.read().unwrap();
         let history_iter = self
@@ -1027,9 +1055,20 @@ impl ChainQuery {
         let mut stats = init_stats;
         let mut seen_txids = HashSet::new();
         let mut lastblock = None;
+        // the last height we're sure is fully scanned; see utxo_delta for why
+        let mut safe_lastblock = None;
+        let mut processed_items = 0;
+        let mut hit_scan_limit = false;
 
         for (history, blockid) in history_iter {
+            if processed_items >= self.history_scan_limit {
+                hit_scan_limit = true;
+                break;
+            }
+            processed_items += 1;
+
             if lastblock != Some(blockid.hash) {
+                safe_lastblock = lastblock;
                 seen_txids.clear();
             }
 
@@ -1070,7 +1109,13 @@ impl ChainQuery {
             lastblock = Some(blockid.hash);
         }
 
-        (stats, lastblock)
+        // the scan ran to completion (not cut off by the cap): the last height seen is
+        // fully in too, since there's nothing left in the iterator for this scripthash
+        if !hit_scan_limit {
+            safe_lastblock = lastblock;
+        }
+
+        (stats, safe_lastblock, hit_scan_limit)
     }
 
     pub fn address_search(&self, prefix: &str, limit: usize) -> Vec<String> {
