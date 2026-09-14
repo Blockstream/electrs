@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::chain::{Network, OutPoint, Transaction, TxOut, Txid};
@@ -260,10 +260,11 @@ impl Query {
 
     #[trace]
     fn refresh_fee_estimates_if_stale(&self) {
-        let _guard = self
-            .estimates_refresh
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = match self.estimates_refresh.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
         if let (_, Some(cache_time)) = *self.cached_estimates.read().unwrap() {
             if cache_time.elapsed() < Duration::from_secs(FEE_ESTIMATES_TTL) {
                 return;
