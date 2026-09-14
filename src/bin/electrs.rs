@@ -60,9 +60,6 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     info!("starting electrs");
 
     if let Some(zmq_addr) = config.zmq_addr.as_ref() {
-        // Block notifications only save the main loop from waiting out its poll
-        // interval, so a subscriber that will not start is worth an error but not
-        // an exit - we keep serving, just without the early wake-ups.
         if let Err(e) = zmq::start(&format!("tcp://{zmq_addr}"), &block_hash_notify, &metrics) {
             error!(
                 "ZMQ notifications disabled, falling back to polling: zmq_addr='{}' err='{}'",
