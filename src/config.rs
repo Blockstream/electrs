@@ -79,6 +79,7 @@ pub struct Config {
     pub electrum_txs_limit: usize,
     pub electrum_subscription_limit: usize,
     pub electrum_checkpoint_proof_concurrency_limit: usize,
+    pub electrum_checkpoint_merkle_cache_mb: usize,
     pub electrum_banner: String,
     pub rpc_logging: RpcLogging,
     pub zmq_addr: Option<SocketAddr>,
@@ -343,8 +344,13 @@ impl Config {
             ).arg(
                 Arg::with_name("electrum_checkpoint_proof_concurrency_limit")
                     .long("electrum-checkpoint-proof-concurrency-limit")
-                    .help("Maximum number of blockchain.block.header(s) checkpoint Merkle proof builds (triggered by a non-zero cp_height) allowed to run at once, process-wide. Each build hashes every header from genesis up to cp_height, so an unbounded count lets concurrent cheap requests pin every CPU core. Requests past the cap fail immediately rather than queueing. 0 = reject all such requests.")
-                    .default_value("2")
+                    .help("Maximum number of blockchain.block.header(s) checkpoint Merkle proof tree rebuilds (a non-zero cp_height not already cached) allowed to run at once, process-wide. Rebuilds past the cap fail immediately rather than queueing. Cached lookups (the common case once a cp_height has been served once) are never subject to this limit. Default: half the detected CPU cores (min 1). 0 = reject all rebuilds.")
+                    .takes_value(true)
+            ).arg(
+                Arg::with_name("electrum_checkpoint_merkle_cache_mb")
+                    .long("electrum-checkpoint-merkle-cache-mb")
+                    .help("Approximate memory budget, in MB, for checkpoint Merkle proof handling: cached trees and the working memory of concurrent rebuilds share this one budget (independently of electrum-checkpoint-proof-concurrency-limit, so a high core count can no longer multiply memory use past it). It is a soft target based on an estimate, not a hard ceiling. Entry size scales with cp_height (up to ~28MB near the chain tip). A cp_height too large to ever fit is served without being cached.")
+                    .default_value("256")
                     .takes_value(true)
             ).arg(
                 Arg::with_name("electrum_banner")
@@ -691,9 +697,21 @@ impl Config {
             electrum_rpc_global_response_budget_bytes,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_subscription_limit: value_t_or_exit!(m, "electrum_subscription_limit", usize),
-            electrum_checkpoint_proof_concurrency_limit: value_t_or_exit!(
+            electrum_checkpoint_proof_concurrency_limit: match m
+                .value_of("electrum_checkpoint_proof_concurrency_limit")
+            {
+                Some(v) => v.parse::<usize>().unwrap_or_else(|_| {
+                    clap::Error::value_validation_auto(format!(
+                        "The argument '{}' isn't a valid value",
+                        v
+                    ))
+                    .exit()
+                }),
+                None => (num_cpus::get() / 2).max(1),
+            },
+            electrum_checkpoint_merkle_cache_mb: value_t_or_exit!(
                 m,
-                "electrum_checkpoint_proof_concurrency_limit",
+                "electrum_checkpoint_merkle_cache_mb",
                 usize
             ),
             electrum_banner,

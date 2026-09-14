@@ -661,6 +661,7 @@ mod tests {
             electrum_txs_limit: 100,
             electrum_subscription_limit: 10_000,
             electrum_checkpoint_proof_concurrency_limit: 2,
+            electrum_checkpoint_merkle_cache_mb: 256,
             electrum_banner: String::new(),
             rpc_logging: RpcLogging::default(),
             zmq_addr: None,

@@ -27,8 +27,8 @@ use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricOpts, Metrics};
 use crate::util::{
-    bincode, full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta,
-    BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
+    bincode, electrum_merkle::CheckpointMerkleCache, full_hash, has_prevout, is_spendable,
+    BlockHeaderMeta, BlockId, BlockMeta, BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
 };
 
 use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
@@ -293,6 +293,7 @@ pub struct ChainQuery {
     duration: HistogramVec,
     network: Network,
     history_scan_limit: usize,
+    checkpoint_merkle_cache: CheckpointMerkleCache,
 }
 
 // TODO: &[Block] should be an iterator / a queue.
@@ -640,6 +641,11 @@ impl ChainQuery {
                 HistogramOpts::new("query_duration", "Index query duration (in seconds)"),
                 &["name"],
             ),
+            checkpoint_merkle_cache: CheckpointMerkleCache::new(
+                config
+                    .electrum_checkpoint_merkle_cache_mb
+                    .saturating_mul(1024 * 1024),
+            ),
         }
     }
 
@@ -649,6 +655,10 @@ impl ChainQuery {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn checkpoint_merkle_cache(&self) -> &CheckpointMerkleCache {
+        &self.checkpoint_merkle_cache
     }
 
     fn start_timer(&self, name: &str) -> HistogramTimer {

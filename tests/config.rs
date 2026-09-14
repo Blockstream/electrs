@@ -80,3 +80,35 @@ fn startup_debug_log_identifies_cookie_file() {
         stderr
     );
 }
+
+#[test]
+fn checkpoint_proof_concurrency_limit_defaults_to_half_the_cpu_cores() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output = run_electrs(temp_dir.path(), &["-vv"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    let expected = (num_cpus::get() / 2).max(1);
+    let needle = format!("electrum_checkpoint_proof_concurrency_limit: {}", expected);
+    assert!(
+        stderr.contains(&needle),
+        "expected '{}' in stderr, got: {}",
+        needle,
+        stderr
+    );
+}
+
+#[test]
+fn checkpoint_proof_concurrency_limit_can_be_overridden() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output = run_electrs(
+        temp_dir.path(),
+        &["-vv", "--electrum-checkpoint-proof-concurrency-limit", "7"],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(
+        stderr.contains("electrum_checkpoint_proof_concurrency_limit: 7"),
+        "explicit override was not honored, stderr: {}",
+        stderr
+    );
+}
