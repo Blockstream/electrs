@@ -15,6 +15,10 @@ extern crate serde_json;
 #[macro_use]
 extern crate lazy_static;
 
+// Reuse the integration-test node fixture in private REST unit tests.
+#[cfg(test)]
+extern crate self as electrs;
+
 pub mod chain;
 pub mod config;
 pub mod daemon;
