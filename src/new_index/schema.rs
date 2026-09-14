@@ -226,7 +226,7 @@ pub struct SpendingInput {
     pub confirmed: Option<BlockId>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ScriptStats {
     pub tx_count: usize,
     pub funded_txo_count: usize,
@@ -795,7 +795,6 @@ impl ChainQuery {
         )
     }
 
-    // like history_iter_scan_reverse, but seeks directly to `height` instead of the tip
     fn history_iter_scan_reverse_from(
         &self,
         code: u8,
@@ -828,9 +827,8 @@ impl ChainQuery {
         let _timer_scan = self.start_timer("history");
         let headers = self.store.indexed_headers.read().unwrap();
 
-        // a cursor can only match a confirmed tx; resolve its height up front, or bail
         let seek_height = match last_seen_txid {
-            Some(txid) => match self.tx_confirming_block(txid) {
+            Some(txid) => match self.tx_confirming_block_with_headers(txid, &headers) {
                 Some(blockid) => Some(blockid.height),
                 None => return vec![],
             },
@@ -845,7 +843,6 @@ impl ChainQuery {
         let mut scanned = 0usize;
         let scan_limit = self.history_scan_limit;
         let history_iter = raw_iter
-            // bounds skip_while below, in case the cursor belongs to another scripthash
             .take_while(move |_| {
                 scanned += 1;
                 scanned <= scan_limit
@@ -938,7 +935,6 @@ impl ChainQuery {
             bail!(ErrorKind::TooBigHistory)
         }
 
-        // check against the final resolved set, not against any point in time during the replay
         if newutxos.len() > limit {
             bail!(ErrorKind::TooManyUtxos)
         }
@@ -990,22 +986,18 @@ impl ChainQuery {
         let mut utxos = init_utxos;
         let mut processed_items = 0;
         let mut lastblock = None;
-        // the last height we're sure is fully scanned: all of its rows for this scripthash
-        // are guaranteed to be contiguous (rows are ordered by height), so it's only safe
-        // once we've seen a row belonging to the height that follows it
         let mut safe_lastblock = None;
         let mut hit_scan_limit = false;
 
         for (history, blockid) in history_iter {
-            if processed_items >= self.history_scan_limit {
-                hit_scan_limit = true;
-                break;
-            }
-            processed_items += 1;
-
             if lastblock.is_some_and(|hash| hash != blockid.hash) {
                 safe_lastblock = lastblock;
+                if processed_items >= self.history_scan_limit {
+                    hit_scan_limit = true;
+                    break;
+                }
             }
+            processed_items += 1;
             lastblock = Some(blockid.hash);
 
             match history.key.txinfo {
@@ -1021,8 +1013,6 @@ impl ChainQuery {
             };
         }
 
-        // the scan ran to completion (not cut off by the cap): the last height seen is
-        // fully in too, since there's nothing left in the iterator for this scripthash
         if !hit_scan_limit {
             safe_lastblock = lastblock;
         }
@@ -1085,10 +1075,7 @@ impl ChainQuery {
                 Some((history, BlockId::from(header)))
             });
 
-        let mut stats = init_stats.clone();
-        // stats as of the last fully-scanned height; unlike UtxoMap these counters
-        // aren't idempotent, so a capped scan rolls back to this instead of the pointer
-        let mut committed_stats = init_stats;
+        let mut stats = init_stats;
         let mut seen_txids = HashSet::new();
         let mut lastblock = None;
         let mut safe_lastblock = None;
@@ -1096,17 +1083,15 @@ impl ChainQuery {
         let mut hit_scan_limit = false;
 
         for (history, blockid) in history_iter {
-            if processed_items >= self.history_scan_limit {
-                hit_scan_limit = true;
-                break;
-            }
-            processed_items += 1;
-
             if lastblock != Some(blockid.hash) {
-                committed_stats = stats.clone();
                 safe_lastblock = lastblock;
                 seen_txids.clear();
+                if processed_items >= self.history_scan_limit {
+                    hit_scan_limit = true;
+                    break;
+                }
             }
+            processed_items += 1;
 
             if seen_txids.insert(history.get_txid()) {
                 stats.tx_count += 1;
@@ -1145,12 +1130,7 @@ impl ChainQuery {
             lastblock = Some(blockid.hash);
         }
 
-        if hit_scan_limit {
-            // discard the not-yet-committed (possibly partial) tail height
-            stats = committed_stats;
-        } else {
-            // the scan ran to completion: the last height seen is fully in too, since
-            // there's nothing left in the iterator for this scripthash
+        if !hit_scan_limit {
             safe_lastblock = lastblock;
         }
 
@@ -1370,9 +1350,13 @@ impl ChainQuery {
 
     pub fn tx_confirming_block(&self, txid: &Txid) -> Option<BlockId> {
         let _timer = self.start_timer("tx_confirming_block");
+        let headers = self.store.indexed_headers.read().unwrap();
+        self.tx_confirming_block_with_headers(txid, &headers)
+    }
+
+    fn tx_confirming_block_with_headers(&self, txid: &Txid, headers: &HeaderList) -> Option<BlockId> {
         let row_value = self.store.history_db.get(&TxConfRow::key(txid))?;
         let height = TxConfRow::height_from_val(&row_value);
-        let headers = self.store.indexed_headers.read().unwrap();
         // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
         Some(headers.header_by_height(height as usize)?.into())
     }
