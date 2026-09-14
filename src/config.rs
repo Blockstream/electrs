@@ -72,6 +72,7 @@ pub struct Config {
     pub cors: Option<String>,
     pub precache_scripts: Option<String>,
     pub utxos_limit: usize,
+    pub history_scan_limit: usize,
     pub electrum_txs_limit: usize,
     pub electrum_subscription_limit: usize,
     pub electrum_checkpoint_proof_concurrency_limit: usize,
@@ -281,6 +282,12 @@ impl Config {
                     .long("utxos-limit")
                     .help("Maximum number of utxos to process per address. Lookups for addresses with more utxos will fail. Applies to the Electrum and HTTP APIs.")
                     .default_value("500")
+            )
+            .arg(
+                Arg::with_name("history_scan_limit")
+                    .long("history-scan-limit")
+                    .help("Maximum number of scripthash history rows scanned per utxo/stats lookup before giving up with a \"too popular\" error. Unlike --utxos-limit and --electrum-txs-limit, which cap the size of the result, this bounds the amount of work done per request regardless of the outcome.")
+                    .default_value("100000")
             )
             .arg(
                 Arg::with_name("electrum_txs_limit")
@@ -591,6 +598,7 @@ impl Config {
             daemon_conn_max_age,
             cookie,
             utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
+            history_scan_limit: value_t_or_exit!(m, "history_scan_limit", usize),
             electrum_rpc_addr,
             electrum_rpc_conn_max_age,
             electrum_rpc_max_request_num_bytes,

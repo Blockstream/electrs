@@ -114,6 +114,7 @@ impl TestRunner {
             cors: None,
             precache_scripts: None,
             utxos_limit: 100,
+            history_scan_limit: 100_000,
             electrum_txs_limit: 100,
             electrum_subscription_limit: 10_000,
             electrum_checkpoint_proof_concurrency_limit: 2,
