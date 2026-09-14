@@ -4,7 +4,7 @@ use crate::chain::{
 };
 use crate::config::Config;
 use crate::errors;
-use crate::new_index::{compute_script_hash, Query, SpendingInput, Utxo};
+use crate::new_index::{compute_script_hash, Mempool, Query, SpendingInput, Utxo};
 #[cfg(feature = "liquid")]
 use crate::util::optional_value_for_newer_blocks;
 use crate::util::{
@@ -487,6 +487,87 @@ fn ttl_by_depth(height: Option<usize>, query: &Query) -> u32 {
     })
 }
 
+// Own the mempool data needed by a response. Chain IO and response construction
+// happen after capture returns and releases the read guard.
+struct MempoolTxs {
+    txs: Vec<(Transaction, Option<BlockId>)>,
+    prevouts: HashMap<OutPoint, TxOut>,
+}
+
+impl MempoolTxs {
+    fn capture(query: &Query, select: impl FnOnce(&Mempool) -> Vec<Transaction>) -> Self {
+        let mempool = query.mempool();
+        let txs: Vec<_> = select(&mempool).into_iter().map(|tx| (tx, None)).collect();
+        let prevouts = txs
+            .iter()
+            .flat_map(|(tx, _)| &tx.input)
+            .filter(|txin| has_prevout(txin))
+            .filter_map(|txin| {
+                mempool
+                    .lookup_txo(&txin.previous_output)
+                    .map(|txout| (txin.previous_output, txout))
+            })
+            .collect();
+        Self { txs, prevouts }
+    }
+
+    fn prepare(self, query: &Query, config: &Config) -> Result<Vec<TransactionValue>, HttpError> {
+        let mut prevouts = self.prevouts;
+        prepare_txs(
+            self.txs,
+            |mut outpoints| {
+                outpoints.retain(|outpoint| !prevouts.contains_key(outpoint));
+                prevouts.extend(query.chain().lookup_txos(outpoints)?);
+                Ok(prevouts)
+            },
+            config,
+        )
+    }
+}
+
+fn prepare_history(
+    query: &Query,
+    config: &Config,
+    mempool_history: impl FnOnce(&Mempool) -> Vec<Transaction>,
+    chain_history: impl FnOnce() -> errors::Result<Vec<(Transaction, BlockId)>>,
+) -> Result<Vec<TransactionValue>, HttpError> {
+    // Read mempool first: a transaction confirmed between these reads remains
+    // in at least one result. Prefer the confirmed entry when both contain it.
+    let mut snapshot = MempoolTxs::capture(query, mempool_history);
+    let chain_txs = chain_history().map_err(HttpError::lookup)?;
+    let confirmed: BTreeSet<_> = chain_txs.iter().map(|(tx, _)| tx.compute_txid()).collect();
+    snapshot
+        .txs
+        .retain(|(tx, _)| !confirmed.contains(&tx.compute_txid()));
+    snapshot.txs.extend(
+        chain_txs
+            .into_iter()
+            .map(|(tx, blockid)| (tx, Some(blockid))),
+    );
+    snapshot.prepare(query, config)
+}
+
+fn prepare_tx(
+    mut snapshot: MempoolTxs,
+    hash: &Txid,
+    query: &Query,
+    config: &Config,
+) -> Result<(TransactionValue, u32), HttpError> {
+    if snapshot.txs.is_empty() {
+        let tx = query
+            .chain()
+            .lookup_txn(hash, None)
+            .map_err(HttpError::lookup)?
+            .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
+        snapshot.txs.push((tx, None));
+    }
+    // Look up status after transaction selection, including the mempool path.
+    let blockid = query.chain().tx_confirming_block(hash);
+    snapshot.txs[0].1 = blockid;
+    let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
+    Ok((snapshot.prepare(query, config)?.remove(0), ttl))
+}
+
 fn prepare_txs<F>(
     txs: Vec<(Transaction, Option<BlockId>)>,
     lookup_txos: F,
@@ -917,27 +998,16 @@ fn handle_blocking_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
-            // Read outside the mempool guard, so a tx that is both indexed as confirmed
-            // and still in the local mempool can appear in chain_txs and the mempool
-            // history below.
-            let chain_txs = query
-                .chain()
-                .history(&script_hash[..], None, CHAIN_TXS_PER_PAGE)
-                .map_err(HttpError::lookup)?;
-
-            let mempool = query.mempool();
-            let mut txs = mempool
-                .history(&script_hash[..], MAX_MEMPOOL_TXS)
-                .into_iter()
-                .map(|tx| (tx, None))
-                .collect::<Vec<_>>();
-            txs.extend(
-                chain_txs
-                    .into_iter()
-                    .map(|(tx, blockid)| (tx, Some(blockid))),
-            );
-            let txs = prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)?;
-            drop(mempool);
+            let txs = prepare_history(
+                query,
+                config,
+                |mempool| mempool.history(&script_hash[..], MAX_MEMPOOL_TXS),
+                || {
+                    query
+                        .chain()
+                        .history(&script_hash[..], None, CHAIN_TXS_PER_PAGE)
+                },
+            )?;
 
             json_response(txs, TTL_SHORT)
         }
@@ -994,14 +1064,10 @@ fn handle_blocking_request(
             None,
         ) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
-            let mempool = query.mempool();
-            let txs = mempool
-                .history(&script_hash[..], MAX_MEMPOOL_TXS)
-                .into_iter()
-                .map(|tx| (tx, None))
-                .collect();
-            let txs = prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)?;
-            drop(mempool);
+            let txs = MempoolTxs::capture(query, |mempool| {
+                mempool.history(&script_hash[..], MAX_MEMPOOL_TXS)
+            })
+            .prepare(query, config)?;
 
             json_response(txs, TTL_SHORT)
         }
@@ -1040,35 +1106,10 @@ fn handle_blocking_request(
         }
         (&Method::GET, Some(&"tx"), Some(hash), None, None, None) => {
             let hash = Txid::from_str(hash)?;
-            let chain_tx = query
-                .chain()
-                .lookup_txn(&hash, None)
-                .map_err(HttpError::lookup)?;
-            let blockid = query.chain().tx_confirming_block(&hash);
-            let ttl = ttl_by_depth(blockid.as_ref().map(|b| b.height), query);
-
-            let tx = match chain_tx {
-                Some(tx) => prepare_txs(
-                    vec![(tx, blockid)],
-                    |outpoints| query.chain().lookup_txos(outpoints),
-                    config,
-                )?
-                .remove(0),
-                None => {
-                    let mempool = query.mempool();
-                    let tx = mempool
-                        .lookup_txn(&hash)
-                        .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
-                    let prepared = prepare_txs(
-                        vec![(tx, None)],
-                        |outpoints| mempool.lookup_txos(outpoints),
-                        config,
-                    )?
-                    .remove(0);
-                    drop(mempool);
-                    prepared
-                }
-            };
+            let snapshot = MempoolTxs::capture(query, |mempool| {
+                mempool.lookup_txn(&hash).into_iter().collect()
+            });
+            let (tx, ttl) = prepare_tx(snapshot, &hash, query, config)?;
 
             json_response(tx, ttl)
         }
@@ -1294,27 +1335,16 @@ fn handle_blocking_request(
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"txs"), None, None) => {
             let asset_id = AssetId::from_str(asset_str)?;
-            // Read outside the mempool guard, so a tx that is both indexed as confirmed
-            // and still in the local mempool can appear in chain_txs and the mempool
-            // history below.
-            let chain_txs = query
-                .chain()
-                .asset_history(&asset_id, None, CHAIN_TXS_PER_PAGE)
-                .map_err(HttpError::lookup)?;
-
-            let mempool = query.mempool();
-            let mut txs = mempool
-                .asset_history(&asset_id, MAX_MEMPOOL_TXS)
-                .into_iter()
-                .map(|tx| (tx, None))
-                .collect::<Vec<_>>();
-            txs.extend(
-                chain_txs
-                    .into_iter()
-                    .map(|(tx, blockid)| (tx, Some(blockid))),
-            );
-            let txs = prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)?;
-            drop(mempool);
+            let txs = prepare_history(
+                query,
+                config,
+                |mempool| mempool.asset_history(&asset_id, MAX_MEMPOOL_TXS),
+                || {
+                    query
+                        .chain()
+                        .asset_history(&asset_id, None, CHAIN_TXS_PER_PAGE)
+                },
+            )?;
 
             json_response(txs, TTL_SHORT)
         }
@@ -1347,14 +1377,10 @@ fn handle_blocking_request(
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"txs"), Some(&"mempool"), None) => {
             let asset_id = AssetId::from_str(asset_str)?;
-            let mempool = query.mempool();
-            let txs = mempool
-                .asset_history(&asset_id, MAX_MEMPOOL_TXS)
-                .into_iter()
-                .map(|tx| (tx, None))
-                .collect();
-            let txs = prepare_txs(txs, |outpoints| mempool.lookup_txos(outpoints), config)?;
-            drop(mempool);
+            let txs = MempoolTxs::capture(query, |mempool| {
+                mempool.asset_history(&asset_id, MAX_MEMPOOL_TXS)
+            })
+            .prepare(query, config)?;
 
             json_response(txs, TTL_SHORT)
         }
@@ -1891,3 +1917,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "rest/mempool_tests.rs"]
+mod mempool_tests;

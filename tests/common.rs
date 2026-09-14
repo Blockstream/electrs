@@ -227,6 +227,10 @@ impl TestRunner {
         return &self.node.client();
     }
 
+    pub fn config(&self) -> &Arc<Config> {
+        &self.config
+    }
+
     pub fn query(&self) -> &Arc<Query> {
         &self.query
     }

@@ -464,7 +464,8 @@ impl Mempool {
         Ok(())
     }
 
-    fn lookup_txo(&self, outpoint: &OutPoint) -> Option<TxOut> {
+    /// Look up a local mempool output without chain or daemon IO.
+    pub(crate) fn lookup_txo(&self, outpoint: &OutPoint) -> Option<TxOut> {
         self.txstore
             .get(&outpoint.txid)
             .and_then(|tx| tx.output.get(outpoint.vout as usize).cloned())
