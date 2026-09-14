@@ -45,6 +45,10 @@ pub struct TestRunner {
 
 impl TestRunner {
     pub fn new() -> Result<TestRunner> {
+        Self::new_with(|_| {})
+    }
+
+    pub fn new_with(configure: impl FnOnce(&mut Config)) -> Result<TestRunner> {
         let log = init_log();
 
         // Setup the bitcoind/elementsd config
@@ -89,7 +93,7 @@ impl TestRunner {
 
         let electrsdb = tempfile::tempdir().unwrap();
 
-        let config = Arc::new(Config {
+        let mut config = Config {
             log,
             network_type,
             db_path: electrsdb.path().to_path_buf(),
@@ -137,7 +141,9 @@ impl TestRunner {
             //electrum_announce: bool,
             //#[cfg(feature = "electrum-discovery")]
             //tor_proxy: Option<std::net::SocketAddr>,
-        });
+        };
+        configure(&mut config);
+        let config = Arc::new(config);
 
         let signal = Waiter::start(crossbeam_channel::never());
         let metrics_addr = rand_available_addr();
@@ -264,6 +270,98 @@ impl TestRunner {
         Ok(txid)
     }
 
+    /// Send `count` outputs of `amount` each to `addr` within a single transaction.
+    // createrawtransaction rejects duplicate-address outputs, so this is built by hand.
+    #[cfg(not(feature = "liquid"))]
+    pub fn send_multi(
+        &mut self,
+        addr: &Address,
+        amount: bitcoin::Amount,
+        count: usize,
+    ) -> Result<Txid> {
+        let fee = bitcoin::Amount::from_sat(50_000);
+        let total_out = bitcoin::Amount::from_sat(amount.to_sat() * count as u64);
+
+        let utxos: Vec<serde_json::Value> = self.node_client().call("listunspent", &[])?;
+        let utxo = utxos
+            .iter()
+            .max_by(|a, b| {
+                a["amount"]
+                    .as_f64()
+                    .unwrap()
+                    .total_cmp(&b["amount"].as_f64().unwrap())
+            })
+            .expect("wallet has no spendable utxos");
+        let input_value = bitcoin::Amount::from_btc(utxo["amount"].as_f64().unwrap()).unwrap();
+        let change = input_value - total_out - fee;
+
+        let input = bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: utxo["txid"].as_str().unwrap().parse().unwrap(),
+                vout: utxo["vout"].as_u64().unwrap() as u32,
+            },
+            ..Default::default()
+        };
+        let mut outputs: Vec<bitcoin::TxOut> = (0..count)
+            .map(|_| bitcoin::TxOut {
+                value: amount,
+                script_pubkey: addr.script_pubkey(),
+            })
+            .collect();
+        outputs.push(bitcoin::TxOut {
+            value: change,
+            script_pubkey: self.newaddress()?.script_pubkey(),
+        });
+
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![input],
+            output: outputs,
+        };
+        let raw_hex = bitcoin::consensus::encode::serialize_hex(&tx);
+        let signed: serde_json::Value = self
+            .node_client()
+            .call("signrawtransactionwithwallet", &[json!(raw_hex)])?;
+        let signed_hex = signed["hex"].as_str().unwrap().to_string();
+        let txid: Txid = self
+            .node_client()
+            .call("sendrawtransaction", &[json!(signed_hex)])?;
+        self.sync()?;
+        Ok(txid)
+    }
+
+    /// Spend outputs `0..n_outputs` of `txid` (assumed wallet-owned) into a single output
+    /// paid to `to`.
+    #[cfg(not(feature = "liquid"))]
+    pub fn consolidate(
+        &mut self,
+        txid: Txid,
+        n_outputs: usize,
+        amount_per_output: bitcoin::Amount,
+        fee: bitcoin::Amount,
+        to: &Address,
+    ) -> Result<Txid> {
+        let inputs: Vec<serde_json::Value> = (0..n_outputs as u32)
+            .map(|vout| json!({ "txid": txid.to_string(), "vout": vout }))
+            .collect();
+        let total = bitcoin::Amount::from_sat(amount_per_output.to_sat() * n_outputs as u64);
+        let output_amount = bitcoin::Amount::from_sat(total.to_sat() - fee.to_sat());
+        let outputs = json!({ to.to_string(): output_amount.to_btc() });
+        let raw_hex: String = self
+            .node_client()
+            .call("createrawtransaction", &[json!(inputs), outputs])?;
+        let signed: serde_json::Value = self
+            .node_client()
+            .call("signrawtransactionwithwallet", &[json!(raw_hex)])?;
+        let signed_hex = signed["hex"].as_str().unwrap().to_string();
+        let txid: Txid = self
+            .node_client()
+            .call("sendrawtransaction", &[json!(signed_hex)])?;
+        self.sync()?;
+        Ok(txid)
+    }
+
     #[cfg(feature = "liquid")]
     pub fn send_asset(
         &mut self,
@@ -350,7 +448,12 @@ impl TestRunner {
 }
 
 pub fn init_rest_tester() -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
-    let tester = TestRunner::new()?;
+    init_rest_tester_with(|_| {})
+}
+pub fn init_rest_tester_with(
+    configure: impl FnOnce(&mut Config),
+) -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
+    let tester = TestRunner::new_with(configure)?;
     let addr = tester.config.http_addr;
     let rest_server = rest::start(Arc::clone(&tester.config), Arc::clone(&tester.query));
     wait_for_tcp(addr, "REST");
