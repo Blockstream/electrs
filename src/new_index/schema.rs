@@ -226,7 +226,7 @@ pub struct SpendingInput {
     pub confirmed: Option<BlockId>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ScriptStats {
     pub tx_count: usize,
     pub funded_txo_count: usize,
@@ -795,6 +795,19 @@ impl ChainQuery {
         )
     }
 
+    // like history_iter_scan_reverse, but seeks directly to `height` instead of the tip
+    fn history_iter_scan_reverse_from(
+        &self,
+        code: u8,
+        hash: &[u8],
+        height: usize,
+    ) -> ReverseScanIterator<'_> {
+        self.store.history_db.iter_scan_reverse(
+            &TxHistoryRow::filter(code, &hash[..]),
+            &TxHistoryRow::prefix_height(code, &hash[..], height as u32 + 1),
+        )
+    }
+
     pub fn history(
         &self,
         scripthash: &[u8],
@@ -814,13 +827,33 @@ impl ChainQuery {
     ) -> Result<Vec<(Transaction, BlockId)>> {
         let _timer_scan = self.start_timer("history");
         let headers = self.store.indexed_headers.read().unwrap();
-        let history_iter = self
-            .history_iter_scan_reverse(code, hash)
+
+        // a cursor can only match a confirmed tx; resolve its height up front, or bail
+        let seek_height = match last_seen_txid {
+            Some(txid) => match self.tx_confirming_block(txid) {
+                Some(blockid) => Some(blockid.height),
+                None => return vec![],
+            },
+            None => None,
+        };
+
+        let raw_iter = match seek_height {
+            Some(height) => self.history_iter_scan_reverse_from(code, hash, height),
+            None => self.history_iter_scan_reverse(code, hash),
+        };
+
+        let mut scanned = 0usize;
+        let scan_limit = self.history_scan_limit;
+        let history_iter = raw_iter
+            // bounds skip_while below, in case the cursor belongs to another scripthash
+            .take_while(move |_| {
+                scanned += 1;
+                scanned <= scan_limit
+            })
             .map(TxHistoryRow::from_row)
             .map(|row| (row.get_txid(), row.key.confirmed_height as usize))
             // XXX: unique() requires keeping an in-memory list of all txids, can we avoid that?
             .unique()
-            // TODO seek directly to last seen tx without reading earlier rows
             .skip_while(|(txid, _)| {
                 // skip until we reach the last_seen_txid
                 last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
@@ -1052,10 +1085,12 @@ impl ChainQuery {
                 Some((history, BlockId::from(header)))
             });
 
-        let mut stats = init_stats;
+        let mut stats = init_stats.clone();
+        // stats as of the last fully-scanned height; unlike UtxoMap these counters
+        // aren't idempotent, so a capped scan rolls back to this instead of the pointer
+        let mut committed_stats = init_stats;
         let mut seen_txids = HashSet::new();
         let mut lastblock = None;
-        // the last height we're sure is fully scanned; see utxo_delta for why
         let mut safe_lastblock = None;
         let mut processed_items = 0;
         let mut hit_scan_limit = false;
@@ -1068,6 +1103,7 @@ impl ChainQuery {
             processed_items += 1;
 
             if lastblock != Some(blockid.hash) {
+                committed_stats = stats.clone();
                 safe_lastblock = lastblock;
                 seen_txids.clear();
             }
@@ -1109,9 +1145,12 @@ impl ChainQuery {
             lastblock = Some(blockid.hash);
         }
 
-        // the scan ran to completion (not cut off by the cap): the last height seen is
-        // fully in too, since there's nothing left in the iterator for this scripthash
-        if !hit_scan_limit {
+        if hit_scan_limit {
+            // discard the not-yet-committed (possibly partial) tail height
+            stats = committed_stats;
+        } else {
+            // the scan ran to completion: the last height seen is fully in too, since
+            // there's nothing left in the iterator for this scripthash
             safe_lastblock = lastblock;
         }
 
