@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use crate::chain::{Network, OutPoint, Transaction, TxOut, Txid};
@@ -32,7 +32,9 @@ pub struct Query {
     daemon: Arc<Daemon>,
     config: Arc<Config>,
     cached_estimates: RwLock<(HashMap<u16, f64>, Option<Instant>)>,
+    estimates_refresh: Mutex<()>,
     cached_relayfee: RwLock<Option<f64>>,
+    relayfee_refresh: Mutex<()>,
     cached_block_template: BlockTemplateCache,
     #[cfg(feature = "liquid")]
     asset_db: Option<Arc<RwLock<AssetRegistry>>>,
@@ -52,7 +54,9 @@ impl Query {
             daemon,
             config,
             cached_estimates: RwLock::new((HashMap::new(), None)),
+            estimates_refresh: Mutex::new(()),
             cached_relayfee: RwLock::new(None),
+            relayfee_refresh: Mutex::new(()),
             cached_block_template: BlockTemplateCache::new(),
         }
     }
@@ -233,7 +237,7 @@ impl Query {
             }
         }
 
-        self.update_fee_estimates();
+        self.refresh_fee_estimates_if_stale();
         self.cached_estimates
             .read()
             .unwrap()
@@ -250,8 +254,22 @@ impl Query {
             }
         }
 
-        self.update_fee_estimates();
+        self.refresh_fee_estimates_if_stale();
         self.cached_estimates.read().unwrap().0.clone()
+    }
+
+    #[trace]
+    fn refresh_fee_estimates_if_stale(&self) {
+        let _guard = self
+            .estimates_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let (_, Some(cache_time)) = *self.cached_estimates.read().unwrap() {
+            if cache_time.elapsed() < Duration::from_secs(FEE_ESTIMATES_TTL) {
+                return;
+            }
+        }
+        self.update_fee_estimates();
     }
 
     #[trace]
@@ -268,6 +286,14 @@ impl Query {
 
     #[trace]
     pub fn get_relayfee(&self) -> Result<f64> {
+        if let Some(cached) = *self.cached_relayfee.read().unwrap() {
+            return Ok(cached);
+        }
+
+        let _guard = self
+            .relayfee_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cached) = *self.cached_relayfee.read().unwrap() {
             return Ok(cached);
         }
@@ -292,7 +318,9 @@ impl Query {
             config,
             asset_db,
             cached_estimates: RwLock::new((HashMap::new(), None)),
+            estimates_refresh: Mutex::new(()),
             cached_relayfee: RwLock::new(None),
+            relayfee_refresh: Mutex::new(()),
             cached_block_template: BlockTemplateCache::new(),
         }
     }

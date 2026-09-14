@@ -39,6 +39,7 @@ pub struct TestRunner {
     daemon: Arc<Daemon>,
     mempool: Arc<RwLock<Mempool>>,
     metrics: Metrics,
+    metrics_addr: net::SocketAddr,
     salt_rwlock: Arc<RwLock<String>>,
 }
 
@@ -138,7 +139,8 @@ impl TestRunner {
         });
 
         let signal = Waiter::start(crossbeam_channel::never());
-        let metrics = Metrics::new(rand_available_addr());
+        let metrics_addr = rand_available_addr();
+        let metrics = Metrics::new(metrics_addr);
         metrics.start();
 
         let daemon = Arc::new(Daemon::new(
@@ -205,8 +207,17 @@ impl TestRunner {
             daemon,
             mempool,
             metrics,
+            metrics_addr,
             salt_rwlock,
         })
+    }
+
+    pub fn query(&self) -> Arc<Query> {
+        Arc::clone(&self.query)
+    }
+
+    pub fn metrics_addr(&self) -> net::SocketAddr {
+        self.metrics_addr
     }
 
     pub fn node_client(&self) -> &Client {
