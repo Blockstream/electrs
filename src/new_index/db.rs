@@ -380,15 +380,33 @@ impl DB {
     }
 
     fn verify_compatibility(&self, config: &Config) {
-        let compatibility_bytes = bincode::serialize_little(&(DB_VERSION, config.light_mode)).unwrap();
+        let compatibility_bytes = bincode::serialize_little(&(
+            DB_VERSION,
+            config.light_mode,
+            config.index_unspendables,
+            config.address_search,
+        ))
+        .unwrap();
 
-        match self.get(b"V") {
-            None => self.put(b"V", &compatibility_bytes),
-            Some(x) if x != compatibility_bytes => {
-                panic!("Incompatible database found. Please reindex or migrate.")
-            }
-            Some(_) => (),
+        let stored = match self.get(b"V") {
+            None => return self.put(b"V", &compatibility_bytes),
+            Some(stored) if stored == compatibility_bytes => return,
+            Some(stored) => stored,
+        };
+
+        let legacy_bytes = bincode::serialize_little(&(DB_VERSION, config.light_mode)).unwrap();
+        if stored == legacy_bytes {
+            warn!(
+                "upgrading legacy DB compatibility record using index_unspendables={} and address_search={}; \
+                 these values must match the settings originally used to build this database, and \
+                 historical values cannot be verified",
+                config.index_unspendables,
+                config.address_search,
+            );
+            return self.put(b"V", &compatibility_bytes);
         }
+
+        panic!("Incompatible database found. Please reindex or migrate.")
     }
 
     #[cfg(test)]
@@ -598,5 +616,142 @@ mod tests {
             iter.next();
         }
         assert_eq!(count, 9, "expected 9 total rows, got {}", count);
+    }
+
+    fn make_test_config(index_unspendables: bool, address_search: bool, light_mode: bool) -> crate::config::Config {
+        use crate::config::{Config, RpcLogging};
+        use std::path::PathBuf;
+
+        #[cfg(not(feature = "liquid"))]
+        let network_type = crate::chain::Network::Regtest;
+        #[cfg(feature = "liquid")]
+        let network_type = crate::chain::Network::LiquidRegtest;
+
+        let unused_addr = "127.0.0.1:0".parse().unwrap();
+
+        Config {
+            log: stderrlog::new(),
+            network_type,
+            db_path: PathBuf::from("/tmp/electrs-test-unused"),
+            daemon_dir: PathBuf::from("/tmp/electrs-test-unused"),
+            blocks_dir: PathBuf::from("/tmp/electrs-test-unused"),
+            daemon_rpc_addr: unused_addr,
+            daemon_rpc_fallback_addr: None,
+            daemon_parallelism: 1,
+            daemon_conn_max_age: None,
+            cookie: None,
+            electrum_rpc_addr: unused_addr,
+            electrum_rpc_conn_max_age: None,
+            electrum_rpc_max_request_num_bytes: 1_048_576,
+            http_addr: unused_addr,
+            http_socket_file: None,
+            monitoring_addr: unused_addr,
+            jsonrpc_import: false,
+            light_mode,
+            address_search,
+            index_unspendables,
+            enable_mining_rest: false,
+            cors: None,
+            precache_scripts: None,
+            utxos_limit: 100,
+            electrum_txs_limit: 100,
+            electrum_subscription_limit: 10_000,
+            electrum_checkpoint_proof_concurrency_limit: 2,
+            electrum_banner: String::new(),
+            rpc_logging: RpcLogging::default(),
+            zmq_addr: None,
+            db_block_cache_mb: 8,
+            db_parallelism: 1,
+            db_write_buffer_size_mb: 8,
+            initial_sync_batch_size: 10,
+            db_cache_index_filter_blocks: false,
+            #[cfg(feature = "liquid")]
+            parent_network: bitcoin::Network::Regtest,
+            #[cfg(feature = "liquid")]
+            asset_db_path: None,
+        }
+    }
+
+    #[test]
+    fn test_verify_compatibility_accepts_matching_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_test(dir.path());
+
+        let config = make_test_config(true, false, false);
+        db.verify_compatibility(&config);
+        db.verify_compatibility(&config);
+    }
+
+    #[test]
+    fn test_verify_compatibility_rejects_index_unspendables_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_test(dir.path());
+
+        db.verify_compatibility(&make_test_config(false, false, false));
+
+        let toggled = make_test_config(true, false, false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.verify_compatibility(&toggled);
+        }));
+        assert!(
+            result.is_err(),
+            "verify_compatibility should reject a DB reopened with a different index_unspendables flag"
+        );
+    }
+
+    #[test]
+    fn test_verify_compatibility_rejects_address_search_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_test(dir.path());
+
+        db.verify_compatibility(&make_test_config(false, false, false));
+
+        let toggled = make_test_config(false, true, false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.verify_compatibility(&toggled);
+        }));
+        assert!(
+            result.is_err(),
+            "verify_compatibility should reject a DB reopened with a different address_search flag"
+        );
+    }
+
+    #[test]
+    fn test_verify_compatibility_upgrades_legacy_record_without_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_test(dir.path());
+
+        let legacy_bytes = bincode::serialize_little(&(DB_VERSION, false)).unwrap();
+        db.put(b"V", &legacy_bytes);
+
+        let config = make_test_config(true, true, false);
+        db.verify_compatibility(&config);
+
+        let expected = bincode::serialize_little(&(DB_VERSION, false, true, true)).unwrap();
+        assert_eq!(db.get(b"V").unwrap(), expected);
+
+        let toggled = make_test_config(false, true, false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.verify_compatibility(&toggled);
+        }));
+        assert!(result.is_err(), "upgraded record should still guard future mismatches");
+    }
+
+    #[test]
+    fn test_verify_compatibility_rejects_legacy_record_with_different_light_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_test(dir.path());
+
+        let legacy_bytes = bincode::serialize_little(&(DB_VERSION, true)).unwrap();
+        db.put(b"V", &legacy_bytes);
+
+        let config = make_test_config(false, false, false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.verify_compatibility(&config);
+        }));
+        assert!(
+            result.is_err(),
+            "verify_compatibility should reject a legacy DB with a different light_mode"
+        );
     }
 }

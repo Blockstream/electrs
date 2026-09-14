@@ -65,7 +65,10 @@ In addition to electrs's original configuration options, a few new options are a
 - `--http-addr <addr:port>` - HTTP server address/port to listen on (default: `127.0.0.1:3000`).
 - `--lightmode` - enable light mode (see above)
 - `--cors <origins>` - origins allowed to make cross-site request (optional, defaults to none).
-- `--address-search` - enables the by-prefix address search index.
+- `--address-search` - enables the by-prefix address search index. Best-effort: entries are
+  written when a block is indexed but are not removed if that block is later reorged out, so
+  the index may return addresses with no transaction in the current best chain. Run a full
+  reindex to clear stale entries if this matters for your deployment.
 - `--index-unspendables` - enables indexing of provably unspendable outputs.
 - `--enable-mining-rest` - enables cached mining-related HTTP endpoints.
 - `--utxos-limit <num>` - maximum number of utxos to return per address.
