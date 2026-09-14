@@ -38,17 +38,11 @@ impl Waiter {
     }
 
     pub fn wait(&self, duration: Duration, accept_block_notification: bool) -> Result<()> {
-        // Iterative rather than recursive. A caller that is not accepting block
-        // notifications keeps waiting out the rest of its budget after each one,
-        // and recursing there meant one stack frame per notification - a flood of
-        // them could exhaust the stack before the deadline ever expired.
         let mut remaining = duration;
 
         loop {
             let start = Instant::now();
 
-            // `false` means we were woken by a notification rather than by the
-            // deadline, so the loop goes round again unless we accept those.
             let deadline_expired = select! {
                 recv(self.receiver) -> msg => {
                     match msg {
