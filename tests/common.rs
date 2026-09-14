@@ -270,8 +270,6 @@ impl TestRunner {
         Ok(txid)
     }
 
-    /// Send `count` outputs of `amount` each to `addr` within a single transaction.
-    // createrawtransaction rejects duplicate-address outputs, so this is built by hand.
     #[cfg(not(feature = "liquid"))]
     pub fn send_multi(
         &mut self,
@@ -331,8 +329,6 @@ impl TestRunner {
         Ok(txid)
     }
 
-    /// Spend outputs `0..n_outputs` of `txid` (assumed wallet-owned) into a single output
-    /// paid to `to`.
     #[cfg(not(feature = "liquid"))]
     pub fn consolidate(
         &mut self,
