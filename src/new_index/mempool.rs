@@ -187,7 +187,7 @@ impl Mempool {
         };
         ensure!(
             entries.len() <= self.config.utxos_limit,
-            ErrorKind::TooManyUtxos
+            ErrorKind::TooBigHistory
         );
 
         Ok(entries

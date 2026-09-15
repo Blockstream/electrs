@@ -830,7 +830,7 @@ impl ChainQuery {
         let seek_height = match last_seen_txid {
             Some(txid) => match self.tx_confirming_block_with_headers(txid, &headers) {
                 Some(blockid) => Some(blockid.height),
-                None => return vec![],
+                None => return Ok(vec![]),
             },
             None => None,
         };
@@ -841,11 +841,17 @@ impl ChainQuery {
         };
 
         let mut scanned = 0usize;
+        let mut hit_scan_limit = false;
         let scan_limit = self.history_scan_limit;
         let history_iter = raw_iter
-            .take_while(move |_| {
+            .take_while(|_| {
                 scanned += 1;
-                scanned <= scan_limit
+                if scanned > scan_limit {
+                    hit_scan_limit = true;
+                    false
+                } else {
+                    true
+                }
             })
             .map(TxHistoryRow::from_row)
             .map(|row| (row.get_txid(), row.key.confirmed_height as usize))
@@ -870,6 +876,10 @@ impl ChainQuery {
             blockids.push(BlockId::from(header));
         }
         drop(headers);
+
+        if hit_scan_limit && txids_with_blockhash.is_empty() {
+            bail!(ErrorKind::TooBigHistory);
+        }
 
         Ok(self
             .lookup_txns(&txids_with_blockhash)?
