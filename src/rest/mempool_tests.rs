@@ -173,7 +173,7 @@ fn selected_mempool_transaction_uses_current_confirmation_status() -> Result<()>
     let snapshot = MempoolTxs::capture(&query, |mempool| vec![mempool.lookup_txn(&txid).unwrap()]);
     let blockhash = tester.mine()?;
     let writer = tester.mempool().try_write().unwrap();
-    let (tx, ttl) = prepare_tx(snapshot, &txid, &query, &config).unwrap();
+    let (tx, ttl) = prepare_captured_tx(snapshot, &txid, &query, &config).unwrap();
     let status = tx.status.unwrap();
     assert!(status.confirmed);
     assert_eq!(status.block_hash, Some(blockhash));
@@ -185,8 +185,47 @@ fn selected_mempool_transaction_uses_current_confirmation_status() -> Result<()>
         mempool.lookup_txn(&txid).into_iter().collect()
     });
     assert!(snapshot.txs.is_empty());
-    let (tx, _) = prepare_tx(snapshot, &txid, &query, &config).unwrap();
+    let (tx, _) = prepare_captured_tx(snapshot, &txid, &query, &config).unwrap();
     assert_eq!(tx.status.unwrap().block_hash, Some(blockhash));
+    Ok(())
+}
+
+#[test]
+fn confirmed_transaction_does_not_wait_for_mempool_writer() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut tester = common::TestRunner::new()?;
+    let address = tester.newaddress()?;
+    let txid = tester.send(&address, "1 BTC".parse().unwrap())?;
+    tester.mine()?;
+
+    let query = Arc::clone(tester.query());
+    let config = Arc::clone(tester.config());
+    let writer = tester.mempool().try_write().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = prepare_tx(&txid, &query, &config).map(|(tx, _)| tx.status.unwrap().confirmed);
+        sender.send(result).unwrap();
+    });
+
+    let completed = receiver.recv_timeout(Duration::from_secs(5));
+    drop(writer);
+    worker.join().unwrap();
+    assert!(completed.unwrap().unwrap());
+    Ok(())
+}
+
+#[test]
+fn missing_confirmed_parent_is_unavailable() -> Result<()> {
+    let mut tester = common::TestRunner::new()?;
+    let address = tester.newaddress()?;
+    let parent = tester.send(&address, "1 BTC".parse().unwrap())?;
+    tester.mine()?;
+
+    let missing = errors::Error::from(errors::ErrorKind::MissingTxo(format!("{}:0", parent)));
+    let status = HttpError::mempool_prevout(missing, tester.query(), &BTreeSet::new()).0;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     Ok(())
 }
 

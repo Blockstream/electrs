@@ -513,11 +513,24 @@ impl MempoolTxs {
 
     fn prepare(self, query: &Query, config: &Config) -> Result<Vec<TransactionValue>, HttpError> {
         let mut prevouts = self.prevouts;
+        let confirmed_prevouts: BTreeSet<_> = self
+            .txs
+            .iter()
+            .filter(|(_, blockid)| blockid.is_some())
+            .flat_map(|(tx, _)| tx.input.iter())
+            .filter(|txin| has_prevout(txin))
+            .map(|txin| txin.previous_output)
+            .collect();
         prepare_txs(
             self.txs,
             |mut outpoints| {
                 outpoints.retain(|outpoint| !prevouts.contains_key(outpoint));
-                prevouts.extend(query.chain().lookup_txos(outpoints)?);
+                prevouts.extend(
+                    query
+                        .chain()
+                        .lookup_txos(outpoints)
+                        .map_err(|err| HttpError::mempool_prevout(err, query, &confirmed_prevouts))?,
+                );
                 Ok(prevouts)
             },
             config,
@@ -548,6 +561,29 @@ fn prepare_history(
 }
 
 fn prepare_tx(
+    hash: &Txid,
+    query: &Query,
+    config: &Config,
+) -> Result<(TransactionValue, u32), HttpError> {
+    if let Some(tx) = query.chain().lookup_txn(hash, None).map_err(HttpError::lookup)? {
+        let blockid = query.chain().try_tx_confirming_block(hash).map_err(HttpError::lookup)?;
+        let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
+        let tx = prepare_txs(
+            vec![(tx, blockid)],
+            |outpoints| query.chain().lookup_txos(outpoints).map_err(HttpError::lookup),
+            config,
+        )?
+        .remove(0);
+        return Ok((tx, ttl));
+    }
+
+    let snapshot = MempoolTxs::capture(query, |mempool| {
+        mempool.lookup_txn(hash).into_iter().collect()
+    });
+    prepare_captured_tx(snapshot, hash, query, config)
+}
+
+fn prepare_captured_tx(
     mut snapshot: MempoolTxs,
     hash: &Txid,
     query: &Query,
@@ -562,7 +598,7 @@ fn prepare_tx(
         snapshot.txs.push((tx, None));
     }
     // Look up status after transaction selection, including the mempool path.
-    let blockid = query.chain().tx_confirming_block(hash);
+    let blockid = query.chain().try_tx_confirming_block(hash).map_err(HttpError::lookup)?;
     snapshot.txs[0].1 = blockid;
     let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
     Ok((snapshot.prepare(query, config)?.remove(0), ttl))
@@ -574,7 +610,7 @@ fn prepare_txs<F>(
     config: &Config,
 ) -> Result<Vec<TransactionValue>, HttpError>
 where
-    F: FnOnce(BTreeSet<OutPoint>) -> errors::Result<HashMap<OutPoint, TxOut>>,
+    F: FnOnce(BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>, HttpError>,
 {
     let outpoints = txs
         .iter()
@@ -586,7 +622,7 @@ where
         })
         .collect();
 
-    let prevouts = lookup_txos(outpoints).map_err(HttpError::lookup)?;
+    let prevouts = lookup_txos(outpoints)?;
 
     Ok(txs
         .into_iter()
@@ -892,7 +928,8 @@ fn handle_blocking_request(
             let hash = BlockHash::from_str(hash)?;
             let txids = query
                 .chain()
-                .get_block_txids(&hash)
+                .try_get_block_txids(&hash)
+                .map_err(HttpError::lookup)?
                 .ok_or_else(|| HttpError::not_found("Block not found".to_string()))?;
             json_response(txids, TTL_LONG)
         }
@@ -925,7 +962,8 @@ fn handle_blocking_request(
             let index: usize = index.parse()?;
             let txids = query
                 .chain()
-                .get_block_txids(&hash)
+                .try_get_block_txids(&hash)
+                .map_err(HttpError::lookup)?
                 .ok_or_else(|| HttpError::not_found("Block not found".to_string()))?;
             if index >= txids.len() {
                 bail!(HttpError::not_found("tx index out of range".to_string()));
@@ -955,7 +993,8 @@ fn handle_blocking_request(
 
             let txs = query
                 .chain()
-                .get_block_txs(&hash, start_index, CHAIN_TXS_PER_PAGE)?
+                .get_block_txs(&hash, start_index, CHAIN_TXS_PER_PAGE)
+                .map_err(HttpError::block_txs)?
                 .into_iter()
                 .map(|tx| (tx, blockid))
                 .collect();
@@ -964,7 +1003,11 @@ fn handle_blocking_request(
             let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
 
             json_response(
-                prepare_txs(txs, |outpoints| query.chain().lookup_txos(outpoints), config)?,
+                prepare_txs(
+                    txs,
+                    |outpoints| query.chain().lookup_txos(outpoints).map_err(HttpError::lookup),
+                    config,
+                )?,
                 ttl,
             )
         }
@@ -1043,7 +1086,11 @@ fn handle_blocking_request(
                 .collect();
 
             json_response(
-                prepare_txs(txs, |outpoints| query.chain().lookup_txos(outpoints), config)?,
+                prepare_txs(
+                    txs,
+                    |outpoints| query.chain().lookup_txos(outpoints).map_err(HttpError::lookup),
+                    config,
+                )?,
                 TTL_SHORT,
             )
         }
@@ -1106,10 +1153,7 @@ fn handle_blocking_request(
         }
         (&Method::GET, Some(&"tx"), Some(hash), None, None, None) => {
             let hash = Txid::from_str(hash)?;
-            let snapshot = MempoolTxs::capture(query, |mempool| {
-                mempool.lookup_txn(&hash).into_iter().collect()
-            });
-            let (tx, ttl) = prepare_tx(snapshot, &hash, query, config)?;
+            let (tx, ttl) = prepare_tx(&hash, query, config)?;
 
             json_response(tx, ttl)
         }
@@ -1369,7 +1413,11 @@ fn handle_blocking_request(
                 .collect();
 
             json_response(
-                prepare_txs(txs, |outpoints| query.chain().lookup_txos(outpoints), config)?,
+                prepare_txs(
+                    txs,
+                    |outpoints| query.chain().lookup_txos(outpoints).map_err(HttpError::lookup),
+                    config,
+                )?,
                 TTL_SHORT,
             )
         }
@@ -1599,12 +1647,42 @@ impl HttpError {
     }
 
     fn lookup(err: errors::Error) -> Self {
-        let status = match err.kind() {
-            errors::ErrorKind::MissingTxo(_) => StatusCode::NOT_FOUND,
-            _ => StatusCode::SERVICE_UNAVAILABLE,
-        };
+        let status = StatusCode::SERVICE_UNAVAILABLE;
         warn!("REST lookup failed status='{}' err='{:?}'", status, err);
         HttpError(status, err.to_string())
+    }
+
+    fn block_txs(err: errors::Error) -> Self {
+        match err.kind() {
+            errors::ErrorKind::InvalidParams(_) => HttpError::from(err.to_string()),
+            _ => HttpError::lookup(err),
+        }
+    }
+
+    fn mempool_prevout(
+        err: errors::Error,
+        query: &Query,
+        confirmed_prevouts: &BTreeSet<OutPoint>,
+    ) -> Self {
+        if let errors::ErrorKind::MissingTxo(missing) = err.kind() {
+            let used_by_confirmed_tx = confirmed_prevouts
+                .iter()
+                .any(|outpoint| outpoint.to_string() == *missing);
+            let confirmed_parent = missing
+                .rsplit_once(':')
+                .and_then(|(txid, _)| Txid::from_str(txid).ok())
+                .map(|txid| query.chain().try_tx_confirming_block(&txid));
+            let confirmed_parent = match confirmed_parent {
+                Some(Ok(blockid)) => blockid.is_some(),
+                Some(Err(err)) => return HttpError::lookup(err),
+                None => false,
+            };
+            if !used_by_confirmed_tx && !confirmed_parent {
+                warn!("REST mempool prevout vanished err='{:?}'", err);
+                return HttpError::not_found(err.to_string());
+            }
+        }
+        HttpError::lookup(err)
     }
 }
 
@@ -1757,14 +1835,26 @@ mod tests {
     }
 
     #[test]
-    fn transaction_preparation_failures_map_to_not_found_or_unavailable() {
+    fn storage_lookup_failures_are_unavailable() {
         let missing = HttpError::lookup(errors::Error::from(ErrorKind::MissingTxo(
             "abc:0".to_string(),
         )));
-        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(missing.0, StatusCode::SERVICE_UNAVAILABLE);
 
         let corrupt = HttpError::lookup(errors::Error::from("failed to parse TxOut"));
         assert_eq!(corrupt.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn block_page_errors_distinguish_invalid_index_from_storage_failure() {
+        let invalid = HttpError::block_txs(errors::Error::from(ErrorKind::InvalidParams(
+            "start index out of range".to_string(),
+        )));
+        assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.1, "start index out of range");
+
+        let storage = HttpError::block_txs(errors::Error::from("missing indexed transaction"));
+        assert_eq!(storage.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
