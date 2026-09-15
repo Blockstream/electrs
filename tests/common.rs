@@ -106,7 +106,16 @@ impl TestRunner {
             cookie: None,
             electrum_rpc_addr: rand_available_addr(),
             electrum_rpc_conn_max_age: None,
+            electrum_rpc_write_timeout: Some(std::time::Duration::from_secs(30)),
             electrum_rpc_max_request_num_bytes: 1_048_576,
+            #[cfg(not(feature = "liquid"))]
+            electrum_rpc_max_response_num_bytes: 8_388_608,
+            #[cfg(feature = "liquid")]
+            electrum_rpc_max_response_num_bytes: 33_554_432,
+            #[cfg(not(feature = "liquid"))]
+            electrum_rpc_global_response_budget_bytes: 67_108_864,
+            #[cfg(feature = "liquid")]
+            electrum_rpc_global_response_budget_bytes: 268_435_456,
             http_addr: rand_available_addr(),
             http_socket_file: None, // XXX test with socket file or tcp?
             monitoring_addr: rand_available_addr(),
@@ -456,7 +465,13 @@ pub fn init_rest_tester_with(
     Ok((rest_server, addr, tester))
 }
 pub fn init_electrum_tester() -> Result<(ElectrumRPC, net::SocketAddr, TestRunner)> {
-    let tester = TestRunner::new()?;
+    init_electrum_tester_with_config(|_| {})
+}
+
+pub fn init_electrum_tester_with_config(
+    configure: impl FnOnce(&mut Config),
+) -> Result<(ElectrumRPC, net::SocketAddr, TestRunner)> {
+    let tester = TestRunner::new_with(configure)?;
     let addr = tester.config.electrum_rpc_addr;
     let electrum_server = ElectrumRPC::start(
         Arc::clone(&tester.config),

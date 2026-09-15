@@ -69,6 +69,21 @@ error_chain! {
             display("Daemon is unavailable: {}", msg)
         }
 
+        PerLineResponseOverflow {
+            description("Response line exceeds configured cap")
+            display("response line exceeds max_response_bytes")
+        }
+
+        ResponseBudgetExhausted {
+            description("Global response budget exhausted")
+            display("response budget exhausted, retry later")
+        }
+
+        ClientWriteTimeout {
+            description("Client response write timed out")
+            display("client response write timed out")
+        }
+
         #[cfg(feature = "electrum-discovery")]
         ElectrumClient(e: electrum_client::Error) {
             description("Electrum client error")

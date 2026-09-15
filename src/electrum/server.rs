@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -21,9 +21,13 @@ use bitcoin::consensus::encode::serialize_hex;
 use elements::encode::serialize_hex;
 use crate::chain::Txid;
 use crate::config::{Config, RpcLogging};
+use crate::electrum::client_io::write_to_client;
+use crate::electrum::response::{
+    json_rpc_error, warn_limits, JsonRpcV2Error, ResponseBudget, ResponseLimit, ResponseWriter,
+};
 use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
-use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
+use crate::metrics::{Counter, Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
 use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
@@ -31,8 +35,6 @@ use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullH
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 const MAX_HEADERS: usize = 2016;
-const MAX_ARRAY_BATCH: usize = 20;
-
 #[cfg(feature = "electrum-discovery")]
 use crate::electrum::{DiscoveryManager, ServerFeatures};
 
@@ -82,27 +84,6 @@ fn bool_from_value_or(val: Option<&Value>, name: &str, default: bool) -> Result<
     bool_from_value(val, name)
 }
 
-// JSON-RPC 2.0 error codes (https://www.jsonrpc.org/specification#error_object),
-// plus the application-level codes used by ElectrumX and romanz/electrs.
-#[repr(i16)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum JsonRpcV2Error {
-    ParseError = -32700,
-    InvalidRequest = -32600,
-    MethodNotFound = -32601,
-    InvalidParams = -32602,
-    InternalError = -32603,
-    BadRequest = 1,
-    DaemonError = 2,
-}
-
-impl JsonRpcV2Error {
-    #[inline]
-    fn into_i16(self) -> i16 {
-        self as i16
-    }
-}
-
 fn jsonrpc_code(e: &Error) -> JsonRpcV2Error {
     match e.kind() {
         ErrorKind::InvalidParams(_) => JsonRpcV2Error::InvalidParams,
@@ -117,22 +98,6 @@ fn jsonrpc_code(e: &Error) -> JsonRpcV2Error {
         }
         _ => JsonRpcV2Error::InternalError,
     }
-}
-
-#[inline]
-fn json_rpc_error(
-    input: impl core::fmt::Display,
-    id: Option<&Value>,
-    code: JsonRpcV2Error,
-) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id.unwrap_or(&Value::Null),
-        "error": {
-            "code": code.into_i16(),
-            "message": format!("{}", input),
-        },
-    })
 }
 
 // TODO: implement caching and delta updates
@@ -184,6 +149,9 @@ struct Connection {
     txs_limit: usize,
     subscription_limit: usize,
     max_request_bytes: usize,
+    max_response_bytes: usize,
+    write_timeout: Option<Duration>,
+    response_budget: Arc<ResponseBudget>,
     checkpoint_proof_concurrency_limit: usize,
     #[cfg(feature = "electrum-discovery")]
     discovery: Option<Arc<DiscoveryManager>>,
@@ -208,6 +176,9 @@ impl Connection {
         txs_limit: usize,
         subscription_limit: usize,
         max_request_bytes: usize,
+        max_response_bytes: usize,
+        write_timeout: Option<Duration>,
+        response_budget: Arc<ResponseBudget>,
         checkpoint_proof_concurrency_limit: usize,
         #[cfg(feature = "electrum-discovery")] discovery: Option<Arc<DiscoveryManager>>,
         rpc_logging: RpcLogging,
@@ -224,6 +195,9 @@ impl Connection {
             txs_limit,
             subscription_limit,
             max_request_bytes,
+            max_response_bytes,
+            write_timeout,
+            response_budget,
             checkpoint_proof_concurrency_limit,
             #[cfg(feature = "electrum-discovery")]
             discovery,
@@ -711,59 +685,60 @@ impl Connection {
         println!("{}", log);
     }
 
-    fn send_values(&mut self, values: &[Value]) -> Result<()> {
-        for value in values {
-            let line = value.to_string() + "\n";
-            (&*self.stream)
-                .write_all(line.as_bytes())
-                .chain_err(|| format!("failed to send response ({} bytes)", line.len()))?;
-        }
-        Ok(())
-    }
-
     #[trace]
     fn handle_replies(&mut self, receiver: Receiver<Message>) -> Result<()> {
         let empty_params = json!([]);
+        let stream = Arc::clone(&self.stream);
+        let stats = Arc::clone(&self.stats);
+        let write_timeout = self.write_timeout;
+        let mut response_writer =
+            ResponseWriter::new(self.max_response_bytes, Arc::clone(&self.response_budget));
         loop {
             let msg = receiver.recv().chain_err(|| "channel closed")?;
             trace!("RPC {:?}", msg);
             match msg {
                 Message::Request(line) => {
-                    let reply = match from_str::<Value>(&line) {
-                        Ok(Value::Array(arr)) => {
-                            if arr.len() > MAX_ARRAY_BATCH {
-                                bail!(
-                                    "Too many elements in batch requests {} max:{}",
-                                    arr.len(),
-                                    MAX_ARRAY_BATCH
-                                );
-                            }
-                            let mut result = Vec::with_capacity(arr.len());
-                            for el in arr {
-                                result.push(self.handle_value(el, &empty_params));
-                            }
-                            Value::Array(result)
-                        }
-                        Ok(cmd) => self.handle_value(cmd, &empty_params),
-                        Err(err) => {
-                            warn!("[{}] invalid JSON request: {}", self.addr, err);
-                            json_rpc_error("parse error", None, JsonRpcV2Error::ParseError)
-                        }
-                    };
-                    self.send_values(&[reply])?
+                    let request = from_str::<Value>(&line);
+                    drop(line);
+                    if let Err(error) = &request {
+                        warn!("[{}] invalid JSON request: {}", self.addr, error);
+                    }
+                    write_to_client(
+                        &stream,
+                        write_timeout,
+                        &stats.client_write_timeouts,
+                        |writer| {
+                            response_writer.send(
+                                writer,
+                                request,
+                                |command| self.handle_value(command, &empty_params),
+                                |limit| match limit {
+                                    ResponseLimit::PerLine => stats.per_line_overflows.inc(),
+                                    ResponseLimit::Global => stats.global_overflows.inc(),
+                                },
+                            )
+                        },
+                    )?;
                 }
                 Message::PeriodicUpdate => {
                     let values = self
                         .update_subscriptions()
                         .chain_err(|| "failed to update subscriptions")?;
-                    self.send_values(&values)?
+                    for value in &values {
+                        write_to_client(
+                            &stream,
+                            write_timeout,
+                            &stats.client_write_timeouts,
+                            |writer| response_writer.send_notification(writer, value),
+                        )?;
+                    }
                 }
                 Message::Done => return Ok(()),
             }
         }
     }
 
-    fn handle_value(&mut self, cmd: Value, empty_params: &Value) -> Value {
+    fn handle_value(&mut self, cmd: &Value, empty_params: &Value) -> Value {
         let start_time = Instant::now();
         match (
             cmd.get("method"),
@@ -894,7 +869,12 @@ impl Connection {
             Connection::reader_thread(reader, sender, max_request_bytes)
         });
         if let Err(e) = self.handle_replies(receiver) {
-            if is_disconnect(&e) {
+            if matches!(e.kind(), ErrorKind::ClientWriteTimeout) {
+                warn!(
+                    "[{}] client response write timed out; closing connection",
+                    self.addr
+                );
+            } else if is_disconnect(&e) {
                 // client went away mid-exchange (broken pipe / reset) — not actionable
                 debug!("[{}] connection closed by client: {}", self.addr, e);
             } else {
@@ -1130,6 +1110,9 @@ struct Stats {
     latency: HistogramVec,
     clients: Gauge,
     subscriptions: Gauge,
+    per_line_overflows: Counter,
+    global_overflows: Counter,
+    client_write_timeouts: Counter,
 }
 
 impl RPC {
@@ -1222,6 +1205,18 @@ impl RPC {
                 "electrum_subscriptions",
                 "# of Electrum subscriptions",
             )),
+            per_line_overflows: metrics.counter(MetricOpts::new(
+                "electrum_per_line_response_overflows",
+                "Replies rejected for exceeding the per-line response cap",
+            )),
+            global_overflows: metrics.counter(MetricOpts::new(
+                "electrum_global_response_budget_rejections",
+                "Replies rejected because the global response budget was exhausted",
+            )),
+            client_write_timeouts: metrics.counter(MetricOpts::new(
+                "electrum_client_write_timeouts_total",
+                "Connections closed because a client response write timed out",
+            )),
         });
         stats.clients.set(0);
         stats.subscriptions.set(0);
@@ -1256,8 +1251,13 @@ impl RPC {
         let txs_limit = config.electrum_txs_limit;
         let subscription_limit = config.electrum_subscription_limit;
         let max_request_bytes = config.electrum_rpc_max_request_num_bytes;
+        let max_response_bytes = config.electrum_rpc_max_response_num_bytes;
+        let write_timeout = config.electrum_rpc_write_timeout;
+        let response_budget = ResponseBudget::new(config.electrum_rpc_global_response_budget_bytes);
         let checkpoint_proof_concurrency_limit = config.electrum_checkpoint_proof_concurrency_limit;
         let conn_max_age = config.electrum_rpc_conn_max_age;
+
+        warn_limits(max_request_bytes, max_response_bytes, txs_limit);
 
         RPC {
             notification: notification.sender(),
@@ -1287,6 +1287,7 @@ impl RPC {
                 while let Some((stream, addr)) = acceptor.receiver().recv().unwrap() {
                     // explicitly scope the shadowed variables for the new thread
                     let query = Arc::clone(&query);
+                    let response_budget = Arc::clone(&response_budget);
                     let stats = Arc::clone(&stats);
                     let garbage_sender = garbage_sender.clone();
                     let rpc_logging = config.rpc_logging.clone();
@@ -1309,6 +1310,9 @@ impl RPC {
                             txs_limit,
                             subscription_limit,
                             max_request_bytes,
+                            max_response_bytes,
+                            write_timeout,
+                            response_budget,
                             checkpoint_proof_concurrency_limit,
                             #[cfg(feature = "electrum-discovery")]
                             discovery,
@@ -1374,6 +1378,7 @@ impl Drop for RPC {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_hash_ip_with_salt() {

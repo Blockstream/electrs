@@ -60,7 +60,10 @@ pub struct Config {
     pub cookie: Option<SensitiveAuth>,
     pub electrum_rpc_addr: SocketAddr,
     pub electrum_rpc_conn_max_age: Option<Duration>,
+    pub electrum_rpc_write_timeout: Option<Duration>,
     pub electrum_rpc_max_request_num_bytes: usize,
+    pub electrum_rpc_max_response_num_bytes: usize,
+    pub electrum_rpc_global_response_budget_bytes: usize,
     pub http_addr: SocketAddr,
     pub http_socket_file: Option<PathBuf>,
     pub monitoring_addr: SocketAddr,
@@ -136,6 +139,24 @@ fn str_to_socketaddr(address: &str, what: &str) -> SocketAddr {
         .unwrap()
 }
 
+fn value_or_default_or_exit(
+    m: &clap::ArgMatches,
+    arg_name: &str,
+    cli_name: &str,
+    default: usize,
+) -> usize {
+    match m.value_of(arg_name) {
+        None => default,
+        Some(raw) => raw.parse::<usize>().unwrap_or_else(|_| {
+            clap::Error::with_description(
+                &format!("--{} expects a non-negative integer (got {:?})", cli_name, raw),
+                clap::ErrorKind::ValueValidation,
+            )
+            .exit()
+        }),
+    }
+}
+
 impl Config {
     pub fn from_args() -> Config {
         let network_help = format!("Select network type ({})", Network::names().join(", "));
@@ -197,10 +218,29 @@ impl Config {
                     .takes_value(true),
             )
             .arg(
+                Arg::with_name("electrum_rpc_write_timeout")
+                    .long("electrum-rpc-write-timeout")
+                    .help("Maximum time (in seconds) to transmit a complete Electrum response, including a whole batch, errors, or a notification. Starts at the first write and is not extended by partial progress. Closes stalled connections and releases response buffers. Does not time idle subscriptions or command execution. 0 = disabled (default: 30).")
+                    .default_value("30")
+                    .takes_value(true),
+            )
+            .arg(
                 Arg::with_name("electrum_rpc_max_request_num_bytes")
                     .long("electrum-rpc-max-request-num-bytes")
                     .help("Maximum size (in bytes) of a single Electrum RPC request line. A client streaming bytes without a newline is disconnected once its in-flight line exceeds this size, bounding per-connection memory. 0 = unlimited (default: 1048576, i.e. 1 MiB)")
                     .default_value("1048576")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("electrum_rpc_max_response_num_bytes")
+                    .long("electrum-rpc-max-response-num-bytes")
+                    .help("Maximum size (in bytes) of a single Electrum RPC solicited reply line, including brackets, commas, error objects, and terminating newline. Applies to singles, batches, parse errors, and invalid-request errors; subscription notifications are exempt. When a reply cannot fit, the client receives a correlated error (code 1) for the overflowing element and later batch elements are not executed. 0 = unlimited (default: 8388608, i.e. 8 MiB on Bitcoin; 33554432, i.e. 32 MiB on Liquid, sized for a 2016-header window during a dynafed parameter vote).")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("electrum_rpc_global_response_budget_bytes")
+                    .long("electrum-rpc-global-response-budget-bytes")
+                    .help("Aggregate cap (in bytes) on Electrum response-buffer memory retained across all connections at any instant. Bounds the memory a set of non-reading clients can hold while writer threads block in write_all. Small replies (< 16 KiB per connection) are exempt; above that floor each reply charges the budget in 64 KiB chunks (or a smaller final chunk) and releases on drop. Requests that would exceed the budget are rejected with a server error (code 2) instead of allocating. Must be >= --electrum-rpc-max-response-num-bytes so a single maximum-size reply can succeed. 0 = unlimited (default: 67108864, i.e. 64 MiB on Bitcoin; 268435456, i.e. 256 MiB on Liquid, keeping the same ratio to the per-line cap).")
                     .takes_value(true),
             )
             .arg(
@@ -457,6 +497,12 @@ impl Config {
             #[cfg(feature = "liquid")]
             Network::LiquidRegtest => 51401,
         };
+        #[cfg(not(feature = "liquid"))]
+        let default_electrum_rpc_max_response_num_bytes: usize = 8_388_608;
+        #[cfg(feature = "liquid")]
+        let default_electrum_rpc_max_response_num_bytes: usize = 33_554_432;
+        let default_electrum_rpc_global_response_budget_bytes: usize =
+            default_electrum_rpc_max_response_num_bytes.saturating_mul(8);
         let default_http_port = match network_type {
             #[cfg(not(feature = "liquid"))]
             Network::Bitcoin => 3000,
@@ -521,6 +567,10 @@ impl Config {
                 0 => None, // 0 = unlimited / never disconnect
                 secs => Some(Duration::from_secs(secs)),
             };
+        let electrum_rpc_write_timeout = match value_t_or_exit!(m, "electrum_rpc_write_timeout", u64) {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
         let electrum_rpc_max_request_num_bytes: usize = match value_t_or_exit!(
             m,
             "electrum_rpc_max_request_num_bytes",
@@ -529,6 +579,40 @@ impl Config {
             0 => usize::MAX, // 0 = unlimited
             bytes => bytes,
         };
+        let electrum_rpc_max_response_num_bytes: usize = match value_or_default_or_exit(
+            &m,
+            "electrum_rpc_max_response_num_bytes",
+            "electrum-rpc-max-response-num-bytes",
+            default_electrum_rpc_max_response_num_bytes,
+        ) {
+            0 => usize::MAX, // 0 = unlimited
+            bytes => bytes,
+        };
+        let electrum_rpc_global_response_budget_bytes: usize = match value_or_default_or_exit(
+            &m,
+            "electrum_rpc_global_response_budget_bytes",
+            "electrum-rpc-global-response-budget-bytes",
+            default_electrum_rpc_global_response_budget_bytes,
+        ) {
+            0 => usize::MAX, // 0 = unlimited
+            bytes => bytes,
+        };
+        if electrum_rpc_global_response_budget_bytes != usize::MAX
+            && electrum_rpc_max_response_num_bytes != usize::MAX
+            && electrum_rpc_global_response_budget_bytes < electrum_rpc_max_response_num_bytes
+        {
+            clap::Error::with_description(
+                &format!(
+                    "--electrum-rpc-global-response-budget-bytes ({}) must be >= \
+                     --electrum-rpc-max-response-num-bytes ({}); a single maximum-size \
+                     reply cannot succeed otherwise",
+                    electrum_rpc_global_response_budget_bytes,
+                    electrum_rpc_max_response_num_bytes,
+                ),
+                clap::ErrorKind::ValueValidation,
+            )
+            .exit();
+        }
         let http_addr: SocketAddr = str_to_socketaddr(
             m.value_of("http_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_http_port)),
@@ -601,7 +685,10 @@ impl Config {
             history_scan_limit: value_t_or_exit!(m, "history_scan_limit", usize),
             electrum_rpc_addr,
             electrum_rpc_conn_max_age,
+            electrum_rpc_write_timeout,
             electrum_rpc_max_request_num_bytes,
+            electrum_rpc_max_response_num_bytes,
+            electrum_rpc_global_response_budget_bytes,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_subscription_limit: value_t_or_exit!(m, "electrum_subscription_limit", usize),
             electrum_checkpoint_proof_concurrency_limit: value_t_or_exit!(
