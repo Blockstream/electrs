@@ -360,6 +360,10 @@ impl DB {
         self.db.get(key).unwrap().map(|v| v.to_vec())
     }
 
+    pub fn try_get(&self, key: &[u8]) -> Result<Option<Bytes>, rocksdb::Error> {
+        self.db.get(key).map(|value| value.map(|v| v.to_vec()))
+    }
+
     pub fn multi_get<K, I>(&self, keys: I) -> Vec<Result<Option<Vec<u8>>, rocksdb::Error>>
     where
         K: AsRef<[u8]>,

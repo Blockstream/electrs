@@ -667,14 +667,35 @@ impl ChainQuery {
         }
     }
 
+    pub fn try_get_block_txids(&self, hash: &BlockHash) -> Result<Option<Vec<Txid>>> {
+        let _timer = self.start_timer("get_block_txids");
+        if self.light_mode {
+            let mut blockinfo = match self.daemon.getblock_raw(hash, 1) {
+                Ok(blockinfo) => blockinfo,
+                Err(_) => return Ok(None),
+            };
+            Ok(Some(serde_json::from_value(blockinfo["tx"].take())
+                .chain_err(|| "failed to parse block txids")?))
+        } else {
+            self.store
+                .txstore_db
+                .try_get(&BlockRow::txids_key(full_hash(&hash[..])))?
+                .map(|val| bincode::deserialize_little(&val).chain_err(|| "failed to parse block txids"))
+                .transpose()
+        }
+    }
+
     pub fn get_block_txs(
         &self,
         hash: &BlockHash,
         start_index: usize,
         limit: usize,
     ) -> Result<Vec<Transaction>> {
-        let txids = self.get_block_txids(hash).chain_err(|| "block not found")?;
-        ensure!(start_index < txids.len(), "start index out of range");
+        let txids = self.try_get_block_txids(hash)?.chain_err(|| "block not found")?;
+        ensure!(
+            start_index < txids.len(),
+            ErrorKind::InvalidParams("start index out of range".to_string())
+        );
 
         let txids_with_blockhash = txids
             .into_iter()
@@ -1149,7 +1170,7 @@ impl ChainQuery {
         blockhash: Option<&BlockHash>,
     ) -> Result<Option<Transaction>> {
         let _timer = self.start_timer("lookup_txn");
-        self.lookup_raw_txn(txid, blockhash)
+        self.try_lookup_raw_txn(txid, blockhash)?
             .map(|rawtx| deserialize(&rawtx).chain_err(|| "failed to parse Transaction"))
             .transpose()
     }
@@ -1191,6 +1212,28 @@ impl ChainQuery {
             Some(Bytes::from_hex(txhex).expect("valid tx from bitcoind"))
         } else {
             self.store.txstore_db.get(&TxRow::key(&txid[..]))
+        }
+    }
+
+    fn try_lookup_raw_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Result<Option<Bytes>> {
+        if self.light_mode {
+            let queried_blockhash = if blockhash.is_none() {
+                self.try_tx_confirming_block(txid)?.map(|blockid| blockid.hash)
+            } else {
+                None
+            };
+            let blockhash = match blockhash.or(queried_blockhash.as_ref()) {
+                Some(blockhash) => blockhash,
+                None => return Ok(None),
+            };
+            let txval = match self.daemon.gettransaction_raw(txid, blockhash, false) {
+                Ok(txval) => txval,
+                Err(_) => return Ok(None),
+            };
+            let txhex = txval.as_str().chain_err(|| "invalid transaction RPC response")?;
+            Ok(Some(Bytes::from_hex(txhex).chain_err(|| "invalid transaction hex")?))
+        } else {
+            Ok(self.store.txstore_db.try_get(&TxRow::key(&txid[..]))?)
         }
     }
 
@@ -1248,6 +1291,18 @@ impl ChainQuery {
         let headers = self.store.indexed_headers.read().unwrap();
         // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
         Some(headers.header_by_height(height as usize)?.into())
+    }
+
+    pub fn try_tx_confirming_block(&self, txid: &Txid) -> Result<Option<BlockId>> {
+        let _timer = self.start_timer("tx_confirming_block");
+        let row_value = match self.store.history_db.try_get(&TxConfRow::key(txid))? {
+            Some(row_value) => row_value,
+            None => return Ok(None),
+        };
+        ensure!(row_value.len() == 4, "invalid transaction confirmation row");
+        let height = TxConfRow::height_from_val(&row_value);
+        let headers = self.store.indexed_headers.read().unwrap();
+        Ok(headers.header_by_height(height as usize).map(Into::into))
     }
 
     pub fn lookup_confirmations(&self, txids: BTreeSet<Txid>) -> HashMap<Txid, u32> {
@@ -2076,6 +2131,27 @@ pub mod bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(dead_code)]
+    mod common {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common.rs"));
+    }
+
+    #[test]
+    fn corrupt_single_key_rows_return_errors() -> common::Result<()> {
+        let mut tester = common::TestRunner::new()?;
+        let address = tester.newaddress()?;
+        let txid = tester.send(&address, "1 BTC".parse().unwrap())?;
+        let blockhash = tester.mine()?;
+        let chain = tester.query().chain();
+
+        chain.store.txstore_db.put(&BlockRow::txids_key(full_hash(&blockhash[..])), &[]);
+        assert!(chain.get_block_txs(&blockhash, 0, 25).is_err());
+
+        chain.store.history_db.put(&TxConfRow::key(&txid), &[]);
+        assert!(chain.try_tx_confirming_block(&txid).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_completed_prefix_stops_at_first_gap() {
