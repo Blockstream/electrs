@@ -1,11 +1,7 @@
 //! Deterministic races through the private preparation functions used by REST.
 use super::*;
-
-#[allow(dead_code)]
-mod common {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common.rs"));
-}
-use common::Result;
+use crate::test_common as common;
+use crate::test_common::Result;
 
 #[test]
 #[cfg(not(feature = "liquid"))]
