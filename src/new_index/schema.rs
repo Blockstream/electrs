@@ -2131,11 +2131,7 @@ pub mod bench {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[allow(dead_code)]
-    mod common {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common.rs"));
-    }
+    use crate::test_common as common;
 
     #[test]
     fn corrupt_single_key_rows_return_errors() -> common::Result<()> {

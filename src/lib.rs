@@ -19,6 +19,12 @@ extern crate lazy_static;
 #[cfg(test)]
 extern crate self as electrs;
 
+#[cfg(test)]
+#[allow(dead_code)]
+mod test_common {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common.rs"));
+}
+
 pub mod chain;
 pub mod config;
 pub mod daemon;
