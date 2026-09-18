@@ -65,6 +65,41 @@ fn test_utxo_limit_checked_against_final_state() -> Result<()> {
 
 #[cfg(not(feature = "liquid"))]
 #[test]
+fn test_utxo_limit_stays_until_consolidation_confirms() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let amount = bitcoin::Amount::from_sat(5_000);
+
+    let fund_txid = tester.send_multi(&addr1, amount, 101)?;
+    tester.mine()?;
+
+    let resp = get_allow_error(rest_addr, &format!("/address/{}/utxo", addr1))?;
+    assert_eq!(resp.status(), 400);
+
+    tester.consolidate(
+        fund_txid,
+        101,
+        amount,
+        bitcoin::Amount::from_sat(30_000),
+        &addr1,
+    )?;
+
+    let resp = get_allow_error(rest_addr, &format!("/address/{}/utxo", addr1))?;
+    assert_eq!(resp.status(), 400);
+
+    // Once mined, the limit is evaluated against the new confirmed state and clears.
+    tester.mine()?;
+    let res = get_json(rest_addr, &format!("/address/{}/utxo", addr1))?;
+    let utxos = res.as_array().expect("array of utxos");
+    assert_eq!(utxos.len(), 1);
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(not(feature = "liquid"))]
+#[test]
 fn test_history_scan_limit_finishes_oversized_height() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) =
         common::init_rest_tester_with(|c| c.history_scan_limit = 5).unwrap();
