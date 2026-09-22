@@ -877,7 +877,7 @@ impl ChainQuery {
         }
         drop(headers);
 
-        if hit_scan_limit && txids_with_blockhash.is_empty() {
+        if hit_scan_limit && txids_with_blockhash.len() < limit {
             bail!(ErrorKind::TooBigHistory);
         }
 
@@ -933,7 +933,7 @@ impl ChainQuery {
 
         // save updated utxo set to cache, even if we bail out below
         if let Some(lastblock) = lastblock {
-            if had_cache || processed_items > MIN_HISTORY_ITEMS_TO_CACHE {
+            if had_cache || hit_scan_limit || processed_items > MIN_HISTORY_ITEMS_TO_CACHE {
                 self.store.cache_db.write_rows(
                     vec![UtxoCacheRow::new(scripthash, &newutxos, &lastblock).into_row()],
                     DBFlush::Enable,
@@ -1053,7 +1053,9 @@ impl ChainQuery {
 
         // save updated stats to cache, even if we bail out below
         if let Some(lastblock) = lastblock {
-            if newstats.funded_txo_count + newstats.spent_txo_count > MIN_HISTORY_ITEMS_TO_CACHE {
+            if hit_scan_limit
+                || newstats.funded_txo_count + newstats.spent_txo_count > MIN_HISTORY_ITEMS_TO_CACHE
+            {
                 self.store.cache_db.write_rows(
                     vec![StatsCacheRow::new(scripthash, &newstats, &lastblock).into_row()],
                     DBFlush::Enable,

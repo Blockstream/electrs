@@ -286,7 +286,7 @@ impl Config {
             .arg(
                 Arg::with_name("history_scan_limit")
                     .long("history-scan-limit")
-                    .help("Maximum number of scripthash history rows scanned per utxo/stats lookup before giving up with a \"too popular\" error. Unlike --utxos-limit and --electrum-txs-limit, which cap the size of the result, this bounds the amount of work done per request regardless of the outcome.")
+                    .help("Approximate number of scripthash history rows scanned per utxo/stats lookup before giving up with a \"too popular\" error (the scan reads through the end of the height it is on when the limit is reached, so it may process somewhat more). Unlike --utxos-limit and --electrum-txs-limit, which cap the size of the result, this bounds the amount of work done per request regardless of the outcome.")
                     .default_value("100000")
             )
             .arg(

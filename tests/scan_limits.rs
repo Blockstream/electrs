@@ -170,6 +170,101 @@ fn test_history_scan_limit_bounds_and_resumes() -> Result<()> {
 }
 
 #[test]
+fn test_history_scan_limit_checkpoints_below_cache_threshold() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) =
+        common::init_rest_tester_with(|c| c.history_scan_limit = 5).unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let amount = bitcoin::Amount::from_sat(1_000);
+
+    for _ in 0..6 {
+        tester.send(&addr1, amount)?;
+        tester.mine()?;
+    }
+
+    let resp = get_allow_error(rest_addr, &format!("/address/{}", addr1))?;
+    assert_eq!(resp.status(), 400);
+
+    let mut stats = None;
+    for _ in 0..3 {
+        match get_json(rest_addr, &format!("/address/{}", addr1)) {
+            Ok(res) => {
+                stats = Some(res);
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    let stats =
+        stats.expect("checkpoint below the cache threshold should still be saved and progress");
+    assert_eq!(stats["chain_stats"]["funded_txo_count"].as_u64(), Some(6));
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_utxo_scan_limit_checkpoints_below_cache_threshold() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) =
+        common::init_rest_tester_with(|c| c.history_scan_limit = 5).unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let amount = bitcoin::Amount::from_sat(1_000);
+
+    for _ in 0..6 {
+        tester.send_multi(&addr1, amount, 1)?;
+        tester.mine()?;
+    }
+
+    let resp = get_allow_error(rest_addr, &format!("/address/{}/utxo", addr1))?;
+    assert_eq!(resp.status(), 400);
+
+    let mut utxos = None;
+    for _ in 0..3 {
+        match get_json(rest_addr, &format!("/address/{}/utxo", addr1)) {
+            Ok(res) => {
+                utxos = Some(res);
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    let utxos =
+        utxos.expect("checkpoint below the cache threshold should still be saved and progress");
+    assert_eq!(utxos.as_array().expect("array of utxos").len(), 6);
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_history_scan_limit_errors_on_short_page() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) =
+        common::init_rest_tester_with(|c| c.history_scan_limit = 5).unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let amount = bitcoin::Amount::from_sat(1_000);
+
+    tester.send(&addr1, amount)?;
+    tester.mine()?;
+
+    tester.send_multi(&addr1, amount, 20)?;
+    tester.mine()?;
+
+    let resp = get_allow_error(rest_addr, &format!("/address/{}/txs/chain", addr1))?;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.into_body().read_to_string()?,
+        "Scripthash history too large to scan"
+    );
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[test]
 fn test_history_cursor_unmatched_returns_empty() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
 
