@@ -41,6 +41,10 @@ pub struct Mempool {
     edges: HashMap<OutPoint, (Txid, u32)>,          // OutPoint -> (spending_txid, spending_vin)
     recent: ArrayDeque<TxOverview, RECENT_TXS_SIZE, Wrapping>, // The N most recent txs to enter the mempool
     backlog_stats: (BacklogStats, Instant),
+    // Whether the initial sync with bitcoind's mempool has completed at least once.
+    // Until then, mempool-derived data (unconfirmed history, outspends, backlog stats)
+    // is incomplete; exposed via /health/ready for readiness checks.
+    synced: bool,
 
     // monitoring
     latency: HistogramVec, // mempool requests latency
@@ -81,6 +85,7 @@ impl Mempool {
                 BacklogStats::default(),
                 Instant::now() - Duration::from_secs(BACKLOG_STATS_TTL),
             ),
+            synced: false,
             latency: metrics.histogram_vec(
                 HistogramOpts::new("mempool_latency", "Mempool requests latency (in seconds)"),
                 &["part"],
@@ -103,6 +108,10 @@ impl Mempool {
 
     pub fn network(&self) -> Network {
         self.config.network_type
+    }
+
+    pub fn is_synced(&self) -> bool {
+        self.synced
     }
 
     pub fn lookup_txn(&self, txid: &Txid) -> Option<Transaction> {
@@ -622,6 +631,7 @@ impl Mempool {
             .set(new_txids.len() as f64);
 
         if new_txids.is_empty() {
+            Self::mark_synced(mempool);
             return Ok(true);
         }
 
@@ -694,8 +704,16 @@ impl Mempool {
         }
 
         trace!("mempool is synced");
+        Self::mark_synced(mempool);
 
         Ok(true)
+    }
+
+    fn mark_synced(mempool: &Arc<RwLock<Mempool>>) {
+        if !mempool.read().unwrap().synced {
+            mempool.write().unwrap().synced = true;
+            info!("initial mempool sync complete");
+        }
     }
 }
 
