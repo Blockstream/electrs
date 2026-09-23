@@ -660,6 +660,25 @@ impl ChainQuery {
         }
     }
 
+    pub fn get_headers(&self, from: &BlockHash, count: usize) -> Option<Vec<BlockHeader>> {
+        let _timer = self.start_timer("get_headers");
+        let store = self.store.indexed_headers.read().unwrap();
+
+        if let Some(from_header) = store.header_by_blockhash(from) {
+            Some(
+                store
+                    .iter()
+                    .rev()
+                    .skip(self.best_height() - from_header.height())
+                    .take(count)
+                    .map(|e| e.header().clone())
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
     pub fn get_block_header(&self, hash: &BlockHash) -> Option<BlockHeader> {
         let _timer = self.start_timer("get_block_header");
         Some(self.header_by_hash(hash)?.header().clone())
