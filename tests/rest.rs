@@ -1367,6 +1367,67 @@ fn test_rest_package_updates_mempool() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_mempool_ensure_txs_concurrency() -> Result<()> {
+    use electrs::new_index::Mempool;
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    let (rest_handle, rest_addr, tester) = common::init_rest_tester().unwrap();
+
+    let addr = tester.newaddress()?;
+    let txid: Txid = tester
+        .node_client()
+        .call("sendtoaddress", &[addr.to_string().into(), 0.1.into()])
+        .unwrap();
+
+    // While a reader holds the mempool lock, the daemon fetch must still complete. If the fetch
+    // ran under the write lock it could not start until the reader is dropped.
+    let proxied_before = tester.proxied_rpc_count("ok");
+    let reader = tester.mempool().read().unwrap();
+    assert!(reader.lookup_txn(&txid).is_none());
+
+    let mempool = Arc::clone(tester.mempool());
+    let daemon = Arc::clone(tester.daemon());
+    let handle = thread::spawn(move || Mempool::ensure_tx(&mempool, &daemon, txid));
+
+    let deadline = Instant::now() + TIMEOUT;
+    while tester.proxied_rpc_count("ok") <= proxied_before {
+        assert!(
+            Instant::now() < deadline,
+            "daemon fetch did not complete while a mempool reader was active"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(reader);
+    handle.join().unwrap().expect("ensure_tx failed");
+
+    assert!(tester.mempool().read().unwrap().lookup_txn(&txid).is_some());
+    let res = get_json(rest_addr, &format!("/tx/{}", txid))?;
+    assert_eq!(res["status"]["confirmed"].as_bool(), Some(false));
+
+    // An already-indexed txid must return without the write lock or a daemon fetch, so it
+    // completes while another thread holds a reader.
+    let proxied_before = tester.proxied_rpc_count("ok");
+    let reader = tester.mempool().read().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let mempool = Arc::clone(tester.mempool());
+    let daemon = Arc::clone(tester.daemon());
+    thread::spawn(move || done_tx.send(Mempool::ensure_tx(&mempool, &daemon, txid)));
+    done_rx
+        .recv_timeout(TIMEOUT)
+        .expect("ensure_tx for an indexed txid blocked on the write lock")?;
+    drop(reader);
+    assert_eq!(tester.proxied_rpc_count("ok"), proxied_before);
+
+    rest_handle.stop();
+    Ok(())
+}
+
 // Elements-only tests
 
 #[cfg(feature = "liquid")]
@@ -1580,7 +1641,7 @@ fn test_rest_mempool_rbf_eviction() -> Result<()> {
     // Regression test for the mempool eviction panic ("missing mempool edge
     // for outpoint"): tx A and its RBF replacement B spend the same outpoint
     // and transiently coexist in the local mempool view when B is injected
-    // through the broadcast endpoint (add_by_txid) while A is still indexed.
+    // through the broadcast endpoint (ensure_tx) while A is still indexed.
     // B's add() clobbers A's `edges` entry; the next sync round evicts A and
     // must tolerate the missing/foreign edge instead of panicking.
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
@@ -1618,7 +1679,7 @@ fn test_rest_mempool_rbf_eviction() -> Result<()> {
     let b_hex = finalized["hex"].as_str().expect("finalized tx hex");
 
     // Inject B through the electrs broadcast endpoint: the node accepts the
-    // replacement (evicting A node-side), and add_by_txid() indexes B locally
+    // replacement (evicting A node-side), and ensure_tx() indexes B locally
     // while A is still present - clobbering A's edges entry for the shared
     // outpoint.
     let broadcast_resp = ureq::post(&format!("http://{}/tx", rest_addr)).send(b_hex)?;

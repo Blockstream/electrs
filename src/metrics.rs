@@ -72,6 +72,11 @@ impl Metrics {
         h
     }
 
+    /// Snapshot of every registered metric, e.g. for asserting on counters in tests.
+    pub fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
+        self.reg.gather()
+    }
+
     pub fn start(&self) {
         let server = tiny_http::Server::http(self.addr)
             .unwrap_or_else(|_| panic!("failed to start monitoring HTTP server at {}", self.addr));
