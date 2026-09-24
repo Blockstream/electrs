@@ -1385,9 +1385,11 @@ impl Daemon {
         self.request("getrawtransaction", json!([txid, verbose, blockhash]))
     }
 
+    /// Fetch a mempool transaction on behalf of an API client broadcast/package path.
     #[trace]
     pub fn getmempooltx(&self, txhash: &Txid) -> Result<Transaction> {
-        let value = self.request("getrawtransaction", json!([txhash, /*verbose=*/ false]))?;
+        let value =
+            self.request_proxied("getrawtransaction", json!([txhash, /*verbose=*/ false]))?;
         tx_from_value(value)
     }
 

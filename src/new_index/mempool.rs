@@ -315,41 +315,63 @@ impl Mempool {
         self.backlog_stats = (BacklogStats::from_feeinfo_slice(&feeinfo), Instant::now());
     }
 
+    /// Ensure a single transaction (e.g. a broadcast one) is in the mempool. Fails if the txid is not
+    /// already indexed and cannot be fetched from the daemon.
     #[trace]
-    pub fn add_by_txid(&mut self, daemon: &Daemon, txid: Txid) -> Result<()> {
-        if self.txstore.get(&txid).is_none() {
-            if let Ok(tx) = daemon.getmempooltx(&txid) {
-                let mut txs_map = HashMap::new();
-                txs_map.insert(txid, tx);
-                self.add(txs_map)
-            } else {
-                bail!("add_by_txid cannot find {}", txid);
-            }
-        } else {
-            Ok(())
+    pub fn ensure_tx(mempool: &RwLock<Mempool>, daemon: &Daemon, txid: Txid) -> Result<()> {
+        if !Self::add_missing(mempool, daemon, &[txid])?.is_empty() {
+            bail!("ensure_tx cannot find txid='{}'", txid);
         }
+        Ok(())
     }
 
-    /// Add multiple transactions (e.g. an accepted package) to the mempool in a single batch,
+    /// Ensure multiple transactions (e.g. an accepted package) are in the mempool in a single batch,
     /// so that interdependent parent/child txs are linked within the same `add` call. Txids that
     /// are already present or cannot be fetched from the daemon are skipped.
-    pub fn add_by_txids(&mut self, daemon: &Daemon, txids: &[Txid]) -> Result<()> {
+    pub fn ensure_txs(mempool: &RwLock<Mempool>, daemon: &Daemon, txids: &[Txid]) -> Result<()> {
+        Self::add_missing(mempool, daemon, txids).map(|_| ())
+    }
+
+    /// Fetch and index the given txids that are not yet in the local mempool, returning the ones
+    /// that could not be fetched. The daemon RPCs run without holding the mempool lock, so they
+    /// never block concurrent readers; the write lock is only taken to insert.
+    fn add_missing(
+        mempool: &RwLock<Mempool>,
+        daemon: &Daemon,
+        txids: &[Txid],
+    ) -> Result<Vec<Txid>> {
+        let missing: Vec<Txid> = {
+            let mempool = mempool.read().unwrap_or_else(|e| e.into_inner());
+            txids
+                .iter()
+                .copied()
+                .filter(|txid| mempool.txstore.get(txid).is_none())
+                .collect()
+        };
+
         let mut txs_map = HashMap::new();
-        for &txid in txids {
-            if self.txstore.get(&txid).is_some() {
-                continue;
-            }
+        let mut unavailable = Vec::new();
+        for txid in missing {
             match daemon.getmempooltx(&txid) {
                 Ok(tx) => {
                     txs_map.insert(txid, tx);
                 }
-                Err(e) => warn!("add_by_txids cannot find txid='{}': e='{}'", txid, e),
+                Err(e) => {
+                    warn!("cannot find mempool txid='{}': e='{}'", txid, e);
+                    unavailable.push(txid);
+                }
             }
         }
-        if txs_map.is_empty() {
-            return Ok(());
+
+        if !txs_map.is_empty() {
+            let mut mempool = mempool.write().unwrap_or_else(|e| e.into_inner());
+            // update() may have indexed some of these while we were fetching
+            txs_map.retain(|txid, _| mempool.txstore.get(txid).is_none());
+            if !txs_map.is_empty() {
+                mempool.add(txs_map)?;
+            }
         }
-        self.add(txs_map)
+        Ok(unavailable)
     }
 
     #[trace]
@@ -529,7 +551,7 @@ impl Mempool {
                 // coexist in the local view. update() itself is safe (evictions
                 // are applied before additions, diffed against one consistent
                 // bitcoind snapshot), but Query::broadcast_raw()/submit_package()
-                // inject transactions via add_by_txid(s) outside the sync loop -
+                // inject transactions via ensure_tx(s) outside the sync loop -
                 // broadcasting a replacement while the original is still indexed
                 // makes the later add() clobber the original's `edges` entry.
                 // Evicting the original then finds its entry gone or foreign.
@@ -690,7 +712,13 @@ impl Mempool {
         if !fetched_txs.is_empty() {
             let mut mempool = mempool.write().unwrap();
 
-            mempool.add(fetched_txs)?;
+            // Query::broadcast_raw()/submit_package() may have indexed some of these via
+            // ensure_tx(s) since the snapshot above; adding them twice would duplicate
+            // their history and recent entries.
+            fetched_txs.retain(|txid, _| mempool.txstore.get(txid).is_none());
+            if !fetched_txs.is_empty() {
+                mempool.add(fetched_txs)?;
+            }
 
             count
                 .with_label_values(&["txs"])

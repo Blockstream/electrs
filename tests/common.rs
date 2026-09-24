@@ -451,6 +451,23 @@ impl TestRunner {
             .transaction()
             .unwrap())
     }
+
+    /// Number of client-proxied daemon RPCs that completed with the given `result` label.
+    pub fn proxied_rpc_count(&self, result: &str) -> f64 {
+        self.metrics
+            .gather()
+            .iter()
+            .filter(|family| family.name() == "daemon_rpc_proxied")
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "result" && label.value() == result)
+            })
+            .map(|metric| metric.get_counter().value())
+            .sum()
+    }
 }
 
 pub fn init_rest_tester() -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {

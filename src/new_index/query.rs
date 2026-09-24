@@ -80,11 +80,7 @@ impl Query {
     #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.daemon.broadcast_raw(txhex)?;
-        let _ = self
-            .mempool
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .add_by_txid(&self.daemon, txid);
+        let _ = Mempool::ensure_tx(&self.mempool, &self.daemon, txid);
         Ok(txid)
     }
 
@@ -100,11 +96,7 @@ impl Query {
         // immediately (they read from the local mempool), mirroring broadcast_raw() above.
         let accepted_txids = result.accepted_txids();
         if !accepted_txids.is_empty() {
-            let _ = self
-                .mempool
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .add_by_txids(&self.daemon, &accepted_txids);
+            let _ = Mempool::ensure_txs(&self.mempool, &self.daemon, &accepted_txids);
         }
         Ok(result)
     }
