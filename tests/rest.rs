@@ -839,6 +839,94 @@ fn test_rest_tx_outspends() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_rest_tx_witness_merkle_proof() -> Result<()> {
+    use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::sha256d;
+    use bitcoin::Transaction;
+
+    // fold a merkle branch bottom-up, mirroring create_merkle_branch_and_root
+    fn fold_branch(mut hash: sha256d::Hash, branch: &[sha256d::Hash], mut pos: usize) -> sha256d::Hash {
+        for sibling in branch {
+            let concat = if pos % 2 == 0 {
+                [&hash[..], &sibling[..]].concat()
+            } else {
+                [&sibling[..], &hash[..]].concat()
+            };
+            hash = sha256d::Hash::hash(&concat);
+            pos /= 2;
+        }
+        hash
+    }
+    fn parse_branch(res: &Value) -> Vec<sha256d::Hash> {
+        res["merkle"]
+            .as_array()
+            .expect("merkle array")
+            .iter()
+            .map(|v| v.as_str().unwrap().parse::<sha256d::Hash>().unwrap())
+            .collect()
+    }
+
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let txid = tester.send(&addr1, "0.5 BTC".parse().unwrap())?;
+    tester.mine()?;
+    let mine_height = tester.get_block_count()?;
+
+    let res = get_json(rest_addr, &format!("/tx/{}/witness-merkle-proof", txid))?;
+    assert_eq!(res["block_height"].as_u64(), Some(mine_height));
+    let pos = res["pos"].as_u64().expect("pos") as usize;
+    assert!(pos > 0, "wallet tx cannot be the coinbase");
+    let witness_root: sha256d::Hash = res["witness_root"]
+        .as_str()
+        .expect("witness_root string")
+        .parse()
+        .expect("valid hash");
+
+    // the tx's own wtxid must fold through the branch to the witness root
+    let tx_hex = get_plain(rest_addr, &format!("/tx/{}/hex", txid))?;
+    let tx: Transaction =
+        deserialize(&Vec::from_hex(&tx_hex).expect("hex")).expect("tx deserialize");
+    assert!(tx.input.iter().any(|i| !i.witness.is_empty()), "test tx should be segwit");
+    let folded = fold_branch(tx.compute_wtxid().to_raw_hash(), &parse_branch(&res), pos);
+    assert_eq!(folded, witness_root, "branch must fold to the witness root");
+
+    // the coinbase's proof uses the ZEROED leaf (BIP-141) and folds to the same root
+    let block_hash = get_plain(rest_addr, &format!("/block-height/{}", mine_height))?;
+    let txids = get_json(rest_addr, &format!("/block/{}/txids", block_hash))?;
+    let coinbase_txid = txids.as_array().expect("txids")[0].as_str().unwrap().to_string();
+    let cb_res = get_json(rest_addr, &format!("/tx/{}/witness-merkle-proof", coinbase_txid))?;
+    assert_eq!(cb_res["pos"].as_u64(), Some(0));
+    assert_eq!(cb_res["witness_root"].as_str().unwrap(), witness_root.to_string());
+    let cb_folded = fold_branch(sha256d::Hash::all_zeros(), &parse_branch(&cb_res), 0);
+    assert_eq!(cb_folded, witness_root, "zeroed coinbase leaf must fold to the witness root");
+
+    // and the root must be the one committed in the coinbase (BIP-141):
+    // commitment output pushes sha256d(witness_root || witness_reserved_value)
+    let cb_hex = get_plain(rest_addr, &format!("/tx/{}/hex", coinbase_txid))?;
+    let coinbase: Transaction =
+        deserialize(&Vec::from_hex(&cb_hex).expect("hex")).expect("coinbase deserialize");
+    let commitment_script = coinbase
+        .output
+        .iter()
+        .map(|o| o.script_pubkey.as_bytes())
+        .find(|s| s.len() >= 38 && s[0..6] == [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed])
+        .expect("coinbase must carry a BIP-141 witness commitment");
+    let reserved = &coinbase.input[0].witness[0];
+    let expected = sha256d::Hash::hash(&[&witness_root[..], &reserved[..]].concat());
+    assert_eq!(&commitment_script[6..38], &expected[..], "witness root must match the coinbase commitment");
+
+    // unconfirmed/unknown tx: 404
+    let bogus = "0000000000000000000000000000000000000000000000000000000000000001";
+    let err = get(rest_addr, &format!("/tx/{}/witness-merkle-proof", bogus));
+    assert!(err.is_err(), "unknown txid should 404");
+
+    rest_handle.stop();
+    Ok(())
+}
+
 #[test]
 fn test_rest_tx_merkle_proof() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();

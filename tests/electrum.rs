@@ -213,6 +213,46 @@ fn test_electrum_raw() {
 
 #[cfg_attr(not(feature = "liquid"), test)]
 #[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_get_witness_merkle() {
+    let (_electrum_server, electrum_addr, mut tester) = common::init_electrum_tester().unwrap();
+
+    let addr = tester.newaddress().unwrap();
+    let txid = tester.send(&addr, "0.31 BTC".parse().unwrap()).unwrap();
+    tester.mine().unwrap();
+    let height = tester.get_block_count().unwrap();
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    let req = format!(
+        "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.transaction.get_witness_merkle\", \"params\": [\"{}\", {}], \"id\": 1}}",
+        txid, height
+    );
+    let s = write_and_read(&mut stream, &req);
+    let v: ::serde_json::Value = ::serde_json::from_str(&s).unwrap();
+    assert!(v["error"].is_null(), "unexpected error: {}", s);
+    let result = &v["result"];
+    assert_eq!(result["block_height"].as_u64(), Some(height));
+    assert!(result["pos"].as_u64().unwrap() > 0);
+    let root = result["witness_root"].as_str().expect("witness_root");
+    assert_eq!(root.len(), 64);
+    assert!(root.chars().all(|c| c.is_ascii_hexdigit()));
+    for entry in result["merkle"].as_array().expect("merkle array") {
+        let hex = entry.as_str().expect("merkle entry");
+        assert_eq!(hex.len(), 64);
+    }
+
+    // wrong height => invalid params error, mirroring get_merkle behavior
+    let req = format!(
+        "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.transaction.get_witness_merkle\", \"params\": [\"{}\", {}], \"id\": 2}}",
+        txid,
+        height + 5
+    );
+    let s = write_and_read(&mut stream, &req);
+    let v: ::serde_json::Value = ::serde_json::from_str(&s).unwrap();
+    assert!(!v["error"].is_null(), "expected invalid-height error, got: {}", s);
+}
+
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
 fn test_electrum_jsonrpc_errors() {
     let (_electrum_server, electrum_addr, mut _tester) = common::init_electrum_tester().unwrap();
 
