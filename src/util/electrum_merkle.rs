@@ -100,13 +100,58 @@ fn estimated_peak_build_bytes(cp_height: usize) -> usize {
         .saturating_mul(3)
 }
 
-type BuildSlot = Mutex<Option<Arc<CachedLevels>>>;
+struct MemoryCharge {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl MemoryCharge {
+    fn new(counter: Arc<AtomicUsize>, bytes: usize) -> Self {
+        counter.fetch_add(bytes, Ordering::AcqRel);
+        Self { counter, bytes }
+    }
+}
+
+impl Drop for MemoryCharge {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+struct RetainedTree {
+    tree: Arc<CachedLevels>,
+    _charge: MemoryCharge,
+}
+
+struct BuildSlot {
+    waiters: AtomicUsize,
+    last_built: Mutex<Option<RetainedTree>>,
+}
+
+struct BuildSlotGuard<'a> {
+    cache: &'a CheckpointMerkleCache,
+    cp_height: usize,
+    slot: Arc<BuildSlot>,
+}
+
+impl<'a> Drop for BuildSlotGuard<'a> {
+    fn drop(&mut self) {
+        let mut locks = self.cache.build_locks.lock().unwrap();
+        if self.slot.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Some(existing) = locks.get(&self.cp_height) {
+                if Arc::ptr_eq(existing, &self.slot) {
+                    locks.remove(&self.cp_height);
+                }
+            }
+        }
+    }
+}
 
 pub struct CheckpointMerkleCache {
     entries: Mutex<Vec<(usize, Arc<CachedLevels>)>>,
     build_locks: Mutex<HashMap<usize, Arc<BuildSlot>>>,
     inflight_rebuilds: AtomicUsize,
-    inflight_build_bytes: AtomicUsize,
+    inflight_build_bytes: Arc<AtomicUsize>,
     capacity_bytes: usize,
 }
 
@@ -116,7 +161,7 @@ impl CheckpointMerkleCache {
             entries: Mutex::new(Vec::new()),
             build_locks: Mutex::new(HashMap::new()),
             inflight_rebuilds: AtomicUsize::new(0),
-            inflight_build_bytes: AtomicUsize::new(0),
+            inflight_build_bytes: Arc::new(AtomicUsize::new(0)),
             capacity_bytes,
         }
     }
@@ -135,44 +180,63 @@ impl CheckpointMerkleCache {
 
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|(h, _)| *h != cp_height && *h <= best_height);
+        if cp_height > best_height {
+            return;
+        }
 
         let mut total_bytes: usize = entries.iter().map(|(_, c)| c.size_bytes).sum();
+        let mut remaining_entries = entries.len();
+        let mut eviction_positions: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, (height, _))| (*height < cp_height).then_some(pos))
+            .collect();
+        eviction_positions.sort_unstable_by_key(|pos| entries[*pos].0);
+
+        let mut evictions_needed = 0;
         while total_bytes + cached.size_bytes > self.capacity_bytes
-            || entries.len() >= MAX_CACHE_ENTRIES
+            || remaining_entries >= MAX_CACHE_ENTRIES
         {
-            match entries.iter().enumerate().min_by_key(|(_, (h, _))| *h) {
-                Some((pos, (min_height, _))) if cp_height > *min_height => {
-                    total_bytes -= entries[pos].1.size_bytes;
-                    entries.remove(pos);
-                }
-                _ => return,
-            }
+            let Some(pos) = eviction_positions.get(evictions_needed).copied() else {
+                return;
+            };
+            total_bytes -= entries[pos].1.size_bytes;
+            remaining_entries -= 1;
+            evictions_needed += 1;
+        }
+
+        let mut selected_positions = eviction_positions[..evictions_needed].to_vec();
+        selected_positions.sort_unstable_by(|a, b| b.cmp(a));
+        for pos in selected_positions {
+            entries.remove(pos);
         }
 
         entries.push((cp_height, cached));
     }
 
-    fn build_lock_for(&self, cp_height: usize) -> Arc<BuildSlot> {
+    fn build_lock_for(&self, cp_height: usize) -> BuildSlotGuard<'_> {
         let mut locks = self.build_locks.lock().unwrap();
-        locks
+        let slot = locks
             .entry(cp_height)
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
-            .clone()
-    }
-
-    fn release_build_lock(&self, cp_height: usize, lock: &Arc<BuildSlot>) {
-        let mut locks = self.build_locks.lock().unwrap();
-        if let Some(existing) = locks.get(&cp_height) {
-            if Arc::ptr_eq(existing, lock) && Arc::strong_count(existing) <= 2 {
-                locks.remove(&cp_height);
-            }
+            .or_insert_with(|| {
+                Arc::new(BuildSlot {
+                    waiters: AtomicUsize::new(0),
+                    last_built: Mutex::new(None),
+                })
+            })
+            .clone();
+        slot.waiters.fetch_add(1, Ordering::AcqRel);
+        BuildSlotGuard {
+            cache: self,
+            cp_height,
+            slot,
         }
     }
 
     fn get_or_build(
         &self,
         cp_height: usize,
-        best_height: usize,
+        current_best_height: impl FnOnce() -> usize,
         concurrency_limit: usize,
         snapshot_cp_hash_and_sibling: impl Fn() -> Result<(BlockHash, Sha256dHash)>,
         build: impl FnOnce() -> Result<(BlockHash, Vec<Vec<Sha256dHash>>, Sha256dHash)>,
@@ -183,36 +247,37 @@ impl CheckpointMerkleCache {
         }
 
         let build_lock = self.build_lock_for(cp_height);
-        let result = self.build_under_lock(
+        self.build_under_lock(
             cp_height,
-            best_height,
+            current_best_height,
             cp_hash,
             sibling,
             concurrency_limit,
-            &build_lock,
+            &build_lock.slot,
             build,
-        );
-        self.release_build_lock(cp_height, &build_lock);
-        result
+        )
     }
 
     fn build_under_lock(
         &self,
         cp_height: usize,
-        best_height: usize,
+        current_best_height: impl FnOnce() -> usize,
         cp_hash: BlockHash,
         sibling: Sha256dHash,
         concurrency_limit: usize,
         build_lock: &BuildSlot,
         build: impl FnOnce() -> Result<(BlockHash, Vec<Vec<Sha256dHash>>, Sha256dHash)>,
     ) -> Result<(Arc<CachedLevels>, Sha256dHash)> {
-        let mut last_built = build_lock.lock().unwrap();
+        let mut last_built = build_lock
+            .last_built
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(cached) = self.get_valid(cp_height, cp_hash) {
             return Ok((cached, sibling));
         }
-        if let Some(cached) = last_built.as_ref().filter(|c| c.cp_hash == cp_hash) {
-            return Ok((cached.clone(), sibling));
+        if let Some(retained) = last_built.as_ref().filter(|r| r.tree.cp_hash == cp_hash) {
+            return Ok((retained.tree.clone(), sibling));
         }
 
         let _permit = RebuildPermit::acquire(&self.inflight_rebuilds, concurrency_limit)?;
@@ -226,14 +291,19 @@ impl CheckpointMerkleCache {
         drop(entries);
         let (cp_hash, levels, sibling) = build()?;
         let cached = Arc::new(CachedLevels::new(cp_hash, levels));
-        self.insert(cp_height, best_height, cached.clone());
-        *last_built = Some(cached.clone());
+        self.insert(cp_height, current_best_height(), cached.clone());
+        *last_built = Some(RetainedTree {
+            _charge: MemoryCharge::new(self.inflight_build_bytes.clone(), cached.size_bytes),
+            tree: cached.clone(),
+        });
         Ok((cached, sibling))
     }
 }
 
 fn merklize(left: Sha256dHash, right: Sha256dHash) -> Sha256dHash {
-    let data = [&left[..], &right[..]].concat();
+    let mut data = [0u8; 64];
+    data[..32].copy_from_slice(&left[..]);
+    data[32..].copy_from_slice(&right[..]);
     Sha256dHash::hash(&data)
 }
 
@@ -310,7 +380,7 @@ pub fn get_header_merkle_proof(
     height: usize,
     cp_height: usize,
     checkpoint_proof_concurrency_limit: usize,
-) -> Result<(Vec<Sha256dHash>, Sha256dHash)> {
+) -> Result<(Vec<Sha256dHash>, Sha256dHash, BlockHash)> {
     if cp_height < height {
         bail!("cp_height #{} < height #{}", cp_height, height);
     }
@@ -326,16 +396,19 @@ pub fn get_header_merkle_proof(
 
     if cp_height == 0 {
         let headers = chain.store().headers();
-        let root = Sha256dHash::from(
-            *headers
-                .header_by_height(0)
-                .chain_err(|| "missing block header at height 0")?
-                .hash(),
-        );
-        return Ok((vec![], root));
+        let cp_hash = *headers
+            .header_by_height(0)
+            .chain_err(|| "missing block header at height 0")?
+            .hash();
+        let root = Sha256dHash::from(cp_hash);
+        return Ok((vec![], root, cp_hash));
     }
 
-    let sibling_index = if height % 2 == 0 { height + 1 } else { height - 1 };
+    let sibling_index = if height % 2 == 0 {
+        height + 1
+    } else {
+        height - 1
+    };
     let sibling_height = sibling_index.min(cp_height);
 
     let snapshot_cp_hash_and_sibling = || -> Result<(BlockHash, Sha256dHash)> {
@@ -374,14 +447,16 @@ pub fn get_header_merkle_proof(
         Ok((cp_hash, levels, sibling))
     };
 
-    let (cached, sibling) = chain.checkpoint_merkle_cache().get_or_build(cp_height,
-        best_height,
+    let (cached, sibling) = chain.checkpoint_merkle_cache().get_or_build(
+        cp_height,
+        || chain.best_height(),
         checkpoint_proof_concurrency_limit,
         snapshot_cp_hash_and_sibling,
         build,
     )?;
 
-    extract_branch_and_root(&cached.levels, sibling, height)
+    let (branch, root) = extract_branch_and_root(&cached.levels, sibling, height)?;
+    Ok((branch, root, cached.cp_hash))
 }
 
 #[trace]
@@ -447,7 +522,11 @@ mod tests {
     }
 
     fn sibling_leaf(leaves: &[Sha256dHash], cp_height: usize, height: usize) -> Sha256dHash {
-        let sibling_index = if height % 2 == 0 { height + 1 } else { height - 1 };
+        let sibling_index = if height % 2 == 0 {
+            height + 1
+        } else {
+            height - 1
+        };
         leaves[sibling_index.min(cp_height)]
     }
 
@@ -495,7 +574,9 @@ mod tests {
         for height in [0usize, 3, 8] {
             let sibling = sibling_leaf(&leaves, cp_height, height);
             let (cached, _) = cache
-                .get_or_build(cp_height, usize::MAX,
+                .get_or_build(
+                    cp_height,
+                    || usize::MAX,
                     1,
                     || Ok((cp_hash, sibling)),
                     || {
@@ -530,24 +611,42 @@ mod tests {
         let build_count = AtomicUsize::new(0);
 
         cache
-            .get_or_build(cp_height, usize::MAX, 4, || Ok((old_hash, sibling)), || {
-                build_count.fetch_add(1, Ordering::SeqCst);
-                Ok((old_hash, build_levels_above_leaves(&leaves)?, sibling))
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                4,
+                || Ok((old_hash, sibling)),
+                || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    Ok((old_hash, build_levels_above_leaves(&leaves)?, sibling))
+                },
+            )
             .unwrap();
         cache
-            .get_or_build(cp_height, usize::MAX, 4, || Ok((old_hash, sibling)), || {
-                build_count.fetch_add(1, Ordering::SeqCst);
-                Ok((old_hash, build_levels_above_leaves(&leaves)?, sibling))
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                4,
+                || Ok((old_hash, sibling)),
+                || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    Ok((old_hash, build_levels_above_leaves(&leaves)?, sibling))
+                },
+            )
             .unwrap();
         assert_eq!(build_count.load(Ordering::SeqCst), 1);
 
         cache
-            .get_or_build(cp_height, usize::MAX, 4, || Ok((new_hash, sibling)), || {
-                build_count.fetch_add(1, Ordering::SeqCst);
-                Ok((new_hash, build_levels_above_leaves(&leaves)?, sibling))
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                4,
+                || Ok((new_hash, sibling)),
+                || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    Ok((new_hash, build_levels_above_leaves(&leaves)?, sibling))
+                },
+            )
             .unwrap();
         assert_eq!(
             build_count.load(Ordering::SeqCst),
@@ -559,7 +658,8 @@ mod tests {
     #[test]
     fn stale_entry_returns_correct_branch_and_root_after_checkpoint_hash_changes() {
         let old_leaves = leaves(5);
-        let new_leaves: Vec<Sha256dHash> = (100..105).map(|i| Sha256dHash::hash(&[i as u8])).collect();
+        let new_leaves: Vec<Sha256dHash> =
+            (100..105).map(|i| Sha256dHash::hash(&[i as u8])).collect();
         let cp_height = 4;
         let height = 1;
         let old_sibling = sibling_leaf(&old_leaves, cp_height, height);
@@ -570,9 +670,19 @@ mod tests {
         let cache = CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES);
 
         let (old_cached, old_ret_sibling) = cache
-            .get_or_build(cp_height, usize::MAX, 4, || Ok((old_hash, old_sibling)), || {
-                Ok((old_hash, build_levels_above_leaves(&old_leaves)?, old_sibling))
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                4,
+                || Ok((old_hash, old_sibling)),
+                || {
+                    Ok((
+                        old_hash,
+                        build_levels_above_leaves(&old_leaves)?,
+                        old_sibling,
+                    ))
+                },
+            )
             .unwrap();
         let (old_branch, old_root) =
             extract_branch_and_root(&old_cached.levels, old_ret_sibling, height).unwrap();
@@ -582,9 +692,19 @@ mod tests {
         assert_eq!(old_root, expected_old_root);
 
         let (new_cached, new_ret_sibling) = cache
-            .get_or_build(cp_height, usize::MAX, 4, || Ok((new_hash, new_sibling)), || {
-                Ok((new_hash, build_levels_above_leaves(&new_leaves)?, new_sibling))
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                4,
+                || Ok((new_hash, new_sibling)),
+                || {
+                    Ok((
+                        new_hash,
+                        build_levels_above_leaves(&new_leaves)?,
+                        new_sibling,
+                    ))
+                },
+            )
             .unwrap();
         let (new_branch, new_root) =
             extract_branch_and_root(&new_cached.levels, new_ret_sibling, height).unwrap();
@@ -609,7 +729,9 @@ mod tests {
         for cp_height in [10usize, 20, 30, 40, 50] {
             let hash = BlockHash::hash(&[cp_height as u8]);
             cache
-                .get_or_build(cp_height, usize::MAX,
+                .get_or_build(
+                    cp_height,
+                    || usize::MAX,
                     4,
                     || Ok((hash, leaf)),
                     || Ok((hash, build_levels_above_leaves(&entry_leaves)?, leaf)),
@@ -620,7 +742,9 @@ mod tests {
 
         let hash60 = BlockHash::hash(&[60u8]);
         cache
-            .get_or_build(60, usize::MAX,
+            .get_or_build(
+                60,
+                || usize::MAX,
                 4,
                 || Ok((hash60, leaf)),
                 || Ok((hash60, build_levels_above_leaves(&entry_leaves)?, leaf)),
@@ -654,7 +778,9 @@ mod tests {
         for cp_height in [10usize, 20, 30, 40, 50] {
             let hash = BlockHash::hash(&[cp_height as u8]);
             cache
-                .get_or_build(cp_height, usize::MAX,
+                .get_or_build(
+                    cp_height,
+                    || usize::MAX,
                     4,
                     || Ok((hash, leaf)),
                     || Ok((hash, build_levels_above_leaves(&entry_leaves)?, leaf)),
@@ -665,7 +791,9 @@ mod tests {
 
         let hash5 = BlockHash::hash(&[5u8]);
         cache
-            .get_or_build(5, usize::MAX,
+            .get_or_build(
+                5,
+                || usize::MAX,
                 4,
                 || Ok((hash5, leaf)),
                 || Ok((hash5, build_levels_above_leaves(&entry_leaves)?, leaf)),
@@ -689,6 +817,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_insert_does_not_partially_evict_lower_entries() {
+        let hash_bytes = std::mem::size_of::<Sha256dHash>();
+        let cache = CheckpointMerkleCache::new(5 * hash_bytes);
+        let make_cached = |height: usize, hashes: usize| {
+            Arc::new(CachedLevels::new(
+                BlockHash::hash(&[height as u8]),
+                vec![vec![Sha256dHash::hash(&[height as u8]); hashes]],
+            ))
+        };
+
+        cache.insert(10, usize::MAX, make_cached(10, 1));
+        cache.insert(30, usize::MAX, make_cached(30, 4));
+        cache.insert(20, usize::MAX, make_cached(20, 2));
+
+        let heights: Vec<usize> = cache
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(height, _)| *height)
+            .collect();
+        assert_eq!(heights, vec![10, 30]);
+    }
+
+    #[test]
     fn insert_caps_entry_count_even_under_a_generous_byte_budget() {
         let entry_leaves = leaves(2);
         let entry_bytes = build_levels_above_leaves(&entry_leaves).unwrap()[0].len()
@@ -699,7 +852,9 @@ mod tests {
 
         for cp_height in 0..MAX_CACHE_ENTRIES + 50 {
             cache
-                .get_or_build(cp_height, usize::MAX,
+                .get_or_build(
+                    cp_height,
+                    || usize::MAX,
                     4,
                     || Ok((hash, leaf)),
                     || Ok((hash, build_levels_above_leaves(&entry_leaves)?, leaf)),
@@ -726,9 +881,13 @@ mod tests {
         let old_height = 100;
         let old_hash = BlockHash::hash(&[1u8]);
         cache
-            .get_or_build(old_height, old_height, 4, || Ok((old_hash, leaf)), || {
-                Ok((old_hash, build_levels_above_leaves(&entry_leaves)?, leaf))
-            })
+            .get_or_build(
+                old_height,
+                || old_height,
+                4,
+                || Ok((old_hash, leaf)),
+                || Ok((old_hash, build_levels_above_leaves(&entry_leaves)?, leaf)),
+            )
             .unwrap();
         assert_eq!(cache.entries.lock().unwrap().len(), 1);
 
@@ -737,18 +896,30 @@ mod tests {
         let build_count = AtomicUsize::new(0);
 
         cache
-            .get_or_build(new_height, new_height, 4, || Ok((new_hash, leaf)), || {
-                build_count.fetch_add(1, Ordering::SeqCst);
-                Ok((new_hash, build_levels_above_leaves(&entry_leaves)?, leaf))
-            })
+            .get_or_build(
+                new_height,
+                || new_height,
+                4,
+                || Ok((new_hash, leaf)),
+                || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    Ok((new_hash, build_levels_above_leaves(&entry_leaves)?, leaf))
+                },
+            )
             .unwrap();
         assert_eq!(build_count.load(Ordering::SeqCst), 1);
 
         cache
-            .get_or_build(new_height, new_height, 4, || Ok((new_hash, leaf)), || {
-                build_count.fetch_add(1, Ordering::SeqCst);
-                panic!("must serve from cache instead of rebuilding")
-            })
+            .get_or_build(
+                new_height,
+                || new_height,
+                4,
+                || Ok((new_hash, leaf)),
+                || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    panic!("must serve from cache instead of rebuilding")
+                },
+            )
             .unwrap();
         assert_eq!(
             build_count.load(Ordering::SeqCst),
@@ -765,6 +936,54 @@ mod tests {
             .map(|(h, _)| *h)
             .collect();
         assert_eq!(heights, vec![new_height]);
+    }
+
+    #[test]
+    fn insertion_reads_best_height_after_a_slow_rebuild() {
+        let entry_leaves = leaves(2);
+        let levels = build_levels_above_leaves(&entry_leaves).unwrap();
+        let entry_bytes = levels[0].len() * std::mem::size_of::<Sha256dHash>();
+        let cache = CheckpointMerkleCache::new(2 * entry_bytes);
+        let leaf = entry_leaves[0];
+
+        let new_tip_height = 101;
+        cache.insert(
+            new_tip_height,
+            new_tip_height,
+            Arc::new(CachedLevels::new(
+                BlockHash::hash(&[new_tip_height as u8]),
+                levels.clone(),
+            )),
+        );
+
+        let best_height = AtomicUsize::new(new_tip_height - 1);
+        let cp_height = new_tip_height - 1;
+        let cp_hash = BlockHash::hash(&[cp_height as u8]);
+        cache
+            .get_or_build(
+                cp_height,
+                || best_height.load(Ordering::SeqCst),
+                1,
+                || Ok((cp_hash, leaf)),
+                || {
+                    best_height.store(new_tip_height, Ordering::SeqCst);
+                    Ok((cp_hash, levels, leaf))
+                },
+            )
+            .unwrap();
+
+        let heights: Vec<usize> = cache
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(height, _)| *height)
+            .collect();
+        assert!(
+            heights.contains(&new_tip_height),
+            "a tip cached during the rebuild must not be pruned using the rebuild's starting height"
+        );
+        assert!(heights.contains(&cp_height));
     }
 
     #[test]
@@ -787,7 +1006,9 @@ mod tests {
                 thread::spawn(move || {
                     barrier.wait();
                     cache
-                        .get_or_build(cp_height, usize::MAX,
+                        .get_or_build(
+                            cp_height,
+                            || usize::MAX,
                             8,
                             || Ok((cp_hash, sibling)),
                             || {
@@ -809,6 +1030,10 @@ mod tests {
             build_count.load(Ordering::SeqCst),
             1,
             "8 concurrent requests for the same cp_height must build exactly once"
+        );
+        assert!(
+            cache.build_locks.lock().unwrap().is_empty(),
+            "no build slot may remain after all requests finished"
         );
     }
 
@@ -833,7 +1058,9 @@ mod tests {
                 thread::spawn(move || {
                     barrier.wait();
                     cache
-                        .get_or_build(cp_height, usize::MAX,
+                        .get_or_build(
+                            cp_height,
+                            || usize::MAX,
                             8,
                             || Ok((cp_hash, sibling)),
                             || {
@@ -856,6 +1083,158 @@ mod tests {
             1,
             "8 concurrent requests for the same uncacheable cp_height must still build exactly once"
         );
+        drop(_keep_build_slot_alive);
+        assert!(
+            cache.build_locks.lock().unwrap().is_empty(),
+            "no build slot may remain once the last request releases it"
+        );
+    }
+
+    #[test]
+    fn concurrent_releases_must_not_leak_the_build_slot_and_its_tree() {
+        let leaves = leaves(9);
+        let cp_height = 8;
+        let cp_hash = BlockHash::hash(&[9u8]);
+        let sibling = sibling_leaf(&leaves, cp_height, 0);
+
+        let cache = CheckpointMerkleCache::new(0);
+
+        let slot_a = cache.build_lock_for(cp_height);
+        let slot_b = cache.build_lock_for(cp_height);
+
+        cache
+            .build_under_lock(
+                cp_height,
+                || usize::MAX,
+                cp_hash,
+                sibling,
+                1,
+                &slot_a.slot,
+                || Ok((cp_hash, build_levels_above_leaves(&leaves)?, sibling)),
+            )
+            .unwrap();
+
+        drop(slot_a);
+        assert_eq!(
+            cache.build_locks.lock().unwrap().len(),
+            1,
+            "slot must stay while another request still holds it"
+        );
+        drop(slot_b);
+
+        let locks = cache.build_locks.lock().unwrap();
+        assert!(
+            locks.is_empty(),
+            "build slot leaked after all requests finished, retaining the tree \
+             outside the cache's memory accounting"
+        );
+    }
+
+    #[test]
+    fn tree_retained_only_by_a_build_slot_counts_against_the_memory_budget() {
+        let entry_leaves = leaves(2);
+        let retained_bytes = build_levels_above_leaves(&entry_leaves).unwrap()[0].len()
+            * std::mem::size_of::<Sha256dHash>();
+        let leaf = entry_leaves[0];
+
+        let blocked_height = 1_000usize;
+        let cache = CheckpointMerkleCache::new(estimated_peak_build_bytes(blocked_height));
+
+        let uncached_height = 100;
+        let uncached_hash = BlockHash::hash(&[1u8]);
+        let slot_guard = cache.build_lock_for(uncached_height);
+        cache
+            .build_under_lock(
+                uncached_height,
+                || uncached_height - 1,
+                uncached_hash,
+                leaf,
+                4,
+                &slot_guard.slot,
+                || {
+                    Ok((
+                        uncached_hash,
+                        build_levels_above_leaves(&entry_leaves)?,
+                        leaf,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(cache.entries.lock().unwrap().is_empty());
+        assert_eq!(
+            cache.inflight_build_bytes.load(Ordering::SeqCst),
+            retained_bytes,
+            "a tree retained only by last_built must be charged to the budget"
+        );
+
+        let blocked_hash = BlockHash::hash(&[2u8]);
+        let result = cache.get_or_build(
+            blocked_height,
+            || usize::MAX,
+            4,
+            || Ok((blocked_hash, leaf)),
+            || panic!("must not build while retained slot bytes exhaust the budget"),
+        );
+        assert!(
+            result.is_err(),
+            "a rebuild must be rejected while slot-retained bytes exhaust the budget"
+        );
+
+        drop(slot_guard);
+        assert_eq!(
+            cache.inflight_build_bytes.load(Ordering::SeqCst),
+            0,
+            "releasing the slot must release its memory charge"
+        );
+        cache
+            .get_or_build(
+                blocked_height,
+                || usize::MAX,
+                4,
+                || Ok((blocked_hash, leaf)),
+                || Ok((blocked_hash, build_levels_above_leaves(&entry_leaves)?, leaf)),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_panicking_build_does_not_poison_the_slot_for_waiters() {
+        let leaves = Arc::new(leaves(5));
+        let cp_height = 4;
+        let cp_hash = BlockHash::hash(&[1u8]);
+        let sibling = sibling_leaf(&leaves, cp_height, 0);
+
+        let cache = Arc::new(CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES));
+        let _keep_slot_alive = cache.build_lock_for(cp_height);
+
+        let panicking = {
+            let cache = cache.clone();
+            thread::spawn(move || {
+                let _ = cache.get_or_build(
+                    cp_height,
+                    || usize::MAX,
+                    4,
+                    || Ok((cp_hash, sibling)),
+                    || panic!("simulated build failure"),
+                );
+            })
+        };
+        assert!(panicking.join().is_err());
+        assert_eq!(
+            cache.build_locks.lock().unwrap().len(),
+            1,
+            "the slot must survive for the still-registered request"
+        );
+
+        cache
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                4,
+                || Ok((cp_hash, sibling)),
+                || Ok((cp_hash, build_levels_above_leaves(&leaves)?, sibling)),
+            )
+            .expect("a waiter must recover from a poisoned slot instead of panicking");
     }
 
     #[test]
@@ -886,15 +1265,23 @@ mod tests {
 
         let cache = CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES);
         cache
-            .get_or_build(cp_height, usize::MAX, 1, || Ok((cp_hash, sibling)), || {
-                Ok((cp_hash, build_levels_above_leaves(&leaves)?, sibling))
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                1,
+                || Ok((cp_hash, sibling)),
+                || Ok((cp_hash, build_levels_above_leaves(&leaves)?, sibling)),
+            )
             .unwrap();
 
         cache
-            .get_or_build(cp_height, usize::MAX, 0, || Ok((cp_hash, sibling)), || {
-                panic!("must not rebuild on a cache hit")
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                0,
+                || Ok((cp_hash, sibling)),
+                || panic!("must not rebuild on a cache hit"),
+            )
             .unwrap();
     }
 
@@ -907,9 +1294,13 @@ mod tests {
 
         let cache = Arc::new(CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES));
         cache
-            .get_or_build(cp_height, usize::MAX, 1, || Ok((cp_hash, sibling)), || {
-                Ok((cp_hash, build_levels_above_leaves(&leaves)?, sibling))
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                1,
+                || Ok((cp_hash, sibling)),
+                || Ok((cp_hash, build_levels_above_leaves(&leaves)?, sibling)),
+            )
             .unwrap();
 
         const HOLDERS: usize = 2;
@@ -926,7 +1317,9 @@ mod tests {
                     let hash = BlockHash::hash(&[100 + i as u8]);
                     let leaf = Sha256dHash::hash(&[0u8]);
                     cache
-                        .get_or_build(miss_height, usize::MAX,
+                        .get_or_build(
+                            miss_height,
+                            || usize::MAX,
                             HOLDERS,
                             || Ok((hash, leaf)),
                             || {
@@ -943,9 +1336,13 @@ mod tests {
         inside_build.wait();
 
         cache
-            .get_or_build(cp_height, usize::MAX, 0, || Ok((cp_hash, sibling)), || {
-                panic!("must not rebuild on a cache hit")
-            })
+            .get_or_build(
+                cp_height,
+                || usize::MAX,
+                0,
+                || Ok((cp_hash, sibling)),
+                || panic!("must not rebuild on a cache hit"),
+            )
             .unwrap();
 
         release_build.wait();
@@ -977,7 +1374,9 @@ mod tests {
                     let hash = BlockHash::hash(&[miss_height as u8]);
                     let leaf = Sha256dHash::hash(&[0u8]);
                     cache
-                        .get_or_build(miss_height, usize::MAX,
+                        .get_or_build(
+                            miss_height,
+                            || usize::MAX,
                             100,
                             || Ok((hash, leaf)),
                             || {
@@ -993,9 +1392,13 @@ mod tests {
 
         inside_build.wait();
 
-        let result = cache.get_or_build(3_000, usize::MAX, 100, || Ok((BlockHash::hash(&[9u8]), Sha256dHash::hash(&[0u8]))), || {
-            panic!("must not rebuild once the memory budget is fully held")
-        });
+        let result = cache.get_or_build(
+            3_000,
+            || usize::MAX,
+            100,
+            || Ok((BlockHash::hash(&[9u8]), Sha256dHash::hash(&[0u8]))),
+            || panic!("must not rebuild once the memory budget is fully held"),
+        );
         assert!(
             result.is_err(),
             "a third concurrent rebuild must be rejected once the memory budget is exhausted, even with a generous concurrency_limit"
@@ -1025,7 +1428,9 @@ mod tests {
 
         let cache = Arc::new(CheckpointMerkleCache::new(capacity_bytes));
         cache
-            .get_or_build(resident_height, usize::MAX,
+            .get_or_build(
+                resident_height,
+                || usize::MAX,
                 1,
                 || Ok((resident_hash, resident_sibling)),
                 || {
@@ -1049,7 +1454,9 @@ mod tests {
                 let hash = BlockHash::hash(&[9u8]);
                 let leaf = Sha256dHash::hash(&[0u8]);
                 cache
-                    .get_or_build(holder_height, usize::MAX,
+                    .get_or_build(
+                        holder_height,
+                        || usize::MAX,
                         100,
                         || Ok((hash, leaf)),
                         || {
@@ -1064,7 +1471,9 @@ mod tests {
 
         inside_build.wait();
 
-        let result = cache.get_or_build(extra_height, usize::MAX,
+        let result = cache.get_or_build(
+            extra_height,
+            || usize::MAX,
             100,
             || Ok((BlockHash::hash(&[11u8]), Sha256dHash::hash(&[0u8]))),
             || panic!("must not rebuild once resident cache bytes and the held build already exhaust the budget"),
