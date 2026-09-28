@@ -212,10 +212,6 @@ impl TestRunner {
         })
     }
 
-    pub fn query(&self) -> Arc<Query> {
-        Arc::clone(&self.query)
-    }
-
     pub fn metrics_addr(&self) -> net::SocketAddr {
         self.metrics_addr
     }
