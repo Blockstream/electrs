@@ -1,4 +1,5 @@
 use arraydeque::{ArrayDeque, Wrapping};
+use error_chain::ChainedError;
 use itertools::{Either, Itertools};
 
 #[cfg(not(feature = "liquid"))]
@@ -16,7 +17,7 @@ use crate::chain::{deserialize, BlockHash, Network, OutPoint, Transaction, TxOut
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
-use crate::metrics::{GaugeVec, HistogramOpts, HistogramVec, MetricOpts, Metrics};
+use crate::metrics::{Counter, GaugeVec, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{
     compute_script_hash, schema::FullHash, ChainQuery, FundingInfo, GetAmountVal, ScriptStats,
     SpendingInfo, SpendingInput, TxHistoryInfo, Utxo,
@@ -29,6 +30,13 @@ use crate::elements::asset;
 
 const RECENT_TXS_SIZE: usize = 10;
 const BACKLOG_STATS_TTL: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MempoolSyncStatus {
+    Synced,
+    TipMoved,
+    FailedToIndex,
+}
 
 pub struct Mempool {
     chain: Arc<ChainQuery>,
@@ -46,6 +54,7 @@ pub struct Mempool {
     latency: HistogramVec, // mempool requests latency
     delta: HistogramVec,   // # of added/removed txs
     count: GaugeVec,       // current state of the mempool
+    sync_failed_to_index: Counter, // # of times a mempool sync failed to index fetched txs
 
     // elements only
     #[cfg(feature = "liquid")]
@@ -79,7 +88,9 @@ impl Mempool {
             recent: ArrayDeque::new(),
             backlog_stats: (
                 BacklogStats::default(),
-                Instant::now() - Duration::from_secs(BACKLOG_STATS_TTL),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(BACKLOG_STATS_TTL))
+                    .unwrap_or_else(Instant::now),
             ),
             latency: metrics.histogram_vec(
                 HistogramOpts::new("mempool_latency", "Mempool requests latency (in seconds)"),
@@ -93,6 +104,10 @@ impl Mempool {
                 MetricOpts::new("mempool_count", "# of elements currently at the mempool"),
                 &["type"],
             ),
+            sync_failed_to_index: metrics.counter(MetricOpts::new(
+                "mempool_sync_failed_to_index",
+                "# of times a mempool sync failed to index fetched transactions",
+            )),
 
             #[cfg(feature = "liquid")]
             asset_history: HashMap::new(),
@@ -601,14 +616,13 @@ impl Mempool {
             .map_or_else(|| vec![], |entries| self._history(entries, limit))
     }
 
-    /// Sync our local view of the mempool with the bitcoind Daemon RPC. If the chain tip moves before
-    /// the mempool is fetched in full, syncing is aborted and an Ok(false) is returned.
+    /// Sync our local view of the mempool with the bitcoind Daemon RPC.
     #[trace]
     pub fn update(
         mempool: &Arc<RwLock<Mempool>>,
         daemon: &Daemon,
         tip: &BlockHash,
-    ) -> Result<bool> {
+    ) -> Result<MempoolSyncStatus> {
         let (_timer, count) = {
             let mempool = mempool.read().unwrap();
             let timer = mempool.latency.with_label_values(&["update"]).start_timer();
@@ -653,7 +667,7 @@ impl Mempool {
             .set(new_txids.len() as f64);
 
         if new_txids.is_empty() {
-            return Ok(true);
+            return Ok(MempoolSyncStatus::Synced);
         }
 
         // Fetch missing transactions from bitcoind
@@ -662,7 +676,7 @@ impl Mempool {
         // Abort if the chain tip moved while fetching transactions
         if daemon.getbestblockhash()? != *tip {
             warn!("chain tip moved while updating mempool");
-            return Ok(false);
+            return Ok(MempoolSyncStatus::TipMoved);
         }
 
         // Find which transactions were requested but are no longer available in bitcoind's mempool,
@@ -710,6 +724,7 @@ impl Mempool {
         // Add fetched transactions to our view of the mempool
         trace!("indexing {} new mempool transactions", fetched_txs.len());
         if !fetched_txs.is_empty() {
+            let fetched_txs_len = fetched_txs.len();
             let mut mempool = mempool.write().unwrap();
 
             // Query::broadcast_raw()/submit_package() may have indexed some of these via
@@ -717,7 +732,15 @@ impl Mempool {
             // their history and recent entries.
             fetched_txs.retain(|txid, _| mempool.txstore.get(txid).is_none());
             if !fetched_txs.is_empty() {
-                mempool.add(fetched_txs)?;
+                if let Err(e) = mempool.add(fetched_txs) {
+                    warn!(
+                        "transient failure adding {} fetched txs, skipping until next cycle: {}",
+                        fetched_txs_len,
+                        e.display_chain()
+                    );
+                    mempool.sync_failed_to_index.inc();
+                    return Ok(MempoolSyncStatus::FailedToIndex);
+                }
             }
 
             count
@@ -732,7 +755,7 @@ impl Mempool {
 
         trace!("mempool is synced");
 
-        Ok(true)
+        Ok(MempoolSyncStatus::Synced)
     }
 }
 

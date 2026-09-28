@@ -8,7 +8,7 @@ extern crate log;
 extern crate electrs;
 
 use crossbeam_channel::{self as channel};
-use error_chain::ChainedError;
+use error_chain::{bail, ChainedError};
 use std::{env, process, thread};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -20,7 +20,9 @@ use electrs::{
     electrum::RPC as ElectrumRPC,
     errors::*,
     metrics::Metrics,
-    new_index::{precache, zmq, ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
+    new_index::{
+        precache, zmq, ChainQuery, FetchFrom, Indexer, Mempool, MempoolSyncStatus, Query, Store,
+    },
     rest,
     signal::Waiter,
 };
@@ -34,6 +36,10 @@ use electrs::metrics::MetricOpts;
 
 /// Default salt rotation interval in seconds (24 hours)
 const DEFAULT_SALT_ROTATION_INTERVAL_SECS: u64 = 24 * 3600;
+
+/// Maximum number of `FailedToIndex` retries during the initial mempool
+/// sync before giving up.
+const MAX_INITIAL_MEMPOOL_SYNC_RETRIES: u32 = 100;
 
 fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
     let mut jsonrpc_import = config.jsonrpc_import;
@@ -122,18 +128,32 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         Arc::clone(&config),
     )));
 
-    // A mempool update is retried whenever the tip moves, so index and try again. An update
-    // that cannot advance the tip never will here, and no listener is bound yet.
-    while !Mempool::update(&mempool, &daemon, &tip)? {
-        let new_tip = indexer.update(&daemon)?;
-        if new_tip == tip {
-            warn!(
-                "index could not advance, starting up with a partial index tip='{}'",
-                tip
-            );
-            break;
+    let mut mempool_sync_retries = 0;
+    loop {
+        match Mempool::update(&mempool, &daemon, &tip)? {
+            MempoolSyncStatus::Synced => break,
+            MempoolSyncStatus::TipMoved => {
+                let new_tip = indexer.update(&daemon)?;
+                if new_tip == tip {
+                    warn!(
+                        "index could not advance, starting up with a partial index tip='{}'",
+                        tip
+                    );
+                    break;
+                }
+                tip = new_tip;
+            }
+            MempoolSyncStatus::FailedToIndex => {
+                mempool_sync_retries += 1;
+                if mempool_sync_retries >= MAX_INITIAL_MEMPOOL_SYNC_RETRIES {
+                    bail!(
+                        "initial mempool sync failed to index {} times, giving up",
+                        MAX_INITIAL_MEMPOOL_SYNC_RETRIES
+                    );
+                }
+                signal.wait(Duration::from_secs(3), false)?;
+            }
         }
-        tip = new_tip;
     }
 
     #[cfg(feature = "liquid")]
@@ -185,8 +205,14 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         };
 
         // Update mempool
-        if !Mempool::update(&mempool, &daemon, &tip)? {
-            warn!("skipped failed mempool update, trying again in 5 seconds");
+        match Mempool::update(&mempool, &daemon, &tip)? {
+            MempoolSyncStatus::Synced => {}
+            MempoolSyncStatus::TipMoved => {
+                warn!("mempool sync aborted: chain tip moved, retrying next cycle");
+            }
+            MempoolSyncStatus::FailedToIndex => {
+                warn!("mempool_sync_failed_to_index: retrying next cycle");
+            }
         }
 
         // Update subscribed clients

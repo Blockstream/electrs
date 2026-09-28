@@ -479,12 +479,16 @@ impl Default for SpendingValue {
 
 fn ttl_by_depth(height: Option<usize>, query: &Query) -> u32 {
     height.map_or(TTL_SHORT, |height| {
-        if query.chain().best_height() - height >= CONF_FINAL {
-            TTL_LONG
-        } else {
-            TTL_SHORT
-        }
+        ttl_by_confirmations(query.chain().best_height(), height)
     })
+}
+
+fn ttl_by_confirmations(best_height: usize, height: usize) -> u32 {
+    if best_height.saturating_sub(height) >= CONF_FINAL {
+        TTL_LONG
+    } else {
+        TTL_SHORT
+    }
 }
 
 // Own the mempool data needed by a response. Chain IO and response construction
@@ -1778,12 +1782,21 @@ impl From<address::AddressError> for HttpError {
 
 #[cfg(test)]
 mod tests {
-    use crate::rest::{is_block_template_request, HttpError};
+    use crate::rest::{
+        is_block_template_request, ttl_by_confirmations, HttpError, TTL_LONG, TTL_SHORT,
+    };
     use crate::{errors, errors::ErrorKind};
     use http_body_util::BodyExt;
     use hyper::{Method, StatusCode};
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn ttl_by_confirmations_survives_a_reorg_race() {
+        assert_eq!(ttl_by_confirmations(110, 100), TTL_LONG);
+        assert_eq!(ttl_by_confirmations(105, 100), TTL_SHORT);
+        assert_eq!(ttl_by_confirmations(99, 100), TTL_SHORT);
+    }
 
     #[test]
     fn block_template_is_the_only_route_kept_on_the_async_runtime() {

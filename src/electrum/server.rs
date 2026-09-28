@@ -416,7 +416,7 @@ impl Connection {
         let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..])?;
 
         Ok(json!({
-            "confirmed": chain_stats.funded_txo_sum - chain_stats.spent_txo_sum,
+            "confirmed": chain_stats.funded_txo_sum.saturating_sub(chain_stats.spent_txo_sum),
             "unconfirmed": mempool_stats.funded_txo_sum as i64 - mempool_stats.spent_txo_sum as i64,
         }))
     }
