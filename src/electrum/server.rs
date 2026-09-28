@@ -277,22 +277,33 @@ impl Connection {
         let height = usize_from_value(params.get(0), "height")?;
         let cp_height = usize_from_value_or(params.get(1), "cp_height", 0)?;
 
-        let raw_header_hex: String = self
-            .query
-            .chain()
-            .header_by_height(height)
-            .map(|entry| serialize_hex(entry.header()))
-            .chain_err(|| "missing header")?;
-
         if cp_height == 0 {
+            let raw_header_hex: String = self
+                .query
+                .chain()
+                .header_by_height(height)
+                .map(|entry| serialize_hex(entry.header()))
+                .chain_err(|| "missing header")?;
             return Ok(json!(raw_header_hex));
         }
-        let (branch, root) = get_header_merkle_proof(
+        let (branch, root, proof_cp_hash) = get_header_merkle_proof(
             self.query.chain(),
             height,
             cp_height,
             self.checkpoint_proof_concurrency_limit,
         )?;
+        let indexed_headers = self.query.chain().store().headers();
+        ensure!(
+            indexed_headers
+                .header_by_height(cp_height)
+                .map(|entry| entry.hash())
+                == Some(&proof_cp_hash),
+            "chain changed while creating checkpoint merkle proof"
+        );
+        let raw_header_hex = indexed_headers
+            .header_by_height(height)
+            .map(|entry| serialize_hex(entry.header()))
+            .chain_err(|| "missing header")?;
 
         Ok(json!({
             "header": raw_header_hex,
@@ -305,18 +316,15 @@ impl Connection {
         let start_height = usize_from_value(params.get(0), "start_height")?;
         let count = MAX_HEADERS.min(usize_from_value(params.get(1), "count")?);
         let cp_height = usize_from_value_or(params.get(2), "cp_height", 0)?;
-        let heights: Vec<usize> = (start_height..(start_height + count)).collect();
-        let headers: Vec<String> = heights
-            .into_iter()
-            .filter_map(|height| {
-                self.query
-                    .chain()
-                    .header_by_height(height)
-                    .map(|entry| serialize_hex(entry.header()))
-            })
-            .collect();
-
         if count == 0 || cp_height == 0 {
+            let headers: Vec<String> = (start_height..(start_height + count))
+                .filter_map(|height| {
+                    self.query
+                        .chain()
+                        .header_by_height(height)
+                        .map(|entry| serialize_hex(entry.header()))
+                })
+                .collect();
             return Ok(json!({
                 "count": headers.len(),
                 "hex": headers.join(""),
@@ -324,12 +332,27 @@ impl Connection {
             }));
         }
 
-        let (branch, root) = get_header_merkle_proof(
+        let (branch, root, proof_cp_hash) = get_header_merkle_proof(
             self.query.chain(),
             start_height + (count - 1),
             cp_height,
             self.checkpoint_proof_concurrency_limit,
         )?;
+        let indexed_headers = self.query.chain().store().headers();
+        ensure!(
+            indexed_headers
+                .header_by_height(cp_height)
+                .map(|entry| entry.hash())
+                == Some(&proof_cp_hash),
+            "chain changed while creating checkpoint merkle proof"
+        );
+        let headers: Vec<String> = (start_height..(start_height + count))
+            .filter_map(|height| {
+                indexed_headers
+                    .header_by_height(height)
+                    .map(|entry| serialize_hex(entry.header()))
+            })
+            .collect();
 
         Ok(json!({
             "count": headers.len(),

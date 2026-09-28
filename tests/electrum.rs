@@ -445,6 +445,255 @@ fn test_electrum_broadcast_package_updates_mempool() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "liquid"))]
+mod checkpoint {
+    use bitcoin::hashes::{sha256d, Hash};
+
+    pub fn merklize(left: sha256d::Hash, right: sha256d::Hash) -> sha256d::Hash {
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(&left[..]);
+        data[32..].copy_from_slice(&right[..]);
+        sha256d::Hash::hash(&data)
+    }
+
+    pub fn merkle_root(mut hashes: Vec<sha256d::Hash>) -> sha256d::Hash {
+        assert!(!hashes.is_empty());
+        while hashes.len() > 1 {
+            if hashes.len() % 2 != 0 {
+                hashes.push(*hashes.last().unwrap());
+            }
+            hashes = hashes
+                .chunks(2)
+                .map(|pair| merklize(pair[0], pair[1]))
+                .collect();
+        }
+        hashes[0]
+    }
+
+    pub fn root_from_branch(
+        leaf: sha256d::Hash,
+        branch: &[sha256d::Hash],
+        mut index: usize,
+    ) -> sha256d::Hash {
+        let mut current = leaf;
+        for sibling in branch {
+            current = if index % 2 == 0 {
+                merklize(current, *sibling)
+            } else {
+                merklize(*sibling, current)
+            };
+            index /= 2;
+        }
+        current
+    }
+}
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_electrum_checkpoint_proofs() -> Result<()> {
+    use bitcoin::hashes::{sha256d, Hash};
+    use bitcoin::hex::FromHex;
+    use std::str::FromStr;
+
+    let (_electrum_server, electrum_addr, tester) = common::init_electrum_tester()?;
+    let tip = tester.get_block_count()? as usize;
+
+    let leaves: Vec<sha256d::Hash> = (0..=tip)
+        .map(|h| Ok(tester.get_block_hash(h as u64)?.to_raw_hash()))
+        .collect::<Result<_>>()?;
+    let expected_root = checkpoint::merkle_root(leaves.clone());
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    let parse = |s: &str| -> electrumd::jsonrpc::serde_json::Value {
+        electrumd::jsonrpc::serde_json::from_str(s).unwrap()
+    };
+
+    let height = 5usize;
+    let v = parse(&write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.header\", \"params\": [{}, {}], \"id\": 1}}",
+            height, tip
+        ),
+    ));
+    let result = &v["result"];
+    let header_bytes =
+        Vec::<u8>::from_hex(result["header"].as_str().expect("header hex")).unwrap();
+    assert_eq!(
+        sha256d::Hash::hash(&header_bytes),
+        leaves[height],
+        "returned header must hash to the block hash at the requested height"
+    );
+    let root = sha256d::Hash::from_str(result["root"].as_str().expect("root")).unwrap();
+    assert_eq!(root, expected_root, "proof root must match the independent tree");
+    let branch: Vec<sha256d::Hash> = result["branch"]
+        .as_array()
+        .expect("branch array")
+        .iter()
+        .map(|h| sha256d::Hash::from_str(h.as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        checkpoint::root_from_branch(leaves[height], &branch, height),
+        expected_root,
+        "branch must connect the leaf to the root"
+    );
+
+    let v2 = parse(&write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.header\", \"params\": [{}, {}], \"id\": 2}}",
+            height, tip
+        ),
+    ));
+    assert_eq!(v["result"], v2["result"], "cached proof must be identical");
+
+    let v = parse(&write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.header\", \"params\": [{}, 0], \"id\": 3}}",
+            height
+        ),
+    ));
+    assert!(v["result"].is_string(), "cp_height=0 must return bare hex");
+
+    let v = parse(&write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.header\", \"params\": [{}, {}], \"id\": 4}}",
+            height, height - 1
+        ),
+    ));
+    assert!(!v["error"].is_null(), "cp_height < height must be an error");
+
+    let v = parse(&write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.header\", \"params\": [{}, {}], \"id\": 5}}",
+            height, tip + 1
+        ),
+    ));
+    assert!(!v["error"].is_null(), "cp_height above the tip must be an error");
+
+    let (start, count) = (0usize, 10usize);
+    let v = parse(&write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.headers\", \"params\": [{}, {}, {}], \"id\": 6}}",
+            start, count, tip
+        ),
+    ));
+    let result = &v["result"];
+    assert_eq!(result["count"].as_u64(), Some(count as u64));
+    let hex = result["hex"].as_str().expect("headers hex");
+    assert_eq!(hex.len(), count * 80 * 2);
+    let root = sha256d::Hash::from_str(result["root"].as_str().expect("root")).unwrap();
+    assert_eq!(root, expected_root);
+    let branch: Vec<sha256d::Hash> = result["branch"]
+        .as_array()
+        .expect("branch array")
+        .iter()
+        .map(|h| sha256d::Hash::from_str(h.as_str().unwrap()).unwrap())
+        .collect();
+    let proof_height = start + count - 1;
+    assert_eq!(
+        checkpoint::root_from_branch(leaves[proof_height], &branch, proof_height),
+        expected_root,
+        "headers branch must connect the last requested header to the root"
+    );
+
+    let v = parse(&write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.headers\", \"params\": [{}, {}, {}], \"id\": 7}}",
+            tip - 1, 5, tip
+        ),
+    ));
+    assert!(
+        !v["error"].is_null(),
+        "a headers range extending past cp_height must be an error"
+    );
+
+    Ok(())
+}
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_electrum_checkpoint_proof_reorg_consistency() -> Result<()> {
+    use bitcoin::hashes::{sha256d, Hash};
+    use bitcoin::hex::FromHex;
+    use std::str::FromStr;
+
+    let (_electrum_server, electrum_addr, mut tester) = common::init_electrum_tester()?;
+    let tip = tester.get_block_count()? as usize;
+    let height = 3usize;
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    let parse = |s: &str| -> electrumd::jsonrpc::serde_json::Value {
+        electrumd::jsonrpc::serde_json::from_str(s).unwrap()
+    };
+    let request = |stream: &mut TcpStream, id: u32| {
+        write_and_read(
+            stream,
+            &format!(
+                "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.header\", \"params\": [{}, {}], \"id\": {}}}",
+                height, tip, id
+            ),
+        )
+    };
+
+    let v = parse(&request(&mut stream, 1));
+    let old_root = sha256d::Hash::from_str(v["result"]["root"].as_str().expect("root")).unwrap();
+
+    let old_tip_hash = tester.get_block_hash(tip as u64)?;
+    let _: electrumd::jsonrpc::serde_json::Value = tester
+        .node_client()
+        .call("invalidateblock", &[json!(old_tip_hash.to_string())])?;
+    tester.mine()?;
+    tester.mine()?;
+    assert_ne!(
+        tester.get_block_hash(tip as u64)?,
+        old_tip_hash,
+        "the reorg must have replaced the block at the old tip height"
+    );
+
+    let v = parse(&request(&mut stream, 2));
+    let result = &v["result"];
+    let new_root = sha256d::Hash::from_str(result["root"].as_str().expect("root")).unwrap();
+    assert_ne!(
+        new_root, old_root,
+        "a reorg past the checkpoint must invalidate the cached tree"
+    );
+
+    let leaves: Vec<sha256d::Hash> = (0..=tip)
+        .map(|h| Ok(tester.get_block_hash(h as u64)?.to_raw_hash()))
+        .collect::<Result<_>>()?;
+    assert_eq!(
+        new_root,
+        checkpoint::merkle_root(leaves.clone()),
+        "post-reorg root must match the new chain"
+    );
+    let branch: Vec<sha256d::Hash> = result["branch"]
+        .as_array()
+        .expect("branch array")
+        .iter()
+        .map(|h| sha256d::Hash::from_str(h.as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        checkpoint::root_from_branch(leaves[height], &branch, height),
+        new_root,
+        "post-reorg branch must connect the leaf to the new root"
+    );
+    let header_bytes =
+        Vec::<u8>::from_hex(result["header"].as_str().expect("header hex")).unwrap();
+    assert_eq!(
+        sha256d::Hash::hash(&header_bytes),
+        leaves[height],
+        "post-reorg header must belong to the same snapshot as the proof"
+    );
+
+    Ok(())
+}
+
 fn write_and_read(stream: &mut TcpStream, write: &str) -> String {
     stream.write_all(write.as_bytes()).unwrap();
     stream.write(b"\n").unwrap();
