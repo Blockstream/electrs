@@ -94,7 +94,10 @@ fn prevout_lookup_survives_ancestor_eviction() -> Result<()> {
         .call("sendrawtransaction", &[signed_conflict["hex"].clone()])?;
 
     let tip = tester.get_best_block_hash()?;
-    assert!(Mempool::update(&tester.mempool(), &tester.daemon(), &tip)?);
+    assert_eq!(
+        Mempool::update(&tester.mempool(), &tester.daemon(), &tip)?,
+        crate::new_index::MempoolSyncStatus::Synced
+    );
 
     // Exercise the actual REST preparation path after the ancestor is gone.
     // Keep a writer guard during preparation: no mempool re-read is allowed.

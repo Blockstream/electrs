@@ -24,7 +24,7 @@ use electrs::{
     daemon::Daemon,
     electrum::RPC as ElectrumRPC,
     metrics::Metrics,
-    new_index::{ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
+    new_index::{ChainQuery, FetchFrom, Indexer, Mempool, MempoolSyncStatus, Query, Store},
     rest,
     signal::Waiter,
 };
@@ -202,7 +202,10 @@ impl TestRunner {
             &metrics,
             Arc::clone(&config),
         )));
-        assert!(Mempool::update(&mempool, &daemon, &tip)?);
+        assert_eq!(
+            Mempool::update(&mempool, &daemon, &tip)?,
+            MempoolSyncStatus::Synced
+        );
 
         let query = Arc::new(Query::new(
             Arc::clone(&chain),
@@ -258,7 +261,10 @@ impl TestRunner {
 
     pub fn sync(&mut self) -> Result<()> {
         let tip = self.indexer.update(&self.daemon)?;
-        assert!(Mempool::update(&self.mempool, &self.daemon, &tip)?);
+        assert_eq!(
+            Mempool::update(&self.mempool, &self.daemon, &tip)?,
+            MempoolSyncStatus::Synced
+        );
         // force an update for the mempool stats, which are normally cached
         self.mempool.write().unwrap().update_backlog_stats();
         Ok(())

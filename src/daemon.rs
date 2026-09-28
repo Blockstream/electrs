@@ -87,7 +87,24 @@ lazy_static! {
 
 const MAX_ATTEMPTS: u32 = 5;
 const RETRY_WAIT_DURATION: Duration = Duration::from_secs(1);
+const RECONNECT_RETRY_WAIT_DURATION: Duration = Duration::from_secs(3);
 const BLOCK_TEMPLATE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn retry_reconnect_with_backoff<T, F, W>(mut reconnect: F, mut wait: W) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+    W: FnMut(Duration) -> Result<()>,
+{
+    loop {
+        match reconnect() {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                warn!("failed connecting to RPC daemon: {}", e.display_chain());
+                wait(RECONNECT_RETRY_WAIT_DURATION)?;
+            }
+        }
+    }
+}
 
 #[trace]
 fn parse_hash<T>(value: &Value) -> Result<T>
@@ -1181,16 +1198,11 @@ impl Daemon {
     }
 
     #[trace]
-    fn retry_reconnect(&self) -> Daemon {
-        // XXX add a max reconnection attempts limit?
-        loop {
-            match self.reconnect() {
-                Ok(daemon) => break daemon,
-                Err(e) => {
-                    warn!("failed connecting to RPC daemon: {}", e.display_chain());
-                }
-            }
-        }
+    fn retry_reconnect(&self) -> Result<Daemon> {
+        retry_reconnect_with_backoff(
+            || self.reconnect(),
+            |duration| self.signal.wait(duration, false),
+        )
     }
 
     // Send requests in parallel over multiple RPC connections as individual JSON-RPC requests (with no JSON-RPC batching),
@@ -1219,9 +1231,15 @@ impl Daemon {
             // get initialized as necessary for the `rpc_threads` pool thread managed by rayon.
             thread_local!(static DAEMON_INSTANCE: OnceCell<Daemon> = OnceCell::new());
 
-            DAEMON_INSTANCE.with(|daemon| {
+            DAEMON_INSTANCE.with(|daemon| -> Result<Value> {
+                if daemon.get().is_none() {
+                    daemon
+                        .set(self.retry_reconnect()?)
+                        .unwrap_or_else(|_| unreachable!("thread-local cell was just empty"));
+                }
                 daemon
-                    .get_or_init(|| self.retry_reconnect())
+                    .get()
+                    .expect("just initialized above")
                     .retry_request(&method, &params)
             })
         })
@@ -1599,8 +1617,9 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_jsonrpc_reply, recycle_due, BlockingSemaphore, Connection, ConnectionConfig,
-        CookieGetter, DAEMON_MAX_BODY_BYTES, DAEMON_MAX_HEADER_LINE_BYTES,
+        parse_jsonrpc_reply, recycle_due, retry_reconnect_with_backoff, BlockingSemaphore,
+        Connection, ConnectionConfig, CookieGetter, DAEMON_MAX_BODY_BYTES,
+        DAEMON_MAX_HEADER_LINE_BYTES,
     };
     use crate::errors::{Error, ErrorKind, Result};
     use crate::signal::Waiter;
@@ -1620,6 +1639,52 @@ mod tests {
 
     fn millis(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn reconnect_failures_are_backed_off_before_retrying() {
+        let mut attempts = 0;
+        let mut waits = vec![];
+
+        let result = retry_reconnect_with_backoff(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    bail!("post-connect setup failed");
+                }
+                Ok(42)
+            },
+            |duration| {
+                waits.push(duration);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(attempts, 3);
+        assert_eq!(waits, vec![secs(3), secs(3)]);
+    }
+
+    #[test]
+    fn reconnect_retry_stops_when_backoff_is_interrupted() {
+        let mut attempts = 0;
+
+        let error = retry_reconnect_with_backoff::<(), _, _>(
+            || {
+                attempts += 1;
+                assert_eq!(attempts, 1, "reconnect retried after interrupted backoff");
+                bail!("post-connect setup failed")
+            },
+            |duration| {
+                assert_eq!(duration, secs(3));
+                bail!("shutdown requested")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("shutdown requested"));
     }
 
     /// Spawn a fake daemon that runs `respond` against the accepted socket, and hand back a
