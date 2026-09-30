@@ -475,6 +475,16 @@ impl TestRunner {
             .map(|metric| metric.get_counter().value())
             .sum()
     }
+
+    pub fn counter_value(&self, name: &str) -> f64 {
+        self.metrics
+            .gather()
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(|family| family.get_metric())
+            .map(|metric| metric.get_counter().value())
+            .sum()
+    }
 }
 
 pub fn init_rest_tester() -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {

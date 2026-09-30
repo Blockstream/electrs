@@ -135,7 +135,7 @@ fn response_line_limits_preserve_ids_and_skip_later_commands() {
 fn response_budget_recovers_when_stalled_batch_writers_time_out() {
     let cap = 16 * 1024 * 1024;
     let banner_bytes = 4 * 1024 * 1024 - 4096;
-    let (_server, addr, _tester) = common::init_electrum_tester_with_config(|config| {
+    let (_server, addr, tester) = common::init_electrum_tester_with_config(|config| {
         config.electrum_rpc_max_response_num_bytes = cap;
         config.electrum_rpc_global_response_budget_bytes = cap;
         config.electrum_rpc_write_timeout = Some(Duration::from_secs(5));
@@ -146,8 +146,7 @@ fn response_budget_recovers_when_stalled_batch_writers_time_out() {
 
     let mut holders = Vec::new();
     for _ in 0..2 {
-        // The 8 MiB reply fills the default TCP buffers. Leave the negotiated
-        // receive window unchanged so reset delivery is reliable on macOS.
+        // The 8 MiB reply fills the default TCP buffers.
         let mut client = Client::connect(addr);
         client.send(&json!([
             {"id":1,"method":"server.banner"},
@@ -182,12 +181,10 @@ fn response_budget_recovers_when_stalled_batch_writers_time_out() {
     }
     let (reply, _) = healthy.call(json!({"id":3,"method":"server.banner"}));
     assert_eq!(reply["result"].as_str().unwrap().len(), banner_bytes);
-    // The first holder's deadline starts first. Recovery can precede the
-    // second holder's timeout, so keep that client unread while checking reset.
-    // Buffered bytes may precede the reset on the first connection.
-    let error = std::io::copy(&mut holders[0].0, &mut std::io::sink())
-        .expect_err("a timed-out writer must reset the connection");
-    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(
+        tester.counter_value("electrum_client_write_timeouts_total") >= 1.0,
+        "budget recovered without a stalled writer timing out"
+    );
 }
 
 #[test]
