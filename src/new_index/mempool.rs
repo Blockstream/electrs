@@ -201,7 +201,7 @@ impl Mempool {
             Some(entries) => entries,
         };
         ensure!(
-            entries.len() <= self.config.utxos_limit,
+            entries.len() <= self.config.utxos_checkpoint_limit,
             ErrorKind::TooBigHistory
         );
 
@@ -252,7 +252,7 @@ impl Mempool {
             Some(entries) => entries,
         };
         ensure!(
-            entries.len() <= self.config.utxos_limit,
+            entries.len() <= self.config.utxos_checkpoint_limit,
             ErrorKind::TooBigHistory
         );
 
@@ -334,17 +334,33 @@ impl Mempool {
     /// already indexed and cannot be fetched from the daemon.
     #[trace]
     pub fn ensure_tx(mempool: &RwLock<Mempool>, daemon: &Daemon, txid: Txid) -> Result<()> {
-        if !Self::add_missing(mempool, daemon, &[txid])?.is_empty() {
-            bail!("ensure_tx cannot find txid='{}'", txid);
-        }
-        Ok(())
+        Self::ensure_txs_with(mempool, daemon, &[txid], HashMap::new())
     }
 
     /// Ensure multiple transactions (e.g. an accepted package) are in the mempool in a single batch,
-    /// so that interdependent parent/child txs are linked within the same `add` call. Txids that
-    /// are already present or cannot be fetched from the daemon are skipped.
+    /// so that interdependent parent/child txs are linked within the same `add` call.
     pub fn ensure_txs(mempool: &RwLock<Mempool>, daemon: &Daemon, txids: &[Txid]) -> Result<()> {
-        Self::add_missing(mempool, daemon, txids).map(|_| ())
+        Self::ensure_txs_with(mempool, daemon, txids, HashMap::new())
+    }
+
+    /// Like `ensure_txs`, but takes the transactions found in `known` as-is instead of fetching
+    /// them from the daemon. Fails if any txid could not be fetched or indexed.
+    pub fn ensure_txs_with(
+        mempool: &RwLock<Mempool>,
+        daemon: &Daemon,
+        txids: &[Txid],
+        known: HashMap<Txid, Transaction>,
+    ) -> Result<()> {
+        let unavailable = Self::add_missing(mempool, daemon, txids, known)?;
+        if !unavailable.is_empty() {
+            bail!(
+                "cannot find {} of {} mempool txids first='{}'",
+                unavailable.len(),
+                txids.len(),
+                unavailable[0]
+            );
+        }
+        Ok(())
     }
 
     /// Fetch and index the given txids that are not yet in the local mempool, returning the ones
@@ -354,6 +370,7 @@ impl Mempool {
         mempool: &RwLock<Mempool>,
         daemon: &Daemon,
         txids: &[Txid],
+        mut known: HashMap<Txid, Transaction>,
     ) -> Result<Vec<Txid>> {
         let missing: Vec<Txid> = {
             let mempool = mempool.read().unwrap_or_else(|e| e.into_inner());
@@ -367,6 +384,10 @@ impl Mempool {
         let mut txs_map = HashMap::new();
         let mut unavailable = Vec::new();
         for txid in missing {
+            if let Some(tx) = known.remove(&txid) {
+                txs_map.insert(txid, tx);
+                continue;
+            }
             match daemon.getmempooltx(&txid) {
                 Ok(tx) => {
                     txs_map.insert(txid, tx);
@@ -536,6 +557,44 @@ impl Mempool {
         txos.extend(self.chain.lookup_txos(remain_outpoints)?);
 
         Ok(txos)
+    }
+
+    /// Remove the transactions whose prevouts cannot be found in the batch, the mempool or the
+    /// chain, along with their in-batch descendants, returning the removed txids.
+    fn drop_unresolvable(&self, txs_map: &mut HashMap<Txid, Transaction>) -> Vec<Txid> {
+        let mut dropped: HashSet<Txid> = txs_map
+            .iter()
+            .filter(|(_, tx)| {
+                let external: BTreeSet<OutPoint> = get_prev_outpoints(std::iter::once(*tx))
+                    .into_iter()
+                    .filter(|prevout| match txs_map.get(&prevout.txid) {
+                        Some(parent) => parent.output.get(prevout.vout as usize).is_none(),
+                        None => true,
+                    })
+                    .collect();
+                self.lookup_txos(external).is_err()
+            })
+            .map(|(txid, _)| *txid)
+            .collect();
+
+        let mut frontier = dropped.clone();
+        while !frontier.is_empty() {
+            frontier = txs_map
+                .iter()
+                .filter(|(txid, tx)| {
+                    !dropped.contains(*txid)
+                        && tx
+                            .input
+                            .iter()
+                            .any(|txin| frontier.contains(&txin.previous_output.txid))
+                })
+                .map(|(txid, _)| *txid)
+                .collect();
+            dropped.extend(frontier.iter().copied());
+        }
+
+        txs_map.retain(|txid, _| !dropped.contains(txid));
+        dropped.into_iter().collect()
     }
 
     #[trace]
@@ -732,14 +791,18 @@ impl Mempool {
             // their history and recent entries.
             fetched_txs.retain(|txid, _| mempool.txstore.get(txid).is_none());
             if !fetched_txs.is_empty() {
-                if let Err(e) = mempool.add(fetched_txs) {
+                if let Err(e) = mempool.add(fetched_txs.clone()) {
+                    let unresolvable = mempool.drop_unresolvable(&mut fetched_txs);
                     warn!(
-                        "transient failure adding {} fetched txs, skipping until next cycle: {}",
+                        "failed adding {} fetched txs, skipping {} with unresolvable prevouts until next cycle: {}",
                         fetched_txs_len,
+                        unresolvable.len(),
                         e.display_chain()
                     );
                     mempool.sync_failed_to_index.inc();
-                    return Ok(MempoolSyncStatus::FailedToIndex);
+                    if unresolvable.is_empty() || mempool.add(fetched_txs).is_err() {
+                        return Ok(MempoolSyncStatus::FailedToIndex);
+                    }
                 }
             }
 

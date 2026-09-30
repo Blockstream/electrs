@@ -222,7 +222,9 @@ fn missing_confirmed_parent_is_unavailable() -> Result<()> {
     let parent = tester.send(&address, "1 BTC".parse().unwrap())?;
     tester.mine()?;
 
-    let missing = errors::Error::from(errors::ErrorKind::MissingTxo(format!("{}:0", parent)));
+    let missing = errors::Error::from(errors::ErrorKind::MissingTxo(
+        OutPoint::new(parent, 0).to_string(),
+    ));
     let status = HttpError::mempool_prevout(missing, tester.query(), &BTreeSet::new()).0;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     Ok(())

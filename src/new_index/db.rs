@@ -380,33 +380,54 @@ impl DB {
     }
 
     fn verify_compatibility(&self, config: &Config) {
-        let compatibility_bytes = bincode::serialize_little(&(
-            DB_VERSION,
-            config.light_mode,
-            config.index_unspendables,
-            config.address_search,
-        ))
-        .unwrap();
+        let version_bytes = bincode::serialize_little(&(DB_VERSION, config.light_mode)).unwrap();
+        let flags_bytes =
+            bincode::serialize_little(&(config.index_unspendables, config.address_search))
+                .unwrap();
+        // Kept apart from "V" so binaries that only know (DB_VERSION, light_mode) can still open the DB.
+        const FLAGS_KEY: &[u8] = b"VF";
 
-        let stored = match self.get(b"V") {
-            None => return self.put(b"V", &compatibility_bytes),
-            Some(stored) if stored == compatibility_bytes => return,
+        let stored_version = match self.get(b"V") {
+            None => {
+                self.put(FLAGS_KEY, &flags_bytes);
+                return self.put(b"V", &version_bytes);
+            }
             Some(stored) => stored,
         };
 
-        let legacy_bytes = bincode::serialize_little(&(DB_VERSION, config.light_mode)).unwrap();
-        if stored == legacy_bytes {
-            warn!(
-                "upgrading legacy DB compatibility record using index_unspendables={} and address_search={}; \
-                 these values must match the settings originally used to build this database, and \
-                 historical values cannot be verified",
+        if stored_version != version_bytes {
+            let combined_bytes = bincode::serialize_little(&(
+                DB_VERSION,
+                config.light_mode,
                 config.index_unspendables,
                 config.address_search,
-            );
-            return self.put(b"V", &compatibility_bytes);
+            ))
+            .unwrap();
+            if stored_version != combined_bytes {
+                panic!("Incompatible database found. Please reindex or migrate.")
+            }
+            self.put(FLAGS_KEY, &flags_bytes);
+            return self.put(b"V", &version_bytes);
         }
 
-        panic!("Incompatible database found. Please reindex or migrate.")
+        match self.get(FLAGS_KEY) {
+            Some(stored_flags) if stored_flags == flags_bytes => {}
+            Some(_) => panic!(
+                "Incompatible database found: index_unspendables={} and address_search={} \
+                 differ from the settings used to build this database. Please reindex.",
+                config.index_unspendables, config.address_search,
+            ),
+            None => {
+                warn!(
+                    "recording DB index flags index_unspendables={} and address_search={}; \
+                     these values must match the settings originally used to build this database, and \
+                     historical values cannot be verified",
+                    config.index_unspendables,
+                    config.address_search,
+                );
+                self.put(FLAGS_KEY, &flags_bytes);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -658,6 +679,7 @@ mod tests {
             precache_scripts: None,
             utxos_limit: 100,
             history_scan_limit: 100_000,
+            utxos_checkpoint_limit: 1_000,
             electrum_txs_limit: 100,
             electrum_subscription_limit: 10_000,
             electrum_checkpoint_proof_concurrency_limit: 2,
@@ -732,14 +754,37 @@ mod tests {
         let config = make_test_config(true, true, false);
         db.verify_compatibility(&config);
 
-        let expected = bincode::serialize_little(&(DB_VERSION, false, true, true)).unwrap();
-        assert_eq!(db.get(b"V").unwrap(), expected);
+        assert_eq!(
+            db.get(b"V").unwrap(),
+            legacy_bytes,
+            "the version record must stay readable by binaries that predate the flags"
+        );
 
         let toggled = make_test_config(false, true, false);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             db.verify_compatibility(&toggled);
         }));
-        assert!(result.is_err(), "upgraded record should still guard future mismatches");
+        assert!(result.is_err(), "recorded flags should still guard future mismatches");
+    }
+
+    #[test]
+    fn test_verify_compatibility_restores_legacy_record_from_combined_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_test(dir.path());
+
+        let combined = bincode::serialize_little(&(DB_VERSION, false, true, false)).unwrap();
+        db.put(b"V", &combined);
+
+        db.verify_compatibility(&make_test_config(true, false, false));
+
+        let legacy_bytes = bincode::serialize_little(&(DB_VERSION, false)).unwrap();
+        assert_eq!(db.get(b"V").unwrap(), legacy_bytes);
+
+        let toggled = make_test_config(true, true, false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.verify_compatibility(&toggled);
+        }));
+        assert!(result.is_err(), "flags from the combined record must be carried over");
     }
 
     #[test]

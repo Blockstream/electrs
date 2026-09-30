@@ -305,3 +305,90 @@ fn test_history_cursor_unmatched_returns_empty() -> Result<()> {
     rest_handle.stop();
     Ok(())
 }
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_history_cursor_from_another_script_does_not_trip_the_scan_limit() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) =
+        common::init_rest_tester_with(|c| c.history_scan_limit = 5).unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let addr2 = tester.newaddress()?;
+    let amount = bitcoin::Amount::from_sat(1_000);
+
+    for _ in 0..4 {
+        tester.send_multi(&addr1, amount, 3)?;
+        tester.mine()?;
+    }
+    // Confirmed at a height where addr1 has no history rows.
+    let foreign_txid = tester.send(&addr2, amount)?;
+    tester.mine()?;
+
+    let res = get_json(
+        rest_addr,
+        &format!("/address/{}/txs/chain/{}", addr1, foreign_txid),
+    )?;
+    assert_eq!(res.as_array().expect("array of txs").len(), 0);
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_precache_retries_until_the_scan_completes() -> Result<()> {
+    use electrs::new_index::precache;
+
+    let (rest_handle, rest_addr, mut tester) =
+        common::init_rest_tester_with(|c| c.history_scan_limit = 5).unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let amount = bitcoin::Amount::from_sat(1_000);
+    for _ in 0..12 {
+        tester.send(&addr1, amount)?;
+        tester.mine()?;
+    }
+
+    let scripthash = precache::compute_script_hash(addr1.script_pubkey().as_bytes());
+    precache::precache(tester.query().chain(), vec![scripthash]);
+
+    let stats = get_json(rest_addr, &format!("/address/{}", addr1))?;
+    assert_eq!(stats["chain_stats"]["funded_txo_count"].as_u64(), Some(12));
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_utxo_checkpoint_limit_bounds_the_saved_set() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester_with(|c| {
+        c.utxos_limit = 10;
+        c.utxos_checkpoint_limit = 20;
+        c.history_scan_limit = 128;
+    })
+    .unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let amount = bitcoin::Amount::from_sat(1_000);
+    for _ in 0..4 {
+        tester.send_multi(&addr1, amount, 64)?;
+        tester.mine()?;
+    }
+
+    for _ in 0..4 {
+        let resp = get_allow_error(rest_addr, &format!("/address/{}/utxo", addr1))?;
+        assert_eq!(resp.status(), 400);
+    }
+
+    let scripthash =
+        electrs::new_index::precache::compute_script_hash(addr1.script_pubkey().as_bytes());
+    let key = [b"U".as_slice(), &scripthash[..]].concat();
+    assert!(
+        tester.query().chain().store().cache_db().get(&key).is_none(),
+        "a utxo set above --utxos-checkpoint-limit must not be checkpointed"
+    );
+
+    rest_handle.stop();
+    Ok(())
+}

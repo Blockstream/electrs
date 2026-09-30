@@ -96,21 +96,21 @@ impl Write for ClientWriter<'_> {
         // A fresh full timeout on each partial write would let a trickling
         // reader extend the response indefinitely. Only use the remaining time.
         self.stream.set_write_timeout(Some(deadline - now))?;
-        let result = (&*self.stream).write(bytes);
-        if Instant::now() >= deadline
-            || matches!(&result, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
-        {
-            return Err(self.expired());
+        match (&*self.stream).write(bytes) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Err(self.expired())
+            }
+            result => result,
         }
-        result
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if self.timed_out
-            || self
-                .deadline
-                .map_or(false, |deadline| Instant::now() >= deadline)
-        {
+        if self.timed_out {
             return Err(self.expired());
         }
         Ok(())
@@ -278,6 +278,30 @@ mod tests {
             ErrorKind::ClientWriteTimeout
         ));
         assert_eq!(timeouts.get(), 1);
+    }
+
+    #[test]
+    fn write_accepted_by_the_kernel_is_not_aborted_at_the_deadline() {
+        let sockets = SocketPair::new();
+        let timeouts = counter();
+        let result = write_to_client(
+            &sockets.server,
+            Some(Duration::from_millis(50)),
+            &timeouts,
+            |writer| {
+                writer
+                    .write_all(b"payload")
+                    .chain_err(|| "payload failed")?;
+                thread::sleep(Duration::from_millis(100));
+                writer.flush().chain_err(|| "flush failed")
+            },
+        );
+        assert!(result.is_ok(), "completed write was treated as a timeout");
+        assert_eq!(timeouts.get(), 0);
+        let mut client = sockets.client.try_clone().unwrap();
+        let mut bytes = [0; 7];
+        client.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"payload");
     }
 
     #[test]

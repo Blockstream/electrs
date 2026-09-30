@@ -153,16 +153,24 @@ pub struct CheckpointMerkleCache {
     inflight_rebuilds: AtomicUsize,
     inflight_build_bytes: Arc<AtomicUsize>,
     capacity_bytes: usize,
+    cache_capacity_bytes: usize,
 }
 
 impl CheckpointMerkleCache {
+    /// Cached trees may use half of `capacity_bytes`, so a full cache always leaves at least
+    /// the other half for rebuild working memory.
     pub fn new(capacity_bytes: usize) -> Self {
+        Self::with_cache_capacity(capacity_bytes, capacity_bytes / 2)
+    }
+
+    fn with_cache_capacity(capacity_bytes: usize, cache_capacity_bytes: usize) -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
             build_locks: Mutex::new(HashMap::new()),
             inflight_rebuilds: AtomicUsize::new(0),
             inflight_build_bytes: Arc::new(AtomicUsize::new(0)),
             capacity_bytes,
+            cache_capacity_bytes: cache_capacity_bytes.min(capacity_bytes),
         }
     }
 
@@ -174,7 +182,7 @@ impl CheckpointMerkleCache {
     }
 
     fn insert(&self, cp_height: usize, best_height: usize, cached: Arc<CachedLevels>) {
-        if cached.size_bytes > self.capacity_bytes {
+        if cached.size_bytes > self.cache_capacity_bytes {
             return;
         }
 
@@ -194,7 +202,7 @@ impl CheckpointMerkleCache {
         eviction_positions.sort_unstable_by_key(|pos| entries[*pos].0);
 
         let mut evictions_needed = 0;
-        while total_bytes + cached.size_bytes > self.capacity_bytes
+        while total_bytes + cached.size_bytes > self.cache_capacity_bytes
             || remaining_entries >= MAX_CACHE_ENTRIES
         {
             let Some(pos) = eviction_positions.get(evictions_needed).copied() else {
@@ -517,6 +525,10 @@ mod tests {
 
     const GENEROUS_TEST_CACHE_BYTES: usize = 1024 * 1024;
 
+    fn full_share_cache(capacity_bytes: usize) -> CheckpointMerkleCache {
+        CheckpointMerkleCache::with_cache_capacity(capacity_bytes, capacity_bytes)
+    }
+
     fn leaves(n: usize) -> Vec<Sha256dHash> {
         (0..n).map(|i| Sha256dHash::hash(&[i as u8])).collect()
     }
@@ -568,7 +580,7 @@ mod tests {
         let cp_height = 8;
         let cp_hash = BlockHash::hash(&[7u8]);
 
-        let cache = CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES);
+        let cache = full_share_cache(GENEROUS_TEST_CACHE_BYTES);
         let build_count = AtomicUsize::new(0);
 
         for height in [0usize, 3, 8] {
@@ -607,7 +619,7 @@ mod tests {
         let old_hash = BlockHash::hash(&[1u8]);
         let new_hash = BlockHash::hash(&[2u8]);
 
-        let cache = CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES);
+        let cache = full_share_cache(GENEROUS_TEST_CACHE_BYTES);
         let build_count = AtomicUsize::new(0);
 
         cache
@@ -667,7 +679,7 @@ mod tests {
         let old_hash = BlockHash::hash(&[1u8]);
         let new_hash = BlockHash::hash(&[2u8]);
 
-        let cache = CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES);
+        let cache = full_share_cache(GENEROUS_TEST_CACHE_BYTES);
 
         let (old_cached, old_ret_sibling) = cache
             .get_or_build(
@@ -723,7 +735,7 @@ mod tests {
         let entry_leaves = leaves(2);
         let entry_bytes = build_levels_above_leaves(&entry_leaves).unwrap()[0].len()
             * std::mem::size_of::<Sha256dHash>();
-        let cache = CheckpointMerkleCache::new(5 * entry_bytes);
+        let cache = full_share_cache(5 * entry_bytes);
         let leaf = entry_leaves[0];
 
         for cp_height in [10usize, 20, 30, 40, 50] {
@@ -772,7 +784,7 @@ mod tests {
         let entry_leaves = leaves(2);
         let entry_bytes = build_levels_above_leaves(&entry_leaves).unwrap()[0].len()
             * std::mem::size_of::<Sha256dHash>();
-        let cache = CheckpointMerkleCache::new(5 * entry_bytes);
+        let cache = full_share_cache(5 * entry_bytes);
         let leaf = entry_leaves[0];
 
         for cp_height in [10usize, 20, 30, 40, 50] {
@@ -819,7 +831,7 @@ mod tests {
     #[test]
     fn failed_insert_does_not_partially_evict_lower_entries() {
         let hash_bytes = std::mem::size_of::<Sha256dHash>();
-        let cache = CheckpointMerkleCache::new(5 * hash_bytes);
+        let cache = full_share_cache(5 * hash_bytes);
         let make_cached = |height: usize, hashes: usize| {
             Arc::new(CachedLevels::new(
                 BlockHash::hash(&[height as u8]),
@@ -846,7 +858,7 @@ mod tests {
         let entry_leaves = leaves(2);
         let entry_bytes = build_levels_above_leaves(&entry_leaves).unwrap()[0].len()
             * std::mem::size_of::<Sha256dHash>();
-        let cache = CheckpointMerkleCache::new((MAX_CACHE_ENTRIES + 100) * entry_bytes);
+        let cache = full_share_cache((MAX_CACHE_ENTRIES + 100) * entry_bytes);
         let leaf = entry_leaves[0];
         let hash = BlockHash::hash(&[7u8]);
 
@@ -876,7 +888,7 @@ mod tests {
         let entry_bytes = build_levels_above_leaves(&entry_leaves).unwrap()[0].len()
             * std::mem::size_of::<Sha256dHash>();
         let leaf = entry_leaves[0];
-        let cache = CheckpointMerkleCache::new(entry_bytes);
+        let cache = full_share_cache(entry_bytes);
 
         let old_height = 100;
         let old_hash = BlockHash::hash(&[1u8]);
@@ -943,7 +955,7 @@ mod tests {
         let entry_leaves = leaves(2);
         let levels = build_levels_above_leaves(&entry_leaves).unwrap();
         let entry_bytes = levels[0].len() * std::mem::size_of::<Sha256dHash>();
-        let cache = CheckpointMerkleCache::new(2 * entry_bytes);
+        let cache = full_share_cache(2 * entry_bytes);
         let leaf = entry_leaves[0];
 
         let new_tip_height = 101;
@@ -993,7 +1005,7 @@ mod tests {
         let cp_hash = BlockHash::hash(&[9u8]);
         let sibling = sibling_leaf(&leaves, cp_height, 0);
 
-        let cache = Arc::new(CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES));
+        let cache = Arc::new(full_share_cache(GENEROUS_TEST_CACHE_BYTES));
         let build_count = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(8));
 
@@ -1044,7 +1056,7 @@ mod tests {
         let cp_hash = BlockHash::hash(&[9u8]);
         let sibling = sibling_leaf(&leaves, cp_height, 0);
 
-        let cache = Arc::new(CheckpointMerkleCache::new(0));
+        let cache = Arc::new(full_share_cache(0));
         let build_count = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(8));
         let _keep_build_slot_alive = cache.build_lock_for(cp_height);
@@ -1097,7 +1109,7 @@ mod tests {
         let cp_hash = BlockHash::hash(&[9u8]);
         let sibling = sibling_leaf(&leaves, cp_height, 0);
 
-        let cache = CheckpointMerkleCache::new(0);
+        let cache = full_share_cache(0);
 
         let slot_a = cache.build_lock_for(cp_height);
         let slot_b = cache.build_lock_for(cp_height);
@@ -1138,7 +1150,7 @@ mod tests {
         let leaf = entry_leaves[0];
 
         let blocked_height = 1_000usize;
-        let cache = CheckpointMerkleCache::new(estimated_peak_build_bytes(blocked_height));
+        let cache = full_share_cache(estimated_peak_build_bytes(blocked_height));
 
         let uncached_height = 100;
         let uncached_hash = BlockHash::hash(&[1u8]);
@@ -1204,7 +1216,7 @@ mod tests {
         let cp_hash = BlockHash::hash(&[1u8]);
         let sibling = sibling_leaf(&leaves, cp_height, 0);
 
-        let cache = Arc::new(CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES));
+        let cache = Arc::new(full_share_cache(GENEROUS_TEST_CACHE_BYTES));
         let _keep_slot_alive = cache.build_lock_for(cp_height);
 
         let panicking = {
@@ -1263,7 +1275,7 @@ mod tests {
         let sibling = sibling_leaf(&leaves, cp_height, 0);
         let cp_hash = BlockHash::hash(&[3u8]);
 
-        let cache = CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES);
+        let cache = full_share_cache(GENEROUS_TEST_CACHE_BYTES);
         cache
             .get_or_build(
                 cp_height,
@@ -1292,7 +1304,7 @@ mod tests {
         let sibling = sibling_leaf(&leaves, cp_height, 0);
         let cp_hash = BlockHash::hash(&[3u8]);
 
-        let cache = Arc::new(CheckpointMerkleCache::new(GENEROUS_TEST_CACHE_BYTES));
+        let cache = Arc::new(full_share_cache(GENEROUS_TEST_CACHE_BYTES));
         cache
             .get_or_build(
                 cp_height,
@@ -1360,7 +1372,7 @@ mod tests {
             .map(|h| estimated_peak_build_bytes(*h))
             .sum();
 
-        let cache = Arc::new(CheckpointMerkleCache::new(capacity_bytes));
+        let cache = Arc::new(full_share_cache(capacity_bytes));
         let inside_build = Arc::new(Barrier::new(HOLDERS + 1));
         let release_build = Arc::new(Barrier::new(HOLDERS + 1));
 
@@ -1426,7 +1438,7 @@ mod tests {
             + estimated_peak_build_bytes(extra_height)
             - 1;
 
-        let cache = Arc::new(CheckpointMerkleCache::new(capacity_bytes));
+        let cache = Arc::new(full_share_cache(capacity_bytes));
         cache
             .get_or_build(
                 resident_height,
@@ -1485,5 +1497,79 @@ mod tests {
 
         release_build.wait();
         holder.join().unwrap();
+    }
+
+    #[test]
+    fn a_full_cache_still_admits_concurrent_rebuilds() {
+        let build_height = 1_000usize;
+        let capacity_bytes = 4 * estimated_peak_build_bytes(build_height);
+        let cache = Arc::new(CheckpointMerkleCache::new(capacity_bytes));
+
+        let filler_leaves = leaves(1 << 12);
+        let filler_bytes = CachedLevels::new(
+            BlockHash::hash(&[0u8]),
+            build_levels_above_leaves(&filler_leaves).unwrap(),
+        )
+        .size_bytes;
+        let mut height = 1usize << 20;
+        let mut resident = 0usize;
+        while resident + filler_bytes <= capacity_bytes / 2 {
+            let hash = BlockHash::hash(&height.to_le_bytes());
+            cache
+                .get_or_build(
+                    height,
+                    || usize::MAX,
+                    1,
+                    || Ok((hash, filler_leaves[0])),
+                    || Ok((hash, build_levels_above_leaves(&filler_leaves)?, filler_leaves[0])),
+                )
+                .unwrap();
+            resident += filler_bytes;
+            height += 1;
+        }
+        assert!(resident > 0);
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handles: Vec<_> = vec![build_height, build_height + 1]
+            .into_iter()
+            .map(|miss_height: usize| {
+                let cache = cache.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                thread::spawn(move || {
+                    let hash = BlockHash::hash(&[miss_height as u8]);
+                    let leaf = Sha256dHash::hash(&[0u8]);
+                    cache.get_or_build(
+                        miss_height,
+                        || usize::MAX,
+                        100,
+                        || Ok((hash, leaf)),
+                        || {
+                            entered.fetch_add(1, Ordering::SeqCst);
+                            while !release.load(Ordering::SeqCst) {
+                                thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            Ok((hash, build_levels_above_leaves(&[leaf])?, leaf))
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) < 2
+            && !handles.iter().any(|handle| handle.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        release.store(true, Ordering::SeqCst);
+        for handle in handles {
+            assert!(
+                handle.join().unwrap().is_ok(),
+                "cached trees must not leave room for only a single rebuild"
+            );
+        }
     }
 }
