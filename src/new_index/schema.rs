@@ -195,6 +195,12 @@ impl Store {
 
 type UtxoMap = HashMap<OutPoint, (BlockId, Value)>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UtxoScanStop {
+    ScanLimit,
+    CheckpointLimit,
+}
+
 #[derive(Debug)]
 pub struct Utxo {
     pub txid: Txid,
@@ -293,6 +299,7 @@ pub struct ChainQuery {
     duration: HistogramVec,
     network: Network,
     history_scan_limit: usize,
+    utxos_checkpoint_limit: usize,
     checkpoint_merkle_cache: CheckpointMerkleCache,
 }
 
@@ -637,6 +644,7 @@ impl ChainQuery {
             light_mode: config.light_mode,
             network: config.network_type,
             history_scan_limit: config.history_scan_limit,
+            utxos_checkpoint_limit: config.utxos_checkpoint_limit,
             duration: metrics.histogram_vec(
                 HistogramOpts::new("query_duration", "Index query duration (in seconds)"),
                 &["name"],
@@ -867,14 +875,20 @@ impl ChainQuery {
             .map(|row| (row.get_txid(), row.key.confirmed_height as usize))
             // XXX: unique() requires keeping an in-memory list of all txids, can we avoid that?
             .unique()
-            .skip_while(|(txid, _)| {
-                // skip until we reach the last_seen_txid
-                last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
+            // skip up to and including last_seen_txid, stopping once the scan passes its height
+            .scan(last_seen_txid.is_none(), |cursor_seen, (txid, height)| {
+                if *cursor_seen {
+                    Some(Some((txid, height)))
+                } else if last_seen_txid == Some(&txid) {
+                    *cursor_seen = true;
+                    Some(None)
+                } else if seek_height.map_or(false, |seek_height| height < seek_height) {
+                    None
+                } else {
+                    Some(None)
+                }
             })
-            .skip(match last_seen_txid {
-                Some(_) => 1, // skip the last_seen_txid itself
-                None => 0,
-            })
+            .flatten()
             // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
             .filter_map(|(txid, height)| Some((txid, headers.header_by_height(height)?)))
             .take(limit);
@@ -923,10 +937,13 @@ impl ChainQuery {
 
         // get the last known utxo set and the blockhash it was updated for.
         // invalidates the cache if the block was orphaned.
-        let cache: Option<(UtxoMap, usize)> = self
-            .store
-            .cache_db
-            .get(&UtxoCacheRow::key(scripthash))
+        let cached_bytes = self.store.cache_db.get(&UtxoCacheRow::key(scripthash));
+        if let Some(ref bytes) = cached_bytes {
+            if UtxoCacheRow::utxo_count(bytes) > self.utxos_checkpoint_limit {
+                bail!(ErrorKind::TooBigHistory)
+            }
+        }
+        let cache: Option<(UtxoMap, usize)> = cached_bytes
             .map(|c| bincode::deserialize_little(&c).unwrap())
             .and_then(|(utxos_cache, blockhash)| {
                 self.height_by_hash(&blockhash)
@@ -936,10 +953,15 @@ impl ChainQuery {
         let had_cache = cache.is_some();
 
         // update utxo set with new transactions since
-        let (newutxos, lastblock, processed_items, hit_scan_limit) = cache.map_or_else(
+        let (newutxos, lastblock, processed_items, stop) = cache.map_or_else(
             || self.utxo_delta(scripthash, HashMap::new(), 0),
             |(oldutxos, blockheight)| self.utxo_delta(scripthash, oldutxos, blockheight + 1),
         );
+
+        if stop == Some(UtxoScanStop::CheckpointLimit) {
+            bail!(ErrorKind::TooBigHistory)
+        }
+        let hit_scan_limit = stop == Some(UtxoScanStop::ScanLimit);
 
         // save updated utxo set to cache, even if we bail out below
         if let Some(lastblock) = lastblock {
@@ -991,7 +1013,7 @@ impl ChainQuery {
         scripthash: &[u8],
         init_utxos: UtxoMap,
         start_height: usize,
-    ) -> (UtxoMap, Option<BlockHash>, usize, bool) {
+    ) -> (UtxoMap, Option<BlockHash>, usize, Option<UtxoScanStop>) {
         let _timer = self.start_timer("utxo_delta");
         let headers = self.store.indexed_headers.read().unwrap();
         let history_iter = self
@@ -1007,13 +1029,13 @@ impl ChainQuery {
         let mut processed_items = 0;
         let mut lastblock = None;
         let mut safe_lastblock = None;
-        let mut hit_scan_limit = false;
+        let mut stop = None;
 
         for (history, blockid) in history_iter {
             if lastblock.is_some_and(|hash| hash != blockid.hash) {
                 safe_lastblock = lastblock;
                 if processed_items >= self.history_scan_limit {
-                    hit_scan_limit = true;
+                    stop = Some(UtxoScanStop::ScanLimit);
                     break;
                 }
             }
@@ -1031,13 +1053,17 @@ impl ChainQuery {
                 | TxHistoryInfo::Pegin(_)
                 | TxHistoryInfo::Pegout(_) => unreachable!(),
             };
+
+            if utxos.len() > self.utxos_checkpoint_limit {
+                return (utxos, None, processed_items, Some(UtxoScanStop::CheckpointLimit));
+            }
         }
 
-        if !hit_scan_limit {
+        if stop.is_none() {
             safe_lastblock = lastblock;
         }
 
-        (utxos, safe_lastblock, processed_items, hit_scan_limit)
+        (utxos, safe_lastblock, processed_items, stop)
     }
 
     pub fn stats(&self, scripthash: &[u8]) -> Result<ScriptStats> {
@@ -2115,6 +2141,15 @@ impl UtxoCacheRow {
         [b"U", scripthash].concat()
     }
 
+    /// Number of utxos in a serialized row, read from the map's length prefix without
+    /// deserializing the entries.
+    fn utxo_count(value: &[u8]) -> usize {
+        value
+            .get(..8)
+            .and_then(|prefix| bincode::deserialize_little::<u64>(prefix).ok())
+            .map_or(0, |count| std::convert::TryFrom::try_from(count).unwrap_or(usize::MAX))
+    }
+
     fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_little(&self.key).unwrap(),
@@ -2237,6 +2272,22 @@ mod tests {
         chain.store.history_db.put(&TxConfRow::key(&txid), &[]);
         assert!(chain.try_tx_confirming_block(&txid).is_err());
         Ok(())
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    #[test]
+    fn utxo_cache_row_count_reads_the_serialized_length() {
+        let blockid = BlockId {
+            height: 7,
+            hash: BlockHash::all_zeros(),
+            time: 0,
+        };
+        let utxos: UtxoMap = (0..3u32)
+            .map(|vout| (OutPoint::new(Txid::all_zeros(), vout), (blockid, 1_000)))
+            .collect();
+        let row = UtxoCacheRow::new(&[0u8; 32], &utxos, &BlockHash::all_zeros());
+        assert_eq!(UtxoCacheRow::utxo_count(&row.value), 3);
+        assert_eq!(UtxoCacheRow::utxo_count(&[]), 0);
     }
 
     #[test]

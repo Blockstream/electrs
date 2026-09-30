@@ -2,11 +2,12 @@ use crate::chain::address::Address;
 use crate::errors::*;
 use crate::new_index::ChainQuery;
 use crate::util::FullHash;
+use error_chain::ChainedError;
 
 use rayon::prelude::*;
 
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::hex::FromHex;
+use bitcoin::hex::{DisplayHex, FromHex};
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
@@ -32,7 +33,21 @@ pub fn precache(chain: &ChainQuery, scripthashes: Vec<FullHash>) {
                 if i % 5 == 0 {
                     info!("running pre-cache for scripthash {}/{}", i + 1, total);
                 }
-                let _ = chain.stats(&scripthash[..]);
+                // Each TooBigHistory saves a checkpoint further along, so retrying finishes the scan.
+                loop {
+                    match chain.stats(&scripthash[..]) {
+                        Err(Error(ErrorKind::TooBigHistory, _)) => continue,
+                        Err(e) => {
+                            warn!(
+                                "pre-cache failed scripthash='{}' e='{}'",
+                                scripthash.to_lower_hex_string(),
+                                e.display_chain()
+                            );
+                            break;
+                        }
+                        Ok(_) => break,
+                    }
+                }
                 //chain.utxo(&scripthash[..]);
             })
     });

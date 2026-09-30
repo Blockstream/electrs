@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-use crate::chain::{Network, OutPoint, Transaction, Txid};
+use crate::chain::{deserialize, Network, OutPoint, Transaction, Txid};
 use crate::config::Config;
 use crate::daemon::{Daemon, SubmitPackageResult};
 use crate::errors::*;
@@ -10,7 +10,9 @@ use crate::new_index::block_template::BlockTemplateCache;
 use crate::new_index::{ChainQuery, Mempool, ScriptStats, SpendingInput, Utxo};
 use crate::util::{is_spendable, BlockId, Bytes, TransactionStatus};
 
+use bitcoin::hex::FromHex;
 use electrs_macros::trace;
+use error_chain::ChainedError;
 use hyper::body::Bytes as BodyBytes;
 
 #[cfg(feature = "liquid")]
@@ -80,8 +82,27 @@ impl Query {
     #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.daemon.broadcast_raw(txhex)?;
-        let _ = Mempool::ensure_tx(&self.mempool, &self.daemon, txid);
+        self.index_broadcast(&[txid], &[txhex]);
         Ok(txid)
+    }
+
+    /// Index accepted transactions locally, using the submitted hex rather than a daemon fetch
+    /// where possible. The daemon already accepted them, so failures are logged, not returned.
+    fn index_broadcast<S: AsRef<str>>(&self, accepted_txids: &[Txid], txhexes: &[S]) {
+        let known: HashMap<Txid, Transaction> = txhexes
+            .iter()
+            .filter_map(|txhex| Vec::<u8>::from_hex(txhex.as_ref()).ok())
+            .filter_map(|bytes| deserialize::<Transaction>(&bytes).ok())
+            .map(|tx| (tx.compute_txid(), tx))
+            .filter(|(txid, _)| accepted_txids.contains(txid))
+            .collect();
+        if let Err(e) = Mempool::ensure_txs_with(&self.mempool, &self.daemon, accepted_txids, known)
+        {
+            warn!(
+                "accepted transactions not yet indexed locally, visible after the next mempool sync: {}",
+                e.display_chain()
+            );
+        }
     }
 
     #[trace]
@@ -91,12 +112,14 @@ impl Query {
         maxfeerate: Option<f64>,
         maxburnamount: Option<f64>,
     ) -> Result<SubmitPackageResult> {
-        let result = self.daemon.submit_package(txhex, maxfeerate, maxburnamount)?;
+        let result = self
+            .daemon
+            .submit_package(txhex.clone(), maxfeerate, maxburnamount)?;
         // Add accepted txs to the local mempool so subscription status updates reflect them
         // immediately (they read from the local mempool), mirroring broadcast_raw() above.
         let accepted_txids = result.accepted_txids();
         if !accepted_txids.is_empty() {
-            let _ = Mempool::ensure_txs(&self.mempool, &self.daemon, &accepted_txids);
+            self.index_broadcast(&accepted_txids, &txhex);
         }
         Ok(result)
     }

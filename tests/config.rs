@@ -112,3 +112,71 @@ fn checkpoint_proof_concurrency_limit_can_be_overridden() {
         stderr
     );
 }
+
+fn assert_rejected(extra_args: &[&str], needle: &str) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output = run_electrs(temp_dir.path(), extra_args);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !output.status.success(),
+        "electrs accepted {:?}",
+        extra_args
+    );
+    assert!(
+        stderr.contains(needle),
+        "expected '{}' in stderr, got: {}",
+        needle,
+        stderr
+    );
+}
+
+#[test]
+fn zero_history_scan_limit_is_rejected() {
+    assert_rejected(
+        &["--history-scan-limit", "0"],
+        "--history-scan-limit must be at least 1",
+    );
+}
+
+#[test]
+fn utxos_checkpoint_limit_below_utxos_limit_is_rejected() {
+    assert_rejected(
+        &["--utxos-limit", "500", "--utxos-checkpoint-limit", "499"],
+        "--utxos-checkpoint-limit (499) must be >= --utxos-limit (500)",
+    );
+}
+
+#[test]
+fn disabled_write_timeout_requires_an_unlimited_budget_or_max_age() {
+    assert_rejected(
+        &["--electrum-rpc-write-timeout", "0"],
+        "requires a non-zero --electrum-rpc-write-timeout or --electrum-rpc-conn-max-age",
+    );
+
+    for extra_args in [
+        [
+            "--electrum-rpc-write-timeout",
+            "0",
+            "--electrum-rpc-global-response-budget-bytes",
+            "0",
+        ],
+        [
+            "--electrum-rpc-write-timeout",
+            "0",
+            "--electrum-rpc-conn-max-age",
+            "600",
+        ],
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut args = vec!["-vv"];
+        args.extend(extra_args);
+        let output = run_electrs(temp_dir.path(), &args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("electrum_rpc_write_timeout: None"),
+            "{:?} should pass validation, stderr: {}",
+            extra_args,
+            stderr
+        );
+    }
+}

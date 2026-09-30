@@ -316,8 +316,11 @@ impl Connection {
         let start_height = usize_from_value(params.get(0), "start_height")?;
         let count = MAX_HEADERS.min(usize_from_value(params.get(1), "count")?);
         let cp_height = usize_from_value_or(params.get(2), "cp_height", 0)?;
+        let end_height = start_height
+            .checked_add(count)
+            .chain_err(|| "start_height + count overflows")?;
         if count == 0 || cp_height == 0 {
-            let headers: Vec<String> = (start_height..(start_height + count))
+            let headers: Vec<String> = (start_height..end_height)
                 .filter_map(|height| {
                     self.query
                         .chain()
@@ -334,7 +337,7 @@ impl Connection {
 
         let (branch, root, proof_cp_hash) = get_header_merkle_proof(
             self.query.chain(),
-            start_height + (count - 1),
+            end_height - 1,
             cp_height,
             self.checkpoint_proof_concurrency_limit,
         )?;
@@ -346,7 +349,7 @@ impl Connection {
                 == Some(&proof_cp_hash),
             "chain changed while creating checkpoint merkle proof"
         );
-        let headers: Vec<String> = (start_height..(start_height + count))
+        let headers: Vec<String> = (start_height..end_height)
             .filter_map(|height| {
                 indexed_headers
                     .header_by_height(height)

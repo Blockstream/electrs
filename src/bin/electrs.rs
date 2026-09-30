@@ -41,6 +41,10 @@ const DEFAULT_SALT_ROTATION_INTERVAL_SECS: u64 = 24 * 3600;
 /// sync before giving up.
 const MAX_INITIAL_MEMPOOL_SYNC_RETRIES: u32 = 100;
 
+/// Maximum number of consecutive `FailedToIndex` main loop cycles before giving up,
+/// about an hour at the 5 second loop interval.
+const MAX_CONSECUTIVE_MEMPOOL_SYNC_FAILURES: u32 = 720;
+
 fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
     let mut jsonrpc_import = config.jsonrpc_import;
     if !jsonrpc_import {
@@ -188,6 +192,7 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         "count of iterations of electrs main loop each 5 seconds or after interrupts",
     ));
 
+    let mut mempool_sync_failures = 0;
     loop {
         main_loop_count.inc();
 
@@ -206,12 +211,22 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
 
         // Update mempool
         match Mempool::update(&mempool, &daemon, &tip)? {
-            MempoolSyncStatus::Synced => {}
+            MempoolSyncStatus::Synced => mempool_sync_failures = 0,
             MempoolSyncStatus::TipMoved => {
                 warn!("mempool sync aborted: chain tip moved, retrying next cycle");
             }
             MempoolSyncStatus::FailedToIndex => {
-                warn!("mempool_sync_failed_to_index: retrying next cycle");
+                mempool_sync_failures += 1;
+                if mempool_sync_failures >= MAX_CONSECUTIVE_MEMPOOL_SYNC_FAILURES {
+                    bail!(
+                        "mempool sync failed to index {} consecutive times, giving up",
+                        MAX_CONSECUTIVE_MEMPOOL_SYNC_FAILURES
+                    );
+                }
+                warn!(
+                    "mempool_sync_failed_to_index: retrying next cycle failures='{}'",
+                    mempool_sync_failures
+                );
             }
         }
 

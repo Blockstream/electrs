@@ -76,6 +76,7 @@ pub struct Config {
     pub precache_scripts: Option<String>,
     pub utxos_limit: usize,
     pub history_scan_limit: usize,
+    pub utxos_checkpoint_limit: usize,
     pub electrum_txs_limit: usize,
     pub electrum_subscription_limit: usize,
     pub electrum_checkpoint_proof_concurrency_limit: usize,
@@ -221,7 +222,7 @@ impl Config {
             .arg(
                 Arg::with_name("electrum_rpc_write_timeout")
                     .long("electrum-rpc-write-timeout")
-                    .help("Maximum time (in seconds) to transmit a complete Electrum response, including a whole batch, errors, or a notification. Starts at the first write and is not extended by partial progress. Closes stalled connections and releases response buffers. Does not time idle subscriptions or command execution. 0 = disabled (default: 30).")
+                    .help("Maximum time (in seconds) to transmit a complete Electrum response, including a whole batch, errors, or a notification. Starts at the first write and is not extended by partial progress. Closes stalled connections and releases response buffers. Does not time idle subscriptions or command execution. 0 = disabled, which requires --electrum-rpc-conn-max-age or an unlimited --electrum-rpc-global-response-budget-bytes (default: 30).")
                     .default_value("30")
                     .takes_value(true),
             )
@@ -241,7 +242,7 @@ impl Config {
             .arg(
                 Arg::with_name("electrum_rpc_global_response_budget_bytes")
                     .long("electrum-rpc-global-response-budget-bytes")
-                    .help("Aggregate cap (in bytes) on Electrum response-buffer memory retained across all connections at any instant. Bounds the memory a set of non-reading clients can hold while writer threads block in write_all. Small replies (< 16 KiB per connection) are exempt; above that floor each reply charges the budget in 64 KiB chunks (or a smaller final chunk) and releases on drop. Requests that would exceed the budget are rejected with a server error (code 2) instead of allocating. Must be >= --electrum-rpc-max-response-num-bytes so a single maximum-size reply can succeed. 0 = unlimited (default: 67108864, i.e. 64 MiB on Bitcoin; 268435456, i.e. 256 MiB on Liquid, keeping the same ratio to the per-line cap).")
+                    .help("Aggregate cap (in bytes) on Electrum solicited-reply buffer memory retained across all connections at any instant, including batch replies held while later batch elements execute and replies held while writer threads block on non-reading clients. Subscription notifications and queued request lines are not counted. Small replies (< 16 KiB per connection) are exempt; above that floor each reply charges the budget in 64 KiB chunks (or a smaller final chunk) and releases on drop. Requests that would exceed the budget are rejected with a server error (code 2) instead of allocating. Must be >= --electrum-rpc-max-response-num-bytes so a single maximum-size reply can succeed, and requires a non-zero --electrum-rpc-write-timeout or --electrum-rpc-conn-max-age so stalled clients release their share. 0 = unlimited (default: 67108864, i.e. 64 MiB on Bitcoin; 268435456, i.e. 256 MiB on Liquid, keeping the same ratio to the per-line cap).")
                     .takes_value(true),
             )
             .arg(
@@ -327,8 +328,14 @@ impl Config {
             .arg(
                 Arg::with_name("history_scan_limit")
                     .long("history-scan-limit")
-                    .help("Approximate number of scripthash history rows scanned per utxo/stats lookup before giving up with a \"too popular\" error (the scan reads through the end of the height it is on when the limit is reached, so it may process somewhat more). Unlike --utxos-limit and --electrum-txs-limit, which cap the size of the result, this bounds the amount of work done per request regardless of the outcome.")
+                    .help("Approximate number of scripthash history rows scanned per utxo/stats lookup before giving up with a \"too popular\" error (the scan reads through the end of the height it is on when the limit is reached, so it may process somewhat more). Unlike --utxos-limit and --electrum-txs-limit, which cap the size of the result, this bounds the amount of work done per request regardless of the outcome. Must be at least 1.")
                     .default_value("100000")
+            )
+            .arg(
+                Arg::with_name("utxos_checkpoint_limit")
+                    .long("utxos-checkpoint-limit")
+                    .help("Maximum number of utxos held in a partially scanned utxo set, and in the checkpoint saved for it. An address whose utxo set grows past this while scanning fails with a \"too popular\" error and no checkpoint is saved. Also bounds the unconfirmed history entries scanned per address for utxo and stats lookups. Must be at least --utxos-limit (default: 10 times --utxos-limit).")
+                    .takes_value(true)
             )
             .arg(
                 Arg::with_name("electrum_txs_limit")
@@ -349,7 +356,7 @@ impl Config {
             ).arg(
                 Arg::with_name("electrum_checkpoint_merkle_cache_mb")
                     .long("electrum-checkpoint-merkle-cache-mb")
-                    .help("Approximate memory budget, in MB, for checkpoint Merkle proof handling: cached trees and the working memory of concurrent rebuilds share this one budget (independently of electrum-checkpoint-proof-concurrency-limit, so a high core count can no longer multiply memory use past it). It is a soft target based on an estimate, not a hard ceiling. Entry size scales with cp_height (up to ~28MB near the chain tip). A cp_height too large to ever fit is served without being cached.")
+                    .help("Approximate memory budget, in MB, for checkpoint Merkle proof handling: cached trees and the working memory of concurrent rebuilds share this one budget (independently of electrum-checkpoint-proof-concurrency-limit, so a high core count can no longer multiply memory use past it). Cached trees use at most half of it, so a full cache still leaves room for rebuilds. It is a soft target based on an estimate, not a hard ceiling. Entry size scales with cp_height (up to ~28MB near the chain tip). A cp_height too large to ever fit is served without being cached.")
                     .default_value("256")
                     .takes_value(true)
             ).arg(
@@ -619,6 +626,41 @@ impl Config {
             )
             .exit();
         }
+        if electrum_rpc_global_response_budget_bytes != usize::MAX
+            && electrum_rpc_write_timeout.is_none()
+            && electrum_rpc_conn_max_age.is_none()
+        {
+            clap::Error::with_description(
+                "--electrum-rpc-global-response-budget-bytes requires a non-zero \
+                 --electrum-rpc-write-timeout or --electrum-rpc-conn-max-age; otherwise \
+                 clients that stop reading hold their share of the budget until restart",
+                clap::ErrorKind::ValueValidation,
+            )
+            .exit();
+        }
+        let utxos_limit = value_t_or_exit!(m, "utxos_limit", usize);
+        let history_scan_limit = value_t_or_exit!(m, "history_scan_limit", usize);
+        if history_scan_limit == 0 {
+            clap::Error::with_description(
+                "--history-scan-limit must be at least 1",
+                clap::ErrorKind::ValueValidation,
+            )
+            .exit();
+        }
+        let utxos_checkpoint_limit = match m.value_of("utxos_checkpoint_limit") {
+            Some(_) => value_t_or_exit!(m, "utxos_checkpoint_limit", usize),
+            None => utxos_limit.saturating_mul(10),
+        };
+        if utxos_checkpoint_limit < utxos_limit {
+            clap::Error::with_description(
+                &format!(
+                    "--utxos-checkpoint-limit ({}) must be >= --utxos-limit ({})",
+                    utxos_checkpoint_limit, utxos_limit
+                ),
+                clap::ErrorKind::ValueValidation,
+            )
+            .exit();
+        }
         let http_addr: SocketAddr = str_to_socketaddr(
             m.value_of("http_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_http_port)),
@@ -687,8 +729,9 @@ impl Config {
             daemon_parallelism: value_t_or_exit!(m, "daemon_parallelism", usize),
             daemon_conn_max_age,
             cookie,
-            utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
-            history_scan_limit: value_t_or_exit!(m, "history_scan_limit", usize),
+            utxos_limit,
+            history_scan_limit,
+            utxos_checkpoint_limit,
             electrum_rpc_addr,
             electrum_rpc_conn_max_age,
             electrum_rpc_write_timeout,

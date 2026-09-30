@@ -1677,9 +1677,7 @@ impl HttpError {
             let used_by_confirmed_tx = confirmed_prevouts
                 .iter()
                 .any(|outpoint| outpoint.to_string() == *missing);
-            let confirmed_parent = missing
-                .rsplit_once(':')
-                .and_then(|(txid, _)| Txid::from_str(txid).ok())
+            let confirmed_parent = missing_txo_txid(missing)
                 .map(|txid| query.chain().try_tx_confirming_block(&txid));
             let confirmed_parent = match confirmed_parent {
                 Some(Ok(blockid)) => blockid.is_some(),
@@ -1693,6 +1691,13 @@ impl HttpError {
         }
         HttpError::lookup(err)
     }
+}
+
+/// Parse the txid out of a `MissingTxo` outpoint string. Elements prefixes its outpoint
+/// display with `[elements]`.
+fn missing_txo_txid(missing: &str) -> Option<Txid> {
+    let (txid, _) = missing.rsplit_once(':')?;
+    Txid::from_str(txid.strip_prefix("[elements]").unwrap_or(txid)).ok()
 }
 
 impl From<String> for HttpError {
