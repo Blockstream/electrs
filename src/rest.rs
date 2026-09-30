@@ -1651,6 +1651,11 @@ impl HttpError {
     }
 
     fn lookup(err: errors::Error) -> Self {
+        // A history that exceeds the configured scan limit is a property of the
+        // requested scripthash, not a transient server-side failure.
+        if let errors::ErrorKind::TooBigHistory = err.kind() {
+            return HttpError::from(err.to_string());
+        }
         let status = StatusCode::SERVICE_UNAVAILABLE;
         warn!("REST lookup failed status='{}' err='{:?}'", status, err);
         HttpError(status, err.to_string())
