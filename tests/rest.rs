@@ -1367,6 +1367,90 @@ fn test_rest_package_updates_mempool() -> Result<()> {
     Ok(())
 }
 
+/// Build two spends of a fresh `OP_DROP OP_TRUE` P2WSH output that share a txid but differ in
+/// witness, returning (txid, first variant hex, second variant hex).
+#[cfg(not(feature = "liquid"))]
+fn same_txid_witness_variants(tester: &mut common::TestRunner) -> Result<(Txid, String, String)> {
+    use bitcoin::blockdata::opcodes::all::{OP_DROP, OP_PUSHNUM_1};
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::{
+        absolute, transaction, Address, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+
+    let witness_script = ScriptBuf::builder()
+        .push_opcode(OP_DROP)
+        .push_opcode(OP_PUSHNUM_1)
+        .into_script();
+    let p2wsh = Address::p2wsh(&witness_script, bitcoin::Network::Regtest);
+    let funding_txid = tester.send(&p2wsh, Amount::from_sat(100_000))?;
+    let funding_tx = tester.get_raw_transaction(funding_txid)?;
+    tester.mine()?;
+    let vout = funding_tx
+        .output
+        .iter()
+        .position(|txout| txout.script_pubkey == p2wsh.script_pubkey())
+        .expect("funding output") as u32;
+
+    let spend = |witness_item: &[u8]| Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(funding_txid, vout),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[witness_item, witness_script.as_bytes()]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(90_000),
+            script_pubkey: p2wsh.script_pubkey(),
+        }],
+    };
+    let first = spend(&[0x01]);
+    let second = spend(&[0x02; 32]);
+    assert_eq!(first.compute_txid(), second.compute_txid());
+    assert_ne!(first.compute_wtxid(), second.compute_wtxid());
+
+    Ok((
+        first.compute_txid(),
+        serialize_hex(&first),
+        serialize_hex(&second),
+    ))
+}
+
+/// Regression test: when bitcoind already holds a transaction with the same txid but a different
+/// witness, broadcasting the other variant succeeds without replacing it. electrs must index the
+/// daemon's copy, not the submitted one.
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_rest_broadcast_indexes_the_daemons_witness() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    for endpoint in ["/tx", "/txs/package"] {
+        let (txid, in_mempool_hex, submitted_hex) = same_txid_witness_variants(&mut tester)?;
+        let _: Value = tester
+            .node_client()
+            .call("sendrawtransaction", &[in_mempool_hex.clone().into()])?;
+
+        let resp = match endpoint {
+            "/tx" => ureq::post(&format!("http://{}/tx", rest_addr)).send(&submitted_hex)?,
+            _ => ureq::post(&format!("http://{}/txs/package", rest_addr))
+                .send_json([&submitted_hex])?,
+        };
+        assert_eq!(resp.status(), 200, "{} rejected the variant", endpoint);
+
+        assert_eq!(
+            get_plain(rest_addr, &format!("/tx/{}/hex", txid))?,
+            in_mempool_hex,
+            "{} indexed the submitted witness instead of the daemon's",
+            endpoint
+        );
+    }
+
+    rest_handle.stop();
+    Ok(())
+}
+
 #[cfg(not(feature = "liquid"))]
 #[test]
 fn test_mempool_ensure_txs_concurrency() -> Result<()> {

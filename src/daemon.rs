@@ -23,7 +23,7 @@ use elements::encode::{deserialize, serialize_hex};
 
 use electrs_macros::trace;
 
-use crate::chain::{Block, BlockHash, BlockHeader, Network, Transaction, Txid};
+use crate::chain::{Block, BlockHash, BlockHeader, Network, Transaction, Txid, Wtxid};
 use crate::metrics::{CounterVec, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::signal::Waiter;
 use crate::util::{HeaderList, DEFAULT_BLOCKHASH};
@@ -242,6 +242,19 @@ impl SubmitPackageResult {
             .values()
             .filter(|tx| tx.error.is_none())
             .filter_map(|tx| Txid::from_str(&tx.txid).ok())
+            .collect()
+    }
+
+    /// (txid, wtxid) of the accepted transactions that are in the daemon's mempool exactly as
+    /// submitted. `other-wtxid` results are excluded: a same-txid transaction with a different
+    /// witness was already there and the submitted one was ignored.
+    pub fn accepted_as_submitted(&self) -> Vec<(Txid, Wtxid)> {
+        self.tx_results
+            .iter()
+            .filter(|(_, tx)| tx.error.is_none() && tx.other_wtxid.is_none())
+            .filter_map(|(wtxid, tx)| {
+                Some((Txid::from_str(&tx.txid).ok()?, Wtxid::from_str(wtxid).ok()?))
+            })
             .collect()
     }
 
@@ -1639,6 +1652,33 @@ mod tests {
 
     fn millis(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn accepted_as_submitted_skips_errors_and_other_witnesses() {
+        use super::SubmitPackageResult;
+        use crate::chain::{Txid, Wtxid};
+        use std::str::FromStr;
+
+        let id = |n: u8| format!("{:02x}", n).repeat(32);
+        let result: SubmitPackageResult = serde_json::from_value(json!({
+            "package_msg": "success",
+            "tx-results": {
+                id(1): { "txid": id(11), "vsize": 100, "fees": { "base": 0.0001 } },
+                id(2): { "txid": id(12), "other-wtxid": id(3) },
+                id(4): { "txid": id(14), "error": "bad-txns-inputs-missingorspent" },
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(
+            result.accepted_as_submitted(),
+            vec![(
+                Txid::from_str(&id(11)).unwrap(),
+                Wtxid::from_str(&id(1)).unwrap()
+            )]
+        );
+        assert_eq!(result.accepted_txids().len(), 2);
     }
 
     #[test]

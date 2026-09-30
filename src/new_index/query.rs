@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-use crate::chain::{deserialize, Network, OutPoint, Transaction, Txid};
+use crate::chain::{deserialize, Network, OutPoint, Transaction, Txid, Wtxid};
 use crate::config::Config;
 use crate::daemon::{Daemon, SubmitPackageResult};
 use crate::errors::*;
@@ -82,20 +82,15 @@ impl Query {
     #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.daemon.broadcast_raw(txhex)?;
-        self.index_broadcast(&[txid], &[txhex]);
+        // sendrawtransaction also succeeds when a same-txid tx with a different witness is
+        // already in the mempool, so the submitted hex may not be the daemon's copy.
+        self.index_broadcast(&[txid], HashMap::new());
         Ok(txid)
     }
 
-    /// Index accepted transactions locally, using the submitted hex rather than a daemon fetch
-    /// where possible. The daemon already accepted them, so failures are logged, not returned.
-    fn index_broadcast<S: AsRef<str>>(&self, accepted_txids: &[Txid], txhexes: &[S]) {
-        let known: HashMap<Txid, Transaction> = txhexes
-            .iter()
-            .filter_map(|txhex| Vec::<u8>::from_hex(txhex.as_ref()).ok())
-            .filter_map(|bytes| deserialize::<Transaction>(&bytes).ok())
-            .map(|tx| (tx.compute_txid(), tx))
-            .filter(|(txid, _)| accepted_txids.contains(txid))
-            .collect();
+    /// Index accepted transactions locally, taking those in `known` as-is and fetching the rest
+    /// from the daemon. The daemon already accepted them, so failures are logged, not returned.
+    fn index_broadcast(&self, accepted_txids: &[Txid], known: HashMap<Txid, Transaction>) {
         if let Err(e) = Mempool::ensure_txs_with(&self.mempool, &self.daemon, accepted_txids, known)
         {
             warn!(
@@ -119,7 +114,8 @@ impl Query {
         // immediately (they read from the local mempool), mirroring broadcast_raw() above.
         let accepted_txids = result.accepted_txids();
         if !accepted_txids.is_empty() {
-            self.index_broadcast(&accepted_txids, &txhex);
+            let known = submitted_txs(&txhex, &result.accepted_as_submitted());
+            self.index_broadcast(&accepted_txids, known);
         }
         Ok(result)
     }
@@ -369,3 +365,55 @@ impl Query {
     }
 }
 
+/// Parse the submitted package transactions that the daemon holds exactly as submitted, matching
+/// both txid and wtxid.
+fn submitted_txs(txhexes: &[String], submitted: &[(Txid, Wtxid)]) -> HashMap<Txid, Transaction> {
+    txhexes
+        .iter()
+        .filter_map(|txhex| Vec::<u8>::from_hex(txhex).ok())
+        .filter_map(|bytes| deserialize::<Transaction>(&bytes).ok())
+        .filter(|tx| submitted.contains(&(tx.compute_txid(), tx.compute_wtxid())))
+        .map(|tx| (tx.compute_txid(), tx))
+        .collect()
+}
+
+#[cfg(all(test, not(feature = "liquid")))]
+mod tests {
+    use super::submitted_txs;
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::{
+        absolute, transaction, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, Witness,
+    };
+
+    fn tx_with_witness(item: &[u8]) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[item]),
+            }],
+            output: vec![],
+        }
+    }
+
+    #[test]
+    fn submitted_txs_require_matching_txid_and_wtxid() {
+        let submitted = tx_with_witness(&[1]);
+        let other = tx_with_witness(&[2]);
+        let txhexes = vec![serialize_hex(&submitted)];
+
+        let matching = [(submitted.compute_txid(), submitted.compute_wtxid())];
+        assert_eq!(
+            submitted_txs(&txhexes, &matching).get(&submitted.compute_txid()),
+            Some(&submitted)
+        );
+
+        let other_witness = [(submitted.compute_txid(), other.compute_wtxid())];
+        assert!(submitted_txs(&txhexes, &other_witness).is_empty());
+
+        assert!(submitted_txs(&txhexes, &[]).is_empty());
+    }
+}
