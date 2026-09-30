@@ -97,10 +97,14 @@ pub mod ebcompact {
 
     pub trait TxidCompat {
         fn compute_txid(&self) -> elements::Txid;
+        fn compute_wtxid(&self) -> elements::Wtxid;
     }
     impl TxidCompat for elements::Transaction {
         fn compute_txid(&self) -> elements::Txid {
             self.txid()
+        }
+        fn compute_wtxid(&self) -> elements::Wtxid {
+            self.wtxid()
         }
     }
 }

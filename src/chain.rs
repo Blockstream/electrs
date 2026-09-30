@@ -2,7 +2,7 @@
 pub use bitcoin::{
     address, blockdata::block::Header as BlockHeader, blockdata::script, consensus::deserialize,
     hash_types::TxMerkleNode, Address, Block, BlockHash, OutPoint, ScriptBuf as Script, Sequence,
-    Transaction, TxIn, TxOut, Txid,
+    Transaction, TxIn, TxOut, Txid, Wtxid,
 };
 
 #[cfg(feature = "liquid")]
@@ -11,6 +11,7 @@ pub use {
     elements::{
         address, confidential, encode::deserialize, script, Address, AssetId, Block, BlockHash,
         BlockHeader, OutPoint, Script, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Txid,
+        Wtxid,
     },
 };
 
