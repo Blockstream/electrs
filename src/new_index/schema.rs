@@ -2258,6 +2258,60 @@ mod tests {
     use super::*;
     use crate::test_common as common;
 
+    #[cfg(not(feature = "liquid"))]
+    #[test]
+    fn partial_mempool_sync_reports_failure_and_keeps_resolvable_txs() -> common::Result<()> {
+        use crate::new_index::{Mempool, MempoolSyncStatus};
+        use bitcoin::consensus::encode::serialize_hex;
+        use serde_json::{json, Value};
+
+        let mut tester = common::TestRunner::new()?;
+        let address = tester.newaddress()?;
+        let funding_txid = tester.send_multi(&address, bitcoin::Amount::ONE_BTC, 2)?;
+        tester.mine()?;
+
+        let spend = |vout: u32| -> common::Result<Txid> {
+            let tx = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn {
+                    previous_output: OutPoint::new(funding_txid, vout),
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value: bitcoin::Amount::from_sat(99_990_000),
+                    script_pubkey: tester.newaddress()?.script_pubkey(),
+                }],
+            };
+            let signed: Value = tester
+                .node_client()
+                .call("signrawtransactionwithwallet", &[json!(serialize_hex(&tx))])?;
+            Ok(tester
+                .node_client()
+                .call("sendrawtransaction", &[signed["hex"].clone()])?)
+        };
+        let unresolvable_txid = spend(0)?;
+        let resolvable_txid = spend(1)?;
+
+        tester.query().chain().store.txstore_db.delete_rows(
+            vec![DBRow {
+                key: TxOutRow::key(&OutPoint::new(funding_txid, 0)),
+                value: vec![],
+            }],
+            DBFlush::Enable,
+        );
+
+        let tip = tester.get_best_block_hash()?;
+        assert_eq!(
+            Mempool::update(tester.mempool(), tester.daemon(), &tip)?,
+            MempoolSyncStatus::FailedToIndex
+        );
+        let mempool = tester.mempool().read().unwrap();
+        assert!(mempool.lookup_txn(&resolvable_txid).is_some());
+        assert!(mempool.lookup_txn(&unresolvable_txid).is_none());
+        Ok(())
+    }
+
     #[test]
     fn corrupt_single_key_rows_return_errors() -> common::Result<()> {
         let mut tester = common::TestRunner::new()?;
