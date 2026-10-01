@@ -782,6 +782,7 @@ impl Mempool {
 
         // Add fetched transactions to our view of the mempool
         trace!("indexing {} new mempool transactions", fetched_txs.len());
+        let mut status = MempoolSyncStatus::Synced;
         if !fetched_txs.is_empty() {
             let fetched_txs_len = fetched_txs.len();
             let mut mempool = mempool.write().unwrap();
@@ -803,6 +804,7 @@ impl Mempool {
                     if unresolvable.is_empty() || mempool.add(fetched_txs).is_err() {
                         return Ok(MempoolSyncStatus::FailedToIndex);
                     }
+                    status = MempoolSyncStatus::FailedToIndex;
                 }
             }
 
@@ -816,9 +818,9 @@ impl Mempool {
             }
         }
 
-        trace!("mempool is synced");
+        trace!("mempool update finished status={:?}", status);
 
-        Ok(MempoolSyncStatus::Synced)
+        Ok(status)
     }
 }
 
