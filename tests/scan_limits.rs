@@ -321,7 +321,7 @@ fn test_history_cursor_from_another_script_does_not_trip_the_scan_limit() -> Res
         tester.mine()?;
     }
     // Confirmed at a height where addr1 has no history rows.
-    let foreign_txid = tester.send(&addr2, amount)?;
+    let foreign_txid = tester.send_multi(&addr2, amount, 1)?;
     tester.mine()?;
 
     let res = get_json(
