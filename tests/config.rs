@@ -80,3 +80,32 @@ fn startup_debug_log_identifies_cookie_file() {
         stderr
     );
 }
+
+#[cfg(feature = "liquid")]
+#[test]
+fn removed_asset_db_path_is_a_startup_error() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output = run_electrs(
+        temp_dir.path(),
+        &["--asset-db-path", temp_dir.path().to_str().unwrap()],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("--asset-db-path is no longer supported"));
+    assert!(stderr.contains("--asset-registry-url"));
+}
+
+#[cfg(feature = "liquid")]
+#[test]
+fn credentialed_asset_registry_url_is_rejected_without_echoing_credentials() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let password = "registry-PASSWORD-123";
+    let url = format!("https://user:{}@registry.example/api", password);
+    let output = run_electrs(temp_dir.path(), &["--asset-registry-url", &url]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("must not contain a username or password"));
+    assert!(!stderr.contains(password));
+}

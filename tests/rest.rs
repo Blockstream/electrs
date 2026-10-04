@@ -1,8 +1,23 @@
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::FromHex;
+#[cfg(feature = "liquid")]
+use serde_json::json;
 use serde_json::Value;
+#[cfg(feature = "liquid")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net;
+
+#[cfg(feature = "liquid")]
+use std::io::{Read, Write};
+#[cfg(feature = "liquid")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "liquid")]
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "liquid")]
+use std::thread;
+#[cfg(feature = "liquid")]
+use url::Url;
 
 #[cfg(feature = "liquid")]
 use elementsd::bitcoincore_rpc::RpcApi;
@@ -28,6 +43,260 @@ fn get_json(rest_addr: net::SocketAddr, path: &str) -> Result<Value> {
 
 fn get_plain(rest_addr: net::SocketAddr, path: &str) -> Result<String> {
     Ok(get(rest_addr, path)?.into_body().read_to_string()?)
+}
+
+#[cfg(feature = "liquid")]
+fn registry_asset_response(asset_id: &str) -> Value {
+    json!({
+        "asset_id": asset_id,
+        "contract": {
+            "entity": {"domain": "example.com"},
+            "name": "Registry Asset",
+            "precision": 8,
+            "ticker": "REG",
+            "version": 1,
+            "custom_contract_field": "preserved"
+        },
+        "initial_issuer_pubkey": format!("02{}", "11".repeat(32)),
+        "initial_issuer_pubkey_source": "contract",
+        "current_issuer_pubkey": format!("02{}", "11".repeat(32)),
+        "issuer_pubkey_history": [],
+        "mutable": {"category_tags": ["stablecoin"]},
+        "admin": {"featured": true},
+        "icon": {"href": format!("/v2/assets/{}/icon/{}.png", asset_id, "22".repeat(32))},
+        "status": "active",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z"
+    })
+}
+
+#[cfg(feature = "liquid")]
+fn missing_registry_asset_response() -> Value {
+    registry_asset_response("1111111111111111111111111111111111111111111111111111111111111111")
+}
+
+#[cfg(feature = "liquid")]
+fn record_registry_mock_mismatch<T>(
+    failures: &Mutex<Vec<String>>,
+    field: &str,
+    actual: T,
+    expected: T,
+) where
+    T: std::fmt::Debug + PartialEq,
+{
+    if actual != expected {
+        failures.lock().unwrap().push(format!(
+            "query field {} differed: actual={:?}, expected={:?}",
+            field, actual, expected
+        ));
+    }
+}
+
+#[cfg(feature = "liquid")]
+pub struct AssetRegistryMock {
+    pub url: Url,
+    pub asset_id: Arc<Mutex<Option<String>>>,
+    pub available: Arc<AtomicBool>,
+    pub include_missing_asset: Arc<AtomicBool>,
+    pub request_count: Arc<AtomicUsize>,
+    failures: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "liquid")]
+impl AssetRegistryMock {
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+        let failures = self.failures.lock().unwrap();
+        assert!(
+            failures.is_empty(),
+            "asset registry mock request mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
+}
+
+#[cfg(feature = "liquid")]
+impl Drop for AssetRegistryMock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(feature = "liquid")]
+fn start_asset_registry_mock() -> AssetRegistryMock {
+    let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let asset_id = Arc::new(Mutex::new(None::<String>));
+    let available = Arc::new(AtomicBool::new(true));
+    let include_missing_asset = Arc::new(AtomicBool::new(false));
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_asset_id = Arc::clone(&asset_id);
+    let server_available = Arc::clone(&available);
+    let server_include_missing_asset = Arc::clone(&include_missing_asset);
+    let server_request_count = Arc::clone(&request_count);
+    let server_failures = Arc::clone(&failures);
+    let server_stop = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
+        while !server_stop.load(Ordering::SeqCst) {
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = vec![0u8; 8192];
+            let len = match stream.read(&mut request) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let request = String::from_utf8(request[..len].to_vec()).unwrap();
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap();
+            server_request_count.fetch_add(1, Ordering::SeqCst);
+
+            let (status, reason, body) = if server_available.load(Ordering::SeqCst) {
+                let asset_id = server_asset_id.lock().unwrap().clone().unwrap();
+                let asset = registry_asset_response(&asset_id);
+                let body = if path.starts_with("/api/v2/assets?") {
+                    let url = Url::parse(&format!("http://registry.invalid{}", path)).unwrap();
+                    let query_pairs: Vec<(String, String)> =
+                        url.query_pairs().into_owned().collect();
+                    let query: HashMap<String, String> = query_pairs.iter().cloned().collect();
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "asset_id",
+                        query.get("asset_id").map(String::as_str),
+                        Some("aB12"),
+                    );
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "domain",
+                        query.get("domain").map(String::as_str),
+                        Some("Example.com"),
+                    );
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "ticker",
+                        query.get("ticker").map(String::as_str),
+                        Some("EXM"),
+                    );
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "name",
+                        query.get("name").map(String::as_str),
+                        Some("Registry"),
+                    );
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "asset_type",
+                        query.get("asset_type").map(String::as_str),
+                        Some("AMP_asset"),
+                    );
+                    let category_tags: Vec<&str> = query_pairs
+                        .iter()
+                        .filter(|(key, _)| key == "category_tag")
+                        .map(|(_, value)| value.as_str())
+                        .collect();
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "category_tag",
+                        category_tags.as_slice(),
+                        ["stablecoin", "bond"].as_slice(),
+                    );
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "trading_venue",
+                        query.get("trading_venue").map(String::as_str),
+                        Some("sideswap"),
+                    );
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "created_after",
+                        query.get("created_after").map(String::as_str),
+                        Some("2026-01-01T00:00:00Z"),
+                    );
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "updated_after",
+                        query.get("updated_after").map(String::as_str),
+                        Some("2026-02-01T12:30:00-05:00"),
+                    );
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "sort",
+                        query.get("sort").map(String::as_str),
+                        Some("created_at_asc"),
+                    );
+                    let mut items = vec![asset];
+                    if server_include_missing_asset.load(Ordering::SeqCst) {
+                        items.push(missing_registry_asset_response());
+                    }
+                    let total_count = items.len();
+                    json!({
+                        "items": items,
+                        "page": 1,
+                        "page_size": 25,
+                        "total_count": total_count,
+                        "total_pages": 1
+                    })
+                } else {
+                    let expected_path = format!("/api/v2/assets/{}", asset_id);
+                    record_registry_mock_mismatch(
+                        &server_failures,
+                        "path",
+                        path,
+                        expected_path.as_str(),
+                    );
+                    asset
+                };
+                (200, "OK", body)
+            } else {
+                (503, "Service Unavailable", json!({"detail": "unavailable"}))
+            };
+            let body = serde_json::to_string(&body).unwrap();
+            let response = format!(
+                "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                reason,
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    AssetRegistryMock {
+        url: Url::parse(&format!("http://{}/api", addr)).unwrap(),
+        asset_id,
+        available,
+        include_missing_asset,
+        request_count,
+        failures,
+        stop,
+        thread: Some(thread),
+    }
 }
 
 #[test]
@@ -1475,6 +1744,222 @@ fn test_rest_liquid_unblinded_issuance() -> Result<()> {
     assert!(issuance_data["assetamountcommitment"].is_null());
 
     rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(feature = "liquid")]
+#[test]
+fn test_rest_liquid_v2_asset_registry() -> Result<()> {
+    let mock = start_asset_registry_mock();
+    let registry_url_for_icon = mock.url.clone();
+    let (rest_handle, rest_addr, mut tester) =
+        common::init_rest_tester_with_asset_registry(mock.url.clone(), None)?;
+
+    let issuance = tester
+        .node_client()
+        .call::<Value>("issueasset", &[1.5.into(), 0.into(), false.into()])?;
+    tester.mine()?;
+    let asset_id = issuance["asset"].as_str().unwrap().to_string();
+    *mock.asset_id.lock().unwrap() = Some(asset_id.clone());
+    let expected_icon = registry_url_for_icon
+        .join(&format!(
+            "/v2/assets/{}/icon/{}.png",
+            asset_id,
+            "22".repeat(32)
+        ))
+        .unwrap()
+        .to_string();
+
+    let response = get(rest_addr, &format!("/asset/{}", asset_id))?;
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=10")
+    );
+    let asset: Value = response.into_body().read_json()?;
+    assert_eq!(asset["name"], "Registry Asset");
+    assert_eq!(asset["ticker"], "REG");
+    assert_eq!(asset["precision"], 8);
+    assert_eq!(asset["contract"]["custom_contract_field"], "preserved");
+    assert_eq!(asset["registry"]["status"], "active");
+    assert_eq!(asset["registry"]["mutable"]["category_tags"][0], "stablecoin");
+    assert_eq!(asset["registry"]["icon"]["href"], expected_icon);
+
+    assert_eq!(
+        get_plain(
+            rest_addr,
+            &format!("/asset/{}/supply/decimal", asset_id)
+        )?,
+        "1.5"
+    );
+    assert_eq!(
+        get_plain(rest_addr, &format!("/asset/{}/supply", asset_id))?,
+        "150000000"
+    );
+
+    let registry_list_path = concat!(
+        "/assets/registry?asset_id=aB12&domain=Example.com&ticker=EXM&name=Registry",
+        "&asset_type=AMP_asset&category_tag=stablecoin&category_tag=bond",
+        "&trading_venue=sideswap&created_after=2026-01-01T00%3A00%3A00Z",
+        "&updated_after=2026-02-01T12%3A30%3A00-05%3A00&sort=created_at_asc"
+    );
+    let response = get(rest_addr, registry_list_path)?;
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-total-results")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let assets: Value = response.into_body().read_json()?;
+    assert_eq!(assets.as_array().unwrap().len(), 1);
+    assert_eq!(assets[0]["asset_id"], asset_id);
+    assert_eq!(assets[0]["registry"]["status"], "active");
+    assert_eq!(assets[0]["registry"]["icon"]["href"], expected_icon);
+
+    mock.include_missing_asset.store(true, Ordering::SeqCst);
+    let response = ureq::get(&format!("http://{}{}", rest_addr, registry_list_path))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(response.status(), 503);
+    assert!(response.headers().get("x-total-results").is_none());
+    assert_eq!(
+        response.into_body().read_to_string()?,
+        "asset registry unavailable"
+    );
+    mock.include_missing_asset.store(false, Ordering::SeqCst);
+
+    let response = ureq::get(&format!(
+        "http://{}/assets/registry?created_after=2026-01-01",
+        rest_addr
+    ))
+    .config()
+    .http_status_as_error(false)
+    .build()
+    .call()?;
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        response.into_body().read_to_string()?,
+        "invalid created_after: expected an RFC 3339 date-time"
+    );
+
+    let response = ureq::get(&format!(
+        "http://{}/assets/registry?updated_after=not-a-time",
+        rest_addr
+    ))
+    .config()
+    .http_status_as_error(false)
+    .build()
+    .call()?;
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        response.into_body().read_to_string()?,
+        "invalid updated_after: expected an RFC 3339 date-time"
+    );
+
+    let response = ureq::get(&format!(
+        "http://{}/assets/registry?asset_id=not-hex",
+        rest_addr
+    ))
+    .config()
+    .http_status_as_error(false)
+    .build()
+    .call()?;
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        response.into_body().read_to_string()?,
+        "invalid asset_id: expected 1 to 64 hexadecimal characters"
+    );
+
+    let request_count_before_refresh = mock.request_count.load(Ordering::SeqCst);
+    thread::sleep(std::time::Duration::from_millis(1100));
+    mock.available.store(false, Ordering::SeqCst);
+    let response = get(rest_addr, &format!("/asset/{}", asset_id))?;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-asset-registry-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("stale")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        None
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok()),
+        Some("X-Asset-Registry-Status, X-Total-Results")
+    );
+    let degraded_asset: Value = response.into_body().read_json()?;
+    assert_eq!(degraded_asset["name"], "Registry Asset");
+    assert_eq!(degraded_asset["registry"]["status"], "active");
+
+    let response = get(rest_addr, &format!("/asset/{}/supply/decimal", asset_id))?;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-asset-registry-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("stale")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(response.into_body().read_to_string()?, "1.5");
+
+    let refresh_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while mock.request_count.load(Ordering::SeqCst) <= request_count_before_refresh
+        && std::time::Instant::now() < refresh_deadline
+    {
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(mock.request_count.load(Ordering::SeqCst) > request_count_before_refresh);
+    let request_count = mock.request_count.load(Ordering::SeqCst);
+    let second_issuance = tester
+        .node_client()
+        .call::<Value>("issueasset", &[1.into(), 0.into(), false.into()])?;
+    tester.mine()?;
+    let second_asset_id = second_issuance["asset"].as_str().unwrap();
+    let response = ureq::get(&format!("http://{}/asset/{}", rest_addr, second_asset_id))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    assert_eq!(response.status(), 503);
+
+    assert_eq!(mock.request_count.load(Ordering::SeqCst), request_count + 1);
+    rest_handle.stop();
+    mock.stop();
     Ok(())
 }
 

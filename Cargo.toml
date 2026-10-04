@@ -17,7 +17,7 @@ default-run = "electrs"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(has_error_description_deprecated)"] }
 
 [features]
-liquid = ["elements"]
+liquid = ["elements", "reqwest"]
 electrum-discovery = ["electrum-client"]
 bench = []
 otlp-tracing = [
@@ -59,7 +59,7 @@ serde_json = "1.0.60"
 signal-hook = "0.4"
 stderrlog = "0.6"
 sysconf = ">=0.3.4"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tiny_http = "0.12.0"
 url = "2.2.0"
 hyper = { version = "1", features = ["http1", "server"] }
@@ -73,6 +73,7 @@ tracing-subscriber = { version = "0.3.17", default-features = false, features = 
 opentelemetry-semantic-conventions = { version = "0.12.0", optional = true }
 tracing = { version = "0.1.40", default-features = false, features = ["attributes"], optional = true }
 rand = "0.9.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 # optional dependencies for electrum-discovery
 electrum-client = { version = "0.8", optional = true }

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
 
 use bitcoin::hashes::{sha256, Hash};
 use elements::confidential::{Asset, Value};
@@ -9,7 +8,7 @@ use elements::{issuance::ContractHash, AssetId, AssetIssuance, OutPoint, Transac
 
 use crate::chain::{BNetwork, BlockHash, Network, Txid};
 use crate::elements::peg::{get_pegin_data, get_pegout_data, PeginInfo, PegoutInfo};
-use crate::elements::registry::{AssetMeta, AssetRegistry};
+use crate::elements::registry::AssetMeta;
 use crate::errors::*;
 use crate::new_index::schema::{TxHistoryInfo, TxHistoryKey, TxHistoryRow};
 use crate::new_index::{db::DBFlush, ChainQuery, DBRow, Mempool, Query};
@@ -351,9 +350,8 @@ fn asset_history_row(
 
 pub fn lookup_asset(
     query: &Query,
-    registry: Option<&Arc<RwLock<AssetRegistry>>>,
     asset_id: &AssetId,
-    meta: Option<&AssetMeta>, // may optionally be provided if already known
+    meta: Option<AssetMeta>,
 ) -> Result<Option<LiquidAsset>> {
     if query.network().pegged_asset() == Some(asset_id) {
         let (chain_stats, mempool_stats) = pegged_asset_stats(query, asset_id);
@@ -380,9 +378,6 @@ pub fn lookup_asset(
     Ok(if let Some(row) = row {
         let reissuance_token = parse_asset_id(&row.reissuance_token);
 
-        let meta = meta
-            .cloned()
-            .or_else(|| registry.and_then(|r| r.read().unwrap().get(asset_id).cloned()));
         let stats = issued_asset_stats(query.chain(), &mempool, asset_id, &reissuance_token);
         let status = query.get_tx_status(&deserialize(&row.issuance_txid).unwrap());
 
