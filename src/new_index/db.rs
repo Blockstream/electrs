@@ -388,7 +388,7 @@ impl DB {
     }
 
     #[cfg(test)]
-    fn open_test(path: &Path) -> DB {
+    pub(crate) fn open_test(path: &Path) -> DB {
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
         db_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(33));

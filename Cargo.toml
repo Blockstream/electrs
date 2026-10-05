@@ -13,6 +13,9 @@ readme = "README.md"
 edition = "2018"
 default-run = "electrs"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(has_error_description_deprecated)"] }
+
 [features]
 liquid = ["elements"]
 electrum-discovery = ["electrum-client"]

@@ -1,18 +1,17 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::chain::{Network, OutPoint, Transaction, TxOut, Txid};
 use crate::config::Config;
 use crate::daemon::{Daemon, SubmitPackageResult};
 use crate::errors::*;
+use crate::new_index::block_template::BlockTemplateCache;
 use crate::new_index::{ChainQuery, Mempool, ScriptStats, SpendingInput, Utxo};
 use crate::util::{is_spendable, BlockId, Bytes, TransactionStatus};
 
 use electrs_macros::trace;
 use hyper::body::Bytes as BodyBytes;
-use serde_json::Value;
-use std::str::FromStr;
 
 #[cfg(feature = "liquid")]
 use crate::{
@@ -21,7 +20,6 @@ use crate::{
 };
 
 const FEE_ESTIMATES_TTL: u64 = 60; // seconds
-pub const GETBLOCKTEMPLATE_TTL: u64 = 15; // seconds
 
 const CONF_TARGETS: [u16; 28] = [
     1u16, 2u16, 3u16, 4u16, 5u16, 6u16, 7u16, 8u16, 9u16, 10u16, 11u16, 12u16, 13u16, 14u16, 15u16,
@@ -34,16 +32,12 @@ pub struct Query {
     daemon: Arc<Daemon>,
     config: Arc<Config>,
     cached_estimates: RwLock<(HashMap<u16, f64>, Option<Instant>)>,
+    estimates_refresh: Mutex<()>,
     cached_relayfee: RwLock<Option<f64>>,
-    cached_block_template: Mutex<Option<CachedBlockTemplate>>,
+    relayfee_refresh: Mutex<()>,
+    cached_block_template: BlockTemplateCache,
     #[cfg(feature = "liquid")]
     asset_db: Option<Arc<RwLock<AssetRegistry>>>,
-}
-
-struct CachedBlockTemplate {
-    tip: crate::chain::BlockHash,
-    fetched_at: Instant,
-    body: BodyBytes,
 }
 
 impl Query {
@@ -60,8 +54,10 @@ impl Query {
             daemon,
             config,
             cached_estimates: RwLock::new((HashMap::new(), None)),
+            estimates_refresh: Mutex::new(()),
             cached_relayfee: RwLock::new(None),
-            cached_block_template: Mutex::new(None),
+            relayfee_refresh: Mutex::new(()),
+            cached_block_template: BlockTemplateCache::new(),
         }
     }
 
@@ -114,40 +110,14 @@ impl Query {
     }
 
     #[trace]
-    pub fn getblocktemplate(&self) -> Result<BodyBytes> {
-        let tip = self.chain.best_hash();
-
-        let mut cache = self.cached_block_template.lock().unwrap();
-        if let Some(cached) = cache.as_ref() {
-            if cached.tip == tip
-                && cached.fetched_at.elapsed() < Duration::from_secs(GETBLOCKTEMPLATE_TTL)
-            {
-                return Ok(cached.body.clone());
-            }
-        }
-
-        let value = self
-            .daemon
-            .getblocktemplate(block_template_rules(self.config.network_type))?;
-        let body = BodyBytes::from(
-            serde_json::to_string(&value).chain_err(|| "failed to serialize getblocktemplate")?,
-        );
-
-        match block_template_tip(&value) {
-            Ok(tip) => {
-                *cache = Some(CachedBlockTemplate {
-                    tip,
-                    fetched_at: Instant::now(),
-                    body: body.clone(),
-                });
-            }
-            Err(err) => {
-                warn!("not caching getblocktemplate response: {}", err);
-                *cache = None;
-            }
-        }
-
-        Ok(body)
+    pub async fn getblocktemplate(&self) -> Result<BodyBytes> {
+        self.cached_block_template
+            .get(
+                Arc::clone(&self.chain),
+                Arc::clone(&self.daemon),
+                self.config.network_type,
+            )
+            .await
     }
 
     #[trace]
@@ -267,7 +237,7 @@ impl Query {
             }
         }
 
-        self.update_fee_estimates();
+        self.refresh_fee_estimates_if_stale();
         self.cached_estimates
             .read()
             .unwrap()
@@ -284,8 +254,23 @@ impl Query {
             }
         }
 
-        self.update_fee_estimates();
+        self.refresh_fee_estimates_if_stale();
         self.cached_estimates.read().unwrap().0.clone()
+    }
+
+    #[trace]
+    fn refresh_fee_estimates_if_stale(&self) {
+        let _guard = match self.estimates_refresh.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        if let (_, Some(cache_time)) = *self.cached_estimates.read().unwrap() {
+            if cache_time.elapsed() < Duration::from_secs(FEE_ESTIMATES_TTL) {
+                return;
+            }
+        }
+        self.update_fee_estimates();
     }
 
     #[trace]
@@ -302,6 +287,14 @@ impl Query {
 
     #[trace]
     pub fn get_relayfee(&self) -> Result<f64> {
+        if let Some(cached) = *self.cached_relayfee.read().unwrap() {
+            return Ok(cached);
+        }
+
+        let _guard = self
+            .relayfee_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cached) = *self.cached_relayfee.read().unwrap() {
             return Ok(cached);
         }
@@ -326,8 +319,10 @@ impl Query {
             config,
             asset_db,
             cached_estimates: RwLock::new((HashMap::new(), None)),
+            estimates_refresh: Mutex::new(()),
             cached_relayfee: RwLock::new(None),
-            cached_block_template: Mutex::new(None),
+            relayfee_refresh: Mutex::new(()),
+            cached_block_template: BlockTemplateCache::new(),
         }
     }
 
@@ -359,42 +354,5 @@ impl Query {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((total_num, results))
-    }
-}
-
-#[cfg(not(feature = "liquid"))]
-fn block_template_rules(network: Network) -> &'static [&'static str] {
-    match network {
-        Network::Signet => &["segwit", "signet"],
-        _ => &["segwit"],
-    }
-}
-
-#[cfg(feature = "liquid")]
-fn block_template_rules(_network: Network) -> &'static [&'static str] {
-    &["segwit"]
-}
-
-fn block_template_tip(value: &Value) -> Result<crate::chain::BlockHash> {
-    let previousblockhash = value
-        .get("previousblockhash")
-        .and_then(|value| value.as_str())
-        .chain_err(|| "getblocktemplate response missing previousblockhash")?;
-    crate::chain::BlockHash::from_str(previousblockhash)
-        .chain_err(|| "invalid getblocktemplate previousblockhash")
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    #[test]
-    fn block_template_tip_parses_previousblockhash() {
-        let hash = "0000000000000000000000000000000000000000000000000000000000000000";
-        let value = json!({ "previousblockhash": hash });
-        assert_eq!(super::block_template_tip(&value).unwrap().to_string(), hash);
-
-        assert!(super::block_template_tip(&json!({})).is_err());
-        assert!(super::block_template_tip(&json!({ "previousblockhash": "not a hash" })).is_err());
     }
 }

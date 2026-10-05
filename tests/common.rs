@@ -39,6 +39,7 @@ pub struct TestRunner {
     daemon: Arc<Daemon>,
     mempool: Arc<RwLock<Mempool>>,
     metrics: Metrics,
+    metrics_addr: net::SocketAddr,
     salt_rwlock: Arc<RwLock<String>>,
 }
 
@@ -100,6 +101,8 @@ impl TestRunner {
             daemon_rpc_fallback_addr: None,
             cookie: None,
             electrum_rpc_addr: rand_available_addr(),
+            electrum_rpc_conn_max_age: None,
+            electrum_rpc_max_request_num_bytes: 1_048_576,
             http_addr: rand_available_addr(),
             http_socket_file: None, // XXX test with socket file or tcp?
             monitoring_addr: rand_available_addr(),
@@ -112,6 +115,8 @@ impl TestRunner {
             precache_scripts: None,
             utxos_limit: 100,
             electrum_txs_limit: 100,
+            electrum_subscription_limit: 10_000,
+            electrum_checkpoint_proof_concurrency_limit: 2,
             electrum_banner: "".into(),
             rpc_logging: RpcLogging::default(),
             zmq_addr: None,
@@ -136,7 +141,8 @@ impl TestRunner {
         });
 
         let signal = Waiter::start(crossbeam_channel::never());
-        let metrics = Metrics::new(rand_available_addr());
+        let metrics_addr = rand_available_addr();
+        let metrics = Metrics::new(metrics_addr);
         metrics.start();
 
         let daemon = Arc::new(Daemon::new(
@@ -203,8 +209,17 @@ impl TestRunner {
             daemon,
             mempool,
             metrics,
+            metrics_addr,
             salt_rwlock,
         })
+    }
+
+    pub fn query(&self) -> Arc<Query> {
+        Arc::clone(&self.query)
+    }
+
+    pub fn metrics_addr(&self) -> net::SocketAddr {
+        self.metrics_addr
     }
 
     pub fn node_client(&self) -> &Client {

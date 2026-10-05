@@ -45,7 +45,7 @@ pub struct HeaderEntry {
 }
 
 impl HeaderEntry {
-    #[cfg(feature = "bench")]
+    #[cfg(any(test, feature = "bench"))]
     pub fn new(height: usize, hash: BlockHash, header: BlockHeader) -> Self {
         Self {
             height,

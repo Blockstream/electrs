@@ -54,22 +54,33 @@ type SizedBlock = (Block, u32);
 
 pub struct Fetcher<T> {
     receiver: Receiver<T>,
-    thread: thread::JoinHandle<()>,
+    thread: thread::JoinHandle<Result<()>>,
 }
 
 impl<T> Fetcher<T> {
-    fn from(receiver: Receiver<T>, thread: thread::JoinHandle<()>) -> Self {
+    fn from(receiver: Receiver<T>, thread: thread::JoinHandle<Result<()>>) -> Self {
         Fetcher { receiver, thread }
     }
 
-    pub fn map<F>(self, mut func: F)
+    pub fn map<F>(self, mut func: F) -> Result<()>
     where
-        F: FnMut(T) -> (),
+        F: FnMut(T) -> Result<()>,
     {
+        let mut consumer_error = None;
         for item in self.receiver {
-            func(item);
+            if let Err(e) = func(item) {
+                consumer_error = Some(e);
+                break;
+            }
         }
-        self.thread.join().expect("fetcher thread panicked")
+        let producer_result = match self.thread.join() {
+            Ok(result) => result,
+            Err(_) => bail!("fetcher thread panicked"),
+        };
+        match consumer_error {
+            Some(e) => Err(e),
+            None => producer_result,
+        }
     }
 }
 
@@ -103,10 +114,20 @@ fn bitcoind_fetcher(
                 fetcher_count += 1;
 
                 let blockhashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
-                let blocks = daemon
-                    .getblocks(&blockhashes)
-                    .expect("failed to get blocks from bitcoind");
-                assert_eq!(blocks.len(), entries.len());
+                let blocks = daemon.getblocks(&blockhashes).chain_err(|| {
+                    format!(
+                        "failed to fetch block batch first_hash='{:?}' batch_size='{}'",
+                        blockhashes.first(),
+                        blockhashes.len()
+                    )
+                })?;
+                if blocks.len() != entries.len() {
+                    bail!(
+                        "bitcoind_fetcher block/entry count mismatch expected='{}' got='{}'",
+                        entries.len(),
+                        blocks.len()
+                    );
+                }
                 let block_entries: Vec<BlockEntry> = blocks
                     .into_iter()
                     .zip(entries)
@@ -120,12 +141,12 @@ fn bitcoind_fetcher(
                         }
                     })
                     .collect();
-                assert_eq!(block_entries.len(), entries.len());
                 sender
                     .send(block_entries)
-                    .expect("failed to send fetched blocks");
+                    .chain_err(|| "bitcoind_fetcher receiver dropped")?;
                 log::debug!("last fetch {:?}", entries.last());
             }
+            Ok(())
         }),
     ))
 }
@@ -177,16 +198,18 @@ fn blkfiles_fetcher(
                     })
                     .collect();
                 trace!("fetched {} blocks", block_entries.len());
-                sender
-                    .send(block_entries)
-                    .expect("failed to send blocks entries from blk*.dat files");
-            });
+                sender.send(block_entries).chain_err(|| {
+                    "failed to send block entries from blk*.dat files"
+                })?;
+                Ok(())
+            })?;
             if !entry_map.is_empty() {
-                panic!(
+                bail!(
                     "failed to index {} blocks from blk*.dat files",
                     entry_map.len()
                 )
             }
+            Ok(())
         }),
     ))
 }
@@ -211,14 +234,15 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>, xor_key: Option<[u8; 8]>) -> Fetcher
 
                 trace!("reading {:?}", path);
                 let mut blob = fs::read(&path)
-                    .unwrap_or_else(|e| panic!("failed to read {:?}: {:?}", path, e));
+                    .chain_err(|| format!("failed to read {:?}", path))?;
                 if let Some(xor_key) = xor_key {
                     blkfile_apply_xor_key(xor_key, &mut blob);
                 }
                 sender
                     .send(blob)
-                    .unwrap_or_else(|_| panic!("failed to send {:?} contents", path));
+                    .chain_err(|| format!("failed to send {:?} contents", path))?;
             }
+            Ok(())
         }),
     )
 }
@@ -247,11 +271,13 @@ fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBloc
                 .unwrap();
             blobs.map(|blob| {
                 trace!("parsing {} bytes", blob.len());
-                let blocks = parse_blocks(&pool, blob, magic).expect("failed to parse blk*.dat file");
+                let blocks = parse_blocks(&pool, blob, magic)?;
                 sender
                     .send(blocks)
-                    .expect("failed to send blocks from blk*.dat file");
-            });
+                    .chain_err(|| "blkfiles_parser receiver dropped")?;
+                Ok(())
+            })?;
+            Ok(())
         }),
     )
 }
@@ -277,6 +303,12 @@ fn parse_blocks(pool: &rayon::ThreadPool, blob: Vec<u8>, magic: u32) -> Result<V
         let start = cursor.position();
         let end = start + block_size as u64;
 
+        // The magic+size truncation handling below covers a truncated header prefix,
+        // but not a truncated block body. Treat that as EOF.
+        if end > max_pos {
+            break;
+        }
+
         // If Core's WriteBlockToDisk ftell fails, only the magic bytes and size will be written
         // and the block body won't be written to the blk*.dat file.
         // Since the first 4 bytes should contain the block's version, we can skip such blocks
@@ -294,10 +326,73 @@ fn parse_blocks(pool: &rayon::ThreadPool, blob: Vec<u8>, magic: u32) -> Result<V
         cursor.set_position(end as u64);
     }
 
-    Ok(pool.install(|| {
+    pool.install(|| {
         slices
             .into_par_iter()
-            .map(|(slice, size)| (deserialize(slice).expect("failed to parse Block"), size))
-            .collect()
-    }))
+            .map(|(slice, size)| {
+                let block = deserialize(slice)
+                    .chain_err(|| "failed to deserialize block from blk file")?;
+                Ok((block, size))
+            })
+            .collect::<Result<Vec<SizedBlock>>>()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetcher_surfaces_producer_error() {
+        let chan = SyncChannel::<u8>::new(1);
+        let fetcher = Fetcher::from(
+            chan.into_receiver(),
+            spawn_thread("failing_fetcher", move || bail!("producer failed")),
+        );
+
+        let error = fetcher.map(|_| Ok(())).unwrap_err();
+        assert!(format!("{:?}", error).contains("producer failed"));
+    }
+
+    #[test]
+    fn fetcher_delivers_partial_output_before_producer_error() {
+        let chan = SyncChannel::new(1);
+        let sender = chan.sender();
+        let fetcher = Fetcher::from(
+            chan.into_receiver(),
+            spawn_thread("partially_failing_fetcher", move || {
+                sender.send(1).chain_err(|| "receiver dropped")?;
+                bail!("producer failed after partial output")
+            }),
+        );
+        let mut items = vec![];
+
+        let error = fetcher
+            .map(|item| {
+                items.push(item);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(items, vec![1]);
+        assert!(format!("{:?}", error).contains("producer failed after partial output"));
+    }
+
+    #[test]
+    fn fetcher_surfaces_consumer_error() {
+        let chan = SyncChannel::new(1);
+        let sender = chan.sender();
+        let fetcher = Fetcher::from(
+            chan.into_receiver(),
+            spawn_thread("successful_fetcher", move || {
+                sender.send(1).chain_err(|| "receiver dropped")?;
+                Ok(())
+            }),
+        );
+
+        let error = fetcher
+            .map(|_| bail!("consumer failed"))
+            .unwrap_err();
+        assert!(format!("{:?}", error).contains("consumer failed"));
+    }
 }

@@ -459,6 +459,10 @@ fn test_rest_mempool() -> Result<()> {
 fn test_rest_getblocktemplate() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
 
+    let address = tester.newaddress()?;
+    let pending_txid = tester
+        .send(&address, "0.001 BTC".parse().unwrap())?
+        .to_string();
     let tip = tester.get_best_block_hash()?;
     let response = get(rest_addr, "/block-template")?;
     assert_eq!(
@@ -477,6 +481,35 @@ fn test_rest_getblocktemplate() -> Result<()> {
     assert!(template["version"].is_i64() || template["version"].is_u64());
     assert!(template["rules"].is_array());
     assert!(template["bits"].is_string());
+    assert!(template["transactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tx| tx["txid"].as_str() == Some(pending_txid.as_str())));
+
+    #[cfg(feature = "liquid")]
+    {
+        assert_eq!(template["capabilities"], serde_json::json!([]));
+        assert_eq!(template["rules"], serde_json::json!([]));
+        assert_eq!(template["vbavailable"], serde_json::json!({}));
+        assert_eq!(template["vbrequired"].as_u64(), Some(0));
+        assert_eq!(template["bits"].as_str(), Some("00000000"));
+        assert_eq!(template["target"], serde_json::json!("0".repeat(64)));
+        assert_eq!(
+            template["noncerange"].as_str(),
+            Some("00000000ffffffff")
+        );
+        assert!(template.get("longpollid").is_none());
+        assert!(template.get("mintime").is_none());
+        assert!(template.get("sigoplimit").is_none());
+        assert!(template.get("sizelimit").is_none());
+        assert!(template.get("weightlimit").is_none());
+        assert!(template["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tx| tx.get("sigops").is_none()));
+    }
 
     let cached_template = get_json(rest_addr, "/block-template")?;
     assert_eq!(cached_template, template);

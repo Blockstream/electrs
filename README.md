@@ -84,9 +84,31 @@ See `$ cargo run --release --bin electrs -- --help` for the full list of options
 ### Mining-related HTTP endpoints
 
 `GET /block-template` is available only with `--enable-mining-rest`. It proxies
-the daemon's `getblocktemplate` template-mode response and caches successful
-responses for 15 seconds, invalidating early when electrs indexes a new tip.
-Callers that require fresher templates should account for this cache behavior.
+the daemon's `getblocktemplate` response unchanged on Bitcoin-compatible chains.
+On Liquid, it instead decodes the complete proposal returned by
+`getnewblockhex` and projects the recoverable header, transaction, fee,
+coinbase, and witness-commitment data into the same response shape. Fields that
+have no equivalent mining semantics for signed dynafed blocks use compatibility
+defaults or are omitted. The Liquid response is intended for template inspection
+and distribution, not block reconstruction or federation signing.
+
+Successful responses are cached for 15 seconds and invalidated early when
+electrs indexes a new tip. Cache misses are coalesced into one daemon request.
+Responses use `Cache-Control: no-store`, so downstream caches do not extend the
+internal lifetime.
+
+Template RPCs use an isolated daemon connection with a 30-second I/O timeout.
+Failures are retained internally for one second to prevent HTTP pollers from
+immediately repeating the same failing RPC, while error responses remain
+`Cache-Control: no-store`. Malformed Bitcoin templates that cannot be validated
+against the indexed tip are rejected with `502 Bad Gateway`; they are not served
+or cached.
+
+All connections to the configured daemon RPC endpoint are expected to expose a
+coherent chain view. Deployments using an L4 load balancer must keep its daemon
+backends synchronized or provide backend affinity. A template that conflicts
+with electrs' indexed tip is rejected rather than serving potentially stale
+mining work.
 
 ## License
 

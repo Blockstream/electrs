@@ -60,7 +60,13 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     info!("starting electrs");
 
     if let Some(zmq_addr) = config.zmq_addr.as_ref() {
-        zmq::start(&format!("tcp://{zmq_addr}"), block_hash_notify);
+        if let Err(e) = zmq::start(&format!("tcp://{zmq_addr}"), &block_hash_notify, &metrics) {
+            error!(
+                "ZMQ notifications disabled, falling back to polling: zmq_addr='{}' err='{}'",
+                zmq_addr,
+                e.display_chain()
+            );
+        }
     }
 
     info!("connecting to daemon at {}", config.daemon_rpc_addr);
@@ -86,7 +92,15 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     );
     info!("starting initial sync");
     let mut tip = indexer.update(&daemon)?;
-    info!("initial sync complete, tip at {}", tip);
+    let daemon_tip = daemon.getbestblockhash()?;
+    if tip == daemon_tip {
+        info!("initial sync complete, tip at {}", tip);
+    } else {
+        info!(
+            "initial sync incomplete, serving a partial index and retrying outstanding blocks in the background tip='{}' daemon_tip='{}'",
+            tip, daemon_tip
+        );
+    }
 
     let chain = Arc::new(ChainQuery::new(
         Arc::clone(&store),
@@ -108,10 +122,18 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         Arc::clone(&config),
     )));
 
+    // A mempool update is retried whenever the tip moves, so index and try again. An update
+    // that cannot advance the tip never will here, and no listener is bound yet.
     while !Mempool::update(&mempool, &daemon, &tip)? {
-        // Mempool syncing was aborted because the chain tip moved;
-        // Index the new block(s) and try again.
-        tip = indexer.update(&daemon)?;
+        let new_tip = indexer.update(&daemon)?;
+        if new_tip == tip {
+            warn!(
+                "index could not advance, starting up with a partial index tip='{}'",
+                tip
+            );
+            break;
+        }
+        tip = new_tip;
     }
 
     #[cfg(feature = "liquid")]

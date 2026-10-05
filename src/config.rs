@@ -1,5 +1,6 @@
 use clap::{App, Arg};
 use dirs::home_dir;
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
@@ -19,6 +20,33 @@ use bitcoin::Network as BNetwork;
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Clone)]
+pub struct SensitiveAuth(String);
+
+impl SensitiveAuth {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for SensitiveAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let username = self
+            .0
+            .split_once(':')
+            .map(|(username, _)| username)
+            .unwrap_or("<invalid>");
+        f.debug_tuple("UserPass")
+            .field(&username)
+            .field(&"<sensitive>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // See below for the documentation of each field:
@@ -31,8 +59,10 @@ pub struct Config {
     pub daemon_rpc_fallback_addr: Option<SocketAddr>,
     pub daemon_parallelism: usize,
     pub daemon_conn_max_age: Option<Duration>,
-    pub cookie: Option<String>,
+    pub cookie: Option<SensitiveAuth>,
     pub electrum_rpc_addr: SocketAddr,
+    pub electrum_rpc_conn_max_age: Option<Duration>,
+    pub electrum_rpc_max_request_num_bytes: usize,
     pub http_addr: SocketAddr,
     pub http_socket_file: Option<PathBuf>,
     pub monitoring_addr: SocketAddr,
@@ -45,6 +75,8 @@ pub struct Config {
     pub precache_scripts: Option<String>,
     pub utxos_limit: usize,
     pub electrum_txs_limit: usize,
+    pub electrum_subscription_limit: usize,
+    pub electrum_checkpoint_proof_concurrency_limit: usize,
     pub electrum_banner: String,
     pub rpc_logging: RpcLogging,
     pub zmq_addr: Option<SocketAddr>,
@@ -161,6 +193,20 @@ impl Config {
                     .takes_value(true),
             )
             .arg(
+                Arg::with_name("electrum_rpc_conn_max_age")
+                    .long("electrum-rpc-conn-max-age")
+                    .help("Maximum age (in seconds) of inbound Electrum RPC TCP connections. Each connection is closed at a randomly selected age between 50% and 100% of this value so clients reconnect gradually and load balancers can redistribute them. 0 = unlimited / never disconnect (default)")
+                    .default_value("0")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("electrum_rpc_max_request_num_bytes")
+                    .long("electrum-rpc-max-request-num-bytes")
+                    .help("Maximum size (in bytes) of a single Electrum RPC request line. A client streaming bytes without a newline is disconnected once its in-flight line exceeds this size, bounding per-connection memory. 0 = unlimited (default: 1048576, i.e. 1 MiB)")
+                    .default_value("1048576")
+                    .takes_value(true),
+            )
+            .arg(
                 Arg::with_name("http_addr")
                     .long("http-addr")
                     .help("HTTP server 'addr:port' to listen on (default: '127.0.0.1:3000' for mainnet, '127.0.0.1:3001' for testnet3 and '127.0.0.1:3004' for testnet4 and '127.0.0.1:3002' for regtest)")
@@ -245,6 +291,18 @@ impl Config {
                     .long("electrum-txs-limit")
                     .help("Maximum number of transactions returned by Electrum history queries. Lookups with more results will fail.")
                     .default_value("500")
+            ).arg(
+                Arg::with_name("electrum_subscription_limit")
+                    .long("electrum-subscription-limit")
+                    .help("Maximum number of scripthash subscriptions a single Electrum connection may hold. Every subscription costs a history lookup on each new block, so an unbounded count lets one client impose unbounded recurring work. Re-subscribing to an already-tracked scripthash is always allowed. 0 = unlimited.")
+                    .default_value("10000")
+                    .takes_value(true)
+            ).arg(
+                Arg::with_name("electrum_checkpoint_proof_concurrency_limit")
+                    .long("electrum-checkpoint-proof-concurrency-limit")
+                    .help("Maximum number of blockchain.block.header(s) checkpoint Merkle proof builds (triggered by a non-zero cp_height) allowed to run at once, process-wide. Each build hashes every header from genesis up to cp_height, so an unbounded count lets concurrent cheap requests pin every CPU core. Requests past the cap fail immediately rather than queueing. 0 = reject all such requests.")
+                    .default_value("2")
+                    .takes_value(true)
             ).arg(
                 Arg::with_name("electrum_banner")
                     .long("electrum-banner")
@@ -467,6 +525,19 @@ impl Config {
                 .unwrap_or(&format!("127.0.0.1:{}", default_electrum_port)),
             "Electrum RPC",
         );
+        let electrum_rpc_conn_max_age: Option<Duration> =
+            match value_t_or_exit!(m, "electrum_rpc_conn_max_age", u64) {
+                0 => None, // 0 = unlimited / never disconnect
+                secs => Some(Duration::from_secs(secs)),
+            };
+        let electrum_rpc_max_request_num_bytes: usize = match value_t_or_exit!(
+            m,
+            "electrum_rpc_max_request_num_bytes",
+            usize
+        ) {
+            0 => usize::MAX, // 0 = unlimited
+            bytes => bytes,
+        };
         let http_addr: SocketAddr = str_to_socketaddr(
             m.value_of("http_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_http_port)),
@@ -499,7 +570,9 @@ impl Config {
             .value_of("blocks_dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| daemon_dir.join("blocks"));
-        let cookie = m.value_of("cookie").map(|s| s.to_owned());
+        let cookie = m
+            .value_of("cookie")
+            .map(|s| SensitiveAuth::new(s.to_owned()));
 
         let electrum_banner = m.value_of("electrum_banner").map_or_else(
             || format!("Welcome to electrs-esplora {}", ELECTRS_VERSION),
@@ -535,7 +608,15 @@ impl Config {
             cookie,
             utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
             electrum_rpc_addr,
+            electrum_rpc_conn_max_age,
+            electrum_rpc_max_request_num_bytes,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
+            electrum_subscription_limit: value_t_or_exit!(m, "electrum_subscription_limit", usize),
+            electrum_checkpoint_proof_concurrency_limit: value_t_or_exit!(
+                m,
+                "electrum_checkpoint_proof_concurrency_limit",
+                usize
+            ),
             electrum_banner,
             rpc_logging: {
                 let params = RpcLogging {
@@ -577,8 +658,14 @@ impl Config {
             #[cfg(feature = "electrum-discovery")]
             tor_proxy: m.value_of("tor_proxy").map(|s| s.parse().unwrap()),
         };
-
-        eprintln!("{:?}", config);
+        match &config.cookie {
+            Some(auth) => log::debug!("daemon authentication: {:?}", auth),
+            None => log::debug!(
+                "daemon authentication: CookieFile({:?})",
+                config.daemon_dir.join(".cookie")
+            ),
+        }
+        log::debug!("configuration: {:?}", config);
         config
     }
 
@@ -653,5 +740,20 @@ impl CookieGetter for CookieFile {
             ErrorKind::Connection(format!("failed to read cookie from {:?}", path))
         })?;
         Ok(contents)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SensitiveAuth;
+
+    #[test]
+    fn sensitive_auth_debug_redacts_password() {
+        let password = "poc-PASSWORD-123";
+        let auth = SensitiveAuth::new(format!("poc-user:{}", password));
+        let rendered = format!("{:?}", auth);
+
+        assert_eq!(rendered, r#"UserPass("poc-user", "<sensitive>")"#);
+        assert!(!rendered.contains(password));
     }
 }

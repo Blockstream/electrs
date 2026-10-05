@@ -533,7 +533,14 @@ fn spawn_conn(
 
             let resp_result = match body_result {
                 Ok(Ok(collected)) => {
-                    handle_request(method, uri, collected.to_bytes(), &query, &config)
+                    handle_request(
+                        method,
+                        uri,
+                        collected.to_bytes(),
+                        query,
+                        Arc::clone(&config),
+                    )
+                    .await
                 }
                 // Inner Err by http_body_util::Limited, either a LengthLimitError or an error by the underlying body stream
                 Ok(Err(e)) if e.is::<LengthLimitError>() => Err(HttpError(
@@ -671,8 +678,67 @@ impl Handle {
     }
 }
 
+/// Whether `uri` addresses the block template endpoint, the one route handled on the async
+/// runtime rather than on the blocking pool (see `handle_request`). Matched exactly the way
+/// the router below matches it, so the two cannot drift apart.
+fn is_block_template_request(method: &Method, uri: &hyper::Uri) -> bool {
+    let mut path = uri.path().split('/').skip(1);
+    *method == Method::GET && path.next() == Some("block-template") && path.next().is_none()
+}
+
+/// Dispatch a request, keeping blocking work off the async worker threads.
+///
+/// Almost every handler is synchronous: it reads RocksDB, and some of them (transaction
+/// broadcast, package submission, and any lookup in `--lightmode`) make a blocking JSON-RPC
+/// call to the daemon. Running those directly on a Tokio worker lets a slow or unresponsive
+/// daemon park every worker the runtime has, at which point even fully in-memory endpoints
+/// such as `GET /blocks/tip/height` stop being served. Moving them to the blocking pool
+/// keeps the runtime free to answer everything else.
+///
+/// The block template endpoint is the exception: it is genuinely asynchronous (concurrent
+/// callers share one in-flight daemon fetch) and already does its own blocking work on the
+/// blocking pool, so it stays on the runtime.
 #[trace]
-fn handle_request(
+async fn handle_request(
+    method: Method,
+    uri: hyper::Uri,
+    body: Bytes,
+    query: Arc<Query>,
+    config: Arc<Config>,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    if is_block_template_request(&method, &uri) {
+        return handle_block_template_request(&query, &config).await;
+    }
+
+    let path = uri.path().to_string();
+    tokio::task::spawn_blocking(move || handle_blocking_request(method, uri, body, &query, &config))
+        .await
+        .unwrap_or_else(|err| {
+            // The handler panicked or was cancelled; hyper still needs a response.
+            warn!("request handler for path='{}' failed: {}", path, err);
+            Err(HttpError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            ))
+        })
+}
+
+async fn handle_block_template_request(
+    query: &Query,
+    config: &Config,
+) -> Result<Response<Full<Bytes>>, HttpError> {
+    if !config.enable_mining_rest {
+        return Err(HttpError::forbidden(
+            "mining REST endpoints are disabled".to_string(),
+        ));
+    }
+    getblocktemplate_response(query.getblocktemplate().await)
+}
+
+/// The synchronous body of the router. Always invoked from the blocking pool by
+/// `handle_request`, never directly from an async worker thread.
+#[trace]
+fn handle_blocking_request(
     method: Method,
     uri: hyper::Uri,
     body: Bytes,
@@ -1150,15 +1216,8 @@ fn handle_request(
             json_response(query.estimate_fee_map(), TTL_SHORT)
         }
 
-        (&Method::GET, Some(&"block-template"), None, None, None, None) => {
-            if !config.enable_mining_rest {
-                return Err(HttpError::forbidden(
-                    "mining REST endpoints are disabled".to_string(),
-                ));
-            }
-            getblocktemplate_response(query.getblocktemplate())
-        }
-
+        // NOTE: `GET /block-template` is intercepted by `handle_request` before reaching
+        // here, because it is the only asynchronous handler. See `is_block_template_request`.
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"assets"), Some(&"registry"), None, None, None) => {
             let start_index: usize = query_params
@@ -1366,14 +1425,16 @@ fn getblocktemplate_response(
             if let errors::ErrorKind::Connection(message) = err.kind() {
                 return text_response_no_store(StatusCode::BAD_GATEWAY, message.clone());
             }
-            Err(HttpError::from(err))
+            text_response_no_store(StatusCode::BAD_GATEWAY, err.to_string())
         }
     }
 }
 
 fn getblocktemplate_rpc_error(err: &errors::Error) -> Option<(i64, String)> {
     match err.kind() {
-        errors::ErrorKind::RpcError(code, message, method) if method == "getblocktemplate" => {
+        errors::ErrorKind::RpcError(code, message, method)
+            if method == "getblocktemplate" || method == "getnewblockhex" =>
+        {
             Some((*code, message.clone()))
         }
         _ => None,
@@ -1500,6 +1561,26 @@ impl From<hex::HexToArrayError> for HttpError {
 impl From<errors::Error> for HttpError {
     fn from(e: errors::Error) -> Self {
         warn!("errors::Error: {:?}", e);
+        // Downstream daemon failures are ours, not the client's: answering them with the
+        // default 400 would tell callers (and caches, and load balancers) that a perfectly
+        // valid request was malformed.
+        match e.kind() {
+            // We refused to queue any deeper for the daemon. Retrying later may well work.
+            errors::ErrorKind::DaemonBusy(_) => {
+                return HttpError(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+            }
+            // The daemon could not be reached, or did not answer within the client-facing
+            // timeout (see DAEMON_PROXY_RPC_TIMEOUT).
+            errors::ErrorKind::DaemonUnavailable(_) => {
+                return HttpError(StatusCode::GATEWAY_TIMEOUT, e.to_string())
+            }
+            // -28 is bitcoind's "still warming up". Client-proxied requests are no longer
+            // retried until it finishes, so report it as a transient server-side condition.
+            errors::ErrorKind::RpcError(-28, _, _) => {
+                return HttpError(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+            }
+            _ => (),
+        }
         match e.description().to_string().as_ref() {
             "getblock RPC error: {\"code\":-5,\"message\":\"Block not found\"}" => {
                 HttpError::not_found("Block not found".to_string())
@@ -1540,11 +1621,61 @@ impl From<address::AddressError> for HttpError {
 
 #[cfg(test)]
 mod tests {
-    use crate::{errors, rest::HttpError};
+    use crate::rest::{is_block_template_request, HttpError};
+    use crate::{errors, errors::ErrorKind};
     use http_body_util::BodyExt;
-    use hyper::StatusCode;
+    use hyper::{Method, StatusCode};
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn block_template_is_the_only_route_kept_on_the_async_runtime() {
+        let is_async = |method: Method, uri: &str| {
+            is_block_template_request(&method, &uri.parse::<hyper::Uri>().unwrap())
+        };
+
+        assert!(is_async(Method::GET, "/block-template"));
+        assert!(is_async(Method::GET, "/block-template?ignored=1"));
+
+        // Everything else must fall through to the blocking pool, including near-misses
+        // that the router itself would not match as the block template route.
+        assert!(!is_async(Method::GET, "/block-template/"));
+        assert!(!is_async(Method::GET, "/block-template/extra"));
+        assert!(!is_async(Method::POST, "/block-template"));
+        assert!(!is_async(Method::GET, "/blocks/tip/height"));
+        assert!(!is_async(Method::POST, "/tx"));
+    }
+
+    #[test]
+    fn daemon_failures_map_to_gateway_statuses() {
+        // A client-proxied daemon failure is a downstream problem, so it must not be
+        // reported as a 400 (which would blame - and let caches memoize - a valid request).
+        let busy = HttpError::from(errors::Error::from(ErrorKind::DaemonBusy(
+            "all 8 client RPC slots are in use".to_string(),
+        )));
+        assert_eq!(busy.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        let unavailable = HttpError::from(errors::Error::from(ErrorKind::DaemonUnavailable(
+            "sendrawtransaction failed".to_string(),
+        )));
+        assert_eq!(unavailable.0, StatusCode::GATEWAY_TIMEOUT);
+
+        // bitcoind still warming up: transient, and no longer retried for client requests.
+        let warming_up = HttpError::from(errors::Error::from(ErrorKind::RpcError(
+            -28,
+            "Loading block index...".to_string(),
+            "sendrawtransaction".to_string(),
+        )));
+        assert_eq!(warming_up.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        // Unrelated daemon errors keep their existing 400 mapping.
+        let rejected = HttpError::from(errors::Error::from(ErrorKind::RpcError(
+            -26,
+            "min relay fee not met".to_string(),
+            "sendrawtransaction".to_string(),
+        )));
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn test_parse_query_param() {
@@ -1628,6 +1759,17 @@ mod tests {
             errors::ErrorKind::RpcError(-5, "Block not found".to_string(), "getblock".to_string())
                 .into();
         assert_eq!(super::getblocktemplate_rpc_error(&other_method), None);
+
+        let elements_err: errors::Error = errors::ErrorKind::RpcError(
+            -28,
+            "warming up".to_string(),
+            "getnewblockhex".to_string(),
+        )
+        .into();
+        assert_eq!(
+            super::getblocktemplate_rpc_error(&elements_err),
+            Some((-28, "warming up".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -1665,5 +1807,23 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"daemon unavailable");
+
+        for message in [
+            "invalid getnewblockhex block hex",
+            "daemon returned a stale or competing block template twice",
+        ] {
+            let error: errors::Error = message.into();
+            let response = super::getblocktemplate_response(Err(error)).unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], message.as_bytes());
+        }
     }
 }
