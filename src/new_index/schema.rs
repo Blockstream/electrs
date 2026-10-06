@@ -514,7 +514,13 @@ impl Indexer {
         self.finish_sync_writes();
 
         // Publish headers only after their history writes are durable.
-        let synced_tip = self.commit_completed_headers(completed_headers)?;
+        let synced_tip = match self.commit_completed_headers(completed_headers) {
+            Ok(tip) => tip,
+            Err(err) => {
+                fetch_result.chain_err(|| err.to_string())?;
+                return Err(err);
+            }
+        };
 
         if fetch_result.is_ok() && synced_tip != tip {
             bail!(
@@ -598,9 +604,26 @@ impl Indexer {
         headers: &[HeaderEntry],
         tip_height: usize,
     ) -> Result<()> {
-        let result = self.fetch_index_batches(self.from, daemon, headers, tip_height);
-        if let FetchFrom::BlkFiles = self.from {
+        let from = self.from;
+        let result = self.fetch_index_batches(from, daemon, headers, tip_height);
+        if let FetchFrom::BlkFiles = from {
             self.from = FetchFrom::Bitcoind;
+            if let Err(err) = result {
+                warn!(
+                    "blk-file import incomplete, fetching remaining='{}' of total='{}' blocks over RPC: {:?}",
+                    self.store.headers_to_process(headers).len(),
+                    headers.len(),
+                    err
+                );
+                return self
+                    .fetch_index_batches(FetchFrom::Bitcoind, daemon, headers, tip_height)
+                    .chain_err(|| {
+                        format!(
+                            "RPC fallback after blk-file import failed: {}",
+                            err.display_chain()
+                        )
+                    });
+            }
         }
         result
     }

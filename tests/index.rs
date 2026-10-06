@@ -8,6 +8,7 @@ use bitcoin::{Block, BlockHash, ScriptBuf};
 use electrs::config::{Config, SensitiveAuth};
 use electrs::metrics::Metrics;
 use electrs::new_index::{ChainQuery, FetchFrom, Indexer, Store};
+use error_chain::ChainedError;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
@@ -1115,4 +1116,68 @@ fn failing_cleanup_backs_off_until_the_daemon_tip_changes() {
     assert_eq!(indexer.update(&daemon).unwrap(), tip);
     assert!(!indexer.stale_cleanup_failing());
     assert!(store.history_db().get(b"R").is_none());
+}
+
+#[test]
+fn file_import_without_progress_falls_back_to_rpc() {
+    for failure in 0..4 {
+        let fixture = Fixture::new();
+        match failure {
+            1 => {
+                let mut data = fixture.config.network_type.magic().to_le_bytes().to_vec();
+                data.extend(4u32.to_le_bytes());
+                data.extend([0u8; 4]);
+                std::fs::write(fixture.config.blocks_dir.join("blk00000.dat"), data).unwrap();
+            }
+            2 => std::fs::create_dir(fixture.config.blocks_dir.join("blk00000.dat")).unwrap(),
+            3 => std::fs::write(fixture.config.blocks_dir.join("xor.dat"), [0u8]).unwrap(),
+            _ => {}
+        }
+        let (store, mut indexer, daemon, _) = fixture.open(FetchFrom::BlkFiles);
+        assert_eq!(
+            indexer.update(&daemon).unwrap(),
+            fixture.chain.lock().unwrap().active[3].block_hash()
+        );
+        assert_eq!(store.headers().len(), 4);
+        assert!(store.done_initial_sync());
+    }
+}
+
+#[test]
+fn failed_block_fetch_preserves_error_without_persisting_an_empty_tip() {
+    for from in [FetchFrom::BlkFiles, FetchFrom::Bitcoind] {
+        let fixture = Fixture::new();
+        let genesis = fixture.chain.lock().unwrap().active[0].block_hash();
+        fixture.chain.lock().unwrap().unavailable.insert(genesis);
+        let (store, mut indexer, daemon, _) = fixture.open(from);
+        let err = indexer.update(&daemon).unwrap_err();
+        let details = err.display_chain().to_string();
+        assert!(details.contains("no blocks were indexed"), "{}", details);
+        assert!(
+            details.contains("failed to fetch block batch"),
+            "{}",
+            details
+        );
+        assert!(details.contains("block unavailable"), "{}", details);
+        if let FetchFrom::BlkFiles = from {
+            assert!(
+                details.contains("failed to index 4 blocks from blk*.dat files"),
+                "{}",
+                details
+            );
+        }
+        assert!(!fixture.chain.lock().unwrap().fetched.is_empty());
+        assert!(!store.done_initial_sync());
+    }
+}
+
+#[test]
+fn partial_file_import_fetches_only_the_gap_over_rpc() {
+    let fixture = Fixture::new();
+    fixture.write_file(&[0, 1, 3]);
+    let (_, mut indexer, daemon, _) = fixture.open(FetchFrom::BlkFiles);
+    let tip = indexer.update(&daemon).unwrap();
+    let chain = fixture.chain.lock().unwrap();
+    assert_eq!(tip, chain.active[3].block_hash());
+    assert_eq!(chain.fetched, vec![chain.active[2].block_hash()]);
 }
