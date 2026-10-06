@@ -681,6 +681,7 @@ mod tests {
             history_scan_limit: 100_000,
             utxos_checkpoint_limit: 1_000,
             electrum_txs_limit: 100,
+            electrum_public_hosts: None,
             electrum_subscription_limit: 10_000,
             electrum_checkpoint_proof_concurrency_limit: 2,
             electrum_checkpoint_merkle_cache_mb: 256,

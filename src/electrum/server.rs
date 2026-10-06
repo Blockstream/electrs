@@ -35,8 +35,9 @@ use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullH
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 const MAX_HEADERS: usize = 2016;
+use crate::electrum::ServerFeatures;
 #[cfg(feature = "electrum-discovery")]
-use crate::electrum::{DiscoveryManager, ServerFeatures};
+use crate::electrum::DiscoveryManager;
 
 fn invalid_params(msg: impl Into<String>) -> Error {
     ErrorKind::InvalidParams(msg.into()).into()
@@ -153,6 +154,7 @@ struct Connection {
     write_timeout: Option<Duration>,
     response_budget: Arc<ResponseBudget>,
     checkpoint_proof_concurrency_limit: usize,
+    server_features: Arc<ServerFeatures>,
     #[cfg(feature = "electrum-discovery")]
     discovery: Option<Arc<DiscoveryManager>>,
     rpc_logging: RpcLogging,
@@ -180,6 +182,7 @@ impl Connection {
         write_timeout: Option<Duration>,
         response_budget: Arc<ResponseBudget>,
         checkpoint_proof_concurrency_limit: usize,
+        server_features: Arc<ServerFeatures>,
         #[cfg(feature = "electrum-discovery")] discovery: Option<Arc<DiscoveryManager>>,
         rpc_logging: RpcLogging,
         salt: String,
@@ -199,6 +202,7 @@ impl Connection {
             write_timeout,
             response_budget,
             checkpoint_proof_concurrency_limit,
+            server_features,
             #[cfg(feature = "electrum-discovery")]
             discovery,
             rpc_logging,
@@ -225,13 +229,8 @@ impl Connection {
         Ok(json!(self.query.config().electrum_banner.clone()))
     }
 
-    #[cfg(feature = "electrum-discovery")]
     fn server_features(&self) -> Result<Value> {
-        let discovery = self
-            .discovery
-            .as_ref()
-            .chain_err(|| "discovery is disabled")?;
-        Ok(json!(discovery.our_features()))
+        Ok(json!(self.server_features.as_ref()))
     }
 
     fn server_donation_address(&self) -> Result<Value> {
@@ -616,9 +615,8 @@ impl Connection {
             "server.peers.subscribe" => self.server_peers_subscribe(),
             "server.ping" => Ok(Value::Null),
             "server.version" => self.server_version(),
-
-            #[cfg(feature = "electrum-discovery")]
             "server.features" => self.server_features(),
+
             #[cfg(feature = "electrum-discovery")]
             "server.add_peer" => self.server_add_peer(&params),
 
@@ -1249,22 +1247,25 @@ impl RPC {
 
         let notification = Channel::unbounded();
 
-        // Discovery is enabled when electrum-public-hosts is set
-        #[cfg(feature = "electrum-discovery")]
-        let discovery = config.electrum_public_hosts.clone().map(|hosts| {
+        let server_features = {
             use crate::chain::genesis_hash;
-            let features = ServerFeatures {
-                hosts,
+            Arc::new(ServerFeatures {
+                hosts: config.electrum_public_hosts.clone().unwrap_or_default(),
                 server_version: format!("electrs-esplora {}", ELECTRS_VERSION),
                 genesis_hash: genesis_hash(config.network_type),
                 protocol_min: PROTOCOL_VERSION,
                 protocol_max: PROTOCOL_VERSION,
                 hash_function: "sha256".into(),
                 pruning: None,
-            };
+            })
+        };
+
+        // Discovery is enabled when electrum-public-hosts is set
+        #[cfg(feature = "electrum-discovery")]
+        let discovery = config.electrum_public_hosts.as_ref().map(|_hosts| {
             let discovery = Arc::new(DiscoveryManager::new(
                 config.network_type,
-                features,
+                server_features.as_ref().clone(),
                 PROTOCOL_VERSION,
                 config.electrum_announce,
                 config.tor_proxy,
@@ -1319,6 +1320,7 @@ impl RPC {
                     let rpc_logging = config.rpc_logging.clone();
                     #[cfg(feature = "electrum-discovery")]
                     let discovery = discovery.clone();
+                    let server_features = Arc::clone(&server_features);
 
                     let (sender, receiver) = mpsc::sync_channel(10);
                     senders.lock().unwrap().push(sender.clone());
@@ -1340,6 +1342,7 @@ impl RPC {
                             write_timeout,
                             response_budget,
                             checkpoint_proof_concurrency_limit,
+                            server_features,
                             #[cfg(feature = "electrum-discovery")]
                             discovery,
                             rpc_logging,

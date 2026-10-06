@@ -213,6 +213,28 @@ fn test_electrum_raw() {
 
 #[cfg_attr(not(feature = "liquid"), test)]
 #[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_server_features_without_public_hosts() {
+    // Electrum >= 4.7.0 calls server.features on connect, so it must answer
+    // even when peer discovery is off (no --electrum-public-hosts). See #229.
+    let (_electrum_server, electrum_addr, mut _tester) = common::init_electrum_tester().unwrap();
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    let s = write_and_read(
+        &mut stream,
+        "{\"jsonrpc\": \"2.0\", \"method\": \"server.features\", \"params\": [], \"id\": 1}",
+    );
+    let reply: electrumd::jsonrpc::serde_json::Value =
+        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    assert!(reply.get("error").is_none(), "server.features errored: {}", s);
+
+    let features = &reply["result"];
+    assert_eq!(features["server_version"], "electrs-esplora 0.4.1");
+    assert_eq!(features["hash_function"], "sha256");
+    assert!(features["genesis_hash"].is_string(), "missing genesis_hash: {}", s);
+}
+
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
 fn test_electrum_jsonrpc_errors() {
     let (_electrum_server, electrum_addr, mut _tester) = common::init_electrum_tester().unwrap();
 
