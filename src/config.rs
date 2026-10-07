@@ -10,6 +10,8 @@ use std::time::Duration;
 use stderrlog;
 
 use crate::chain::Network;
+#[cfg(feature = "liquid")]
+use crate::chain::Txid;
 use crate::daemon::CookieGetter;
 use crate::errors::*;
 
@@ -123,6 +125,8 @@ pub struct Config {
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
     pub asset_db_path: Option<PathBuf>,
+    #[cfg(feature = "liquid")]
+    pub initial_issuance_prevtx: Option<Txid>,
 
     #[cfg(feature = "electrum-discovery")]
     pub electrum_public_hosts: Option<crate::electrum::ServerHosts>,
@@ -435,6 +439,12 @@ impl Config {
                     .long("asset-db-path")
                     .help("Directory for liquid/elements asset db")
                     .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("initial_issuance_prevtx")
+                    .long("initial-issuance-prevtx")
+                    .help("Custom initial issuance prevtx TXID — the txid spent by the issuance tx's input (required for custom liquid testnets/signets)")
+                    .takes_value(true),
             );
 
         #[cfg(feature = "electrum-discovery")]
@@ -473,6 +483,12 @@ impl Config {
 
         #[cfg(feature = "liquid")]
         let asset_db_path = m.value_of("asset_db_path").map(PathBuf::from);
+
+        #[cfg(feature = "liquid")]
+        let initial_issuance_prevtx = m.value_of("initial_issuance_prevtx").map(|s| {
+            s.parse::<Txid>()
+                .expect("invalid initial-issuance-prevtx TXID")
+        });
 
         let default_daemon_port = match network_type {
             #[cfg(not(feature = "liquid"))]
@@ -788,6 +804,8 @@ impl Config {
             parent_network,
             #[cfg(feature = "liquid")]
             asset_db_path,
+            #[cfg(feature = "liquid")]
+            initial_issuance_prevtx,
 
             #[cfg(feature = "electrum-discovery")]
             electrum_public_hosts,
