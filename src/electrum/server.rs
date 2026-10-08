@@ -1249,10 +1249,19 @@ impl RPC {
 
         let server_features = {
             use crate::chain::genesis_hash;
+            // Prefer the genesis block hash actually indexed at height 0 over the
+            // hardcoded genesis_hash(): on Liquid testnet/regtest the latter is an
+            // all-zero placeholder, and Elements regtest genesis is configurable.
+            // `start` runs after the initial sync, so height 0 is already indexed;
+            // fall back to genesis_hash() only if it somehow isn't.
+            let genesis_hash = query
+                .chain()
+                .hash_by_height(0)
+                .unwrap_or_else(|| genesis_hash(config.network_type));
             Arc::new(ServerFeatures {
                 hosts: config.electrum_public_hosts.clone().unwrap_or_default(),
                 server_version: format!("electrs-esplora {}", ELECTRS_VERSION),
-                genesis_hash: genesis_hash(config.network_type),
+                genesis_hash,
                 protocol_min: PROTOCOL_VERSION,
                 protocol_max: PROTOCOL_VERSION,
                 hash_function: "sha256".into(),
