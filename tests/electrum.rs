@@ -213,6 +213,42 @@ fn test_electrum_raw() {
 
 #[cfg_attr(not(feature = "liquid"), test)]
 #[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_server_features_without_public_hosts() {
+    // Electrum >= 4.7.0 calls server.features on connect, so it must answer
+    // even when peer discovery is off (no --electrum-public-hosts). See #229.
+    let (_electrum_server, electrum_addr, tester) = common::init_electrum_tester().unwrap();
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    let s = write_and_read(
+        &mut stream,
+        "{\"jsonrpc\": \"2.0\", \"method\": \"server.features\", \"params\": [], \"id\": 1}",
+    );
+    let reply: electrumd::jsonrpc::serde_json::Value =
+        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    assert!(reply.get("error").is_none(), "server.features errored: {}", s);
+
+    let features = &reply["result"];
+    assert_eq!(features["server_version"], "electrs-esplora 0.4.1");
+    assert_eq!(features["hash_function"], "sha256");
+
+    // The genesis hash must be the actual genesis block hash indexed at height 0,
+    // not the hardcoded genesis_hash() (which is an all-zero placeholder on
+    // Liquid testnet/regtest). The Electrum protocol serializes hashes reversed.
+    use bitcoin::hashes::Hash;
+    use bitcoin::hex::DisplayHex;
+    let mut genesis_bytes = tester.get_block_hash(0).unwrap().to_raw_hash().to_byte_array();
+    genesis_bytes.reverse();
+    let expected = genesis_bytes.to_lower_hex_string();
+    assert_eq!(
+        features["genesis_hash"].as_str(),
+        Some(expected.as_str()),
+        "genesis_hash must be the indexed height-0 block hash: {}",
+        s
+    );
+}
+
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
 fn test_electrum_jsonrpc_errors() {
     let (_electrum_server, electrum_addr, mut _tester) = common::init_electrum_tester().unwrap();
 

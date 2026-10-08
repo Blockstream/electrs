@@ -124,7 +124,6 @@ pub struct Config {
     #[cfg(feature = "liquid")]
     pub asset_db_path: Option<PathBuf>,
 
-    #[cfg(feature = "electrum-discovery")]
     pub electrum_public_hosts: Option<crate::electrum::ServerHosts>,
     #[cfg(feature = "electrum-discovery")]
     pub electrum_announce: bool,
@@ -706,6 +705,8 @@ impl Config {
         let electrum_public_hosts = m
             .value_of("electrum_public_hosts")
             .map(|s| serde_json::from_str(s).expect("invalid --electrum-public-hosts"));
+        #[cfg(not(feature = "electrum-discovery"))]
+        let electrum_public_hosts: Option<crate::electrum::ServerHosts> = None;
 
         let mut log = stderrlog::new();
         // Base verbosity is 2 (Info), each -v flag adds one level:
@@ -789,7 +790,6 @@ impl Config {
             #[cfg(feature = "liquid")]
             asset_db_path,
 
-            #[cfg(feature = "electrum-discovery")]
             electrum_public_hosts,
             #[cfg(feature = "electrum-discovery")]
             electrum_announce: m.is_present("electrum_announce"),
