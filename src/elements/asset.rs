@@ -30,10 +30,6 @@ lazy_static! {
             .unwrap();
 }
 
-fn parse_asset_id(sl: &[u8]) -> AssetId {
-    AssetId::from_slice(sl).expect("failed to parse AssetId")
-}
-
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum LiquidAsset {
@@ -78,7 +74,30 @@ pub struct AssetRow {
     pub prev_txid: FullHash,
     pub prev_vout: u32,
     pub issuance: Bytes, // bincode does not like dealing with AssetIssuance, deserialization fails with "invalid type: sequence, expected a struct"
-    pub reissuance_token: FullHash,
+    reissuance_token: FullHash,
+}
+
+impl AssetRow {
+    fn issuance(&self) -> Result<AssetIssuance> {
+        deserialize(&self.issuance).chain_err(|| "failed parsing AssetIssuance")
+    }
+
+    fn prev_outpoint(&self) -> Result<OutPoint> {
+        Ok(OutPoint {
+            txid: deserialize(&self.prev_txid)
+                .chain_err(|| "failed parsing issuance prevout txid")?,
+            vout: self.prev_vout,
+        })
+    }
+
+    pub fn reissuance_token(&self) -> Result<AssetId> {
+        let txin = TxIn {
+            previous_output: self.prev_outpoint()?,
+            asset_issuance: self.issuance()?,
+            ..Default::default()
+        };
+        Ok(txin.issuance_ids().1)
+    }
 }
 
 impl IssuedAsset {
@@ -88,11 +107,8 @@ impl IssuedAsset {
         (chain_stats, mempool_stats): (IssuedAssetStats, IssuedAssetStats),
         meta: Option<AssetMeta>,
         status: TransactionStatus,
-    ) -> Self {
-        let issuance: AssetIssuance =
-            deserialize(&asset.issuance).expect("failed parsing AssetIssuance");
-
-        let reissuance_token = parse_asset_id(&asset.reissuance_token);
+    ) -> Result<Self> {
+        let issuance = asset.issuance()?;
 
         let contract_hash = if issuance.asset_entropy != [0u8; 32] {
             Some(ContractHash::from_byte_array(issuance.asset_entropy))
@@ -100,23 +116,21 @@ impl IssuedAsset {
             None
         };
 
-        Self {
+        Ok(Self {
             asset_id: *asset_id,
             issuance_txin: TxInput {
-                txid: deserialize(&asset.issuance_txid).unwrap(),
+                txid: deserialize(&asset.issuance_txid)
+                    .chain_err(|| "failed parsing issuance txid")?,
                 vin: asset.issuance_vin,
             },
-            issuance_prevout: OutPoint {
-                txid: deserialize(&asset.prev_txid).unwrap(),
-                vout: asset.prev_vout,
-            },
+            issuance_prevout: asset.prev_outpoint()?,
             contract_hash,
-            reissuance_token,
+            reissuance_token: asset.reissuance_token()?,
             status,
             chain_stats,
             mempool_stats,
             meta,
-        }
+        })
     }
 }
 
@@ -310,12 +324,7 @@ fn index_tx_assets(
             ));
 
             if !is_reissuance {
-                let is_confidential = match txi.asset_issuance.inflation_keys {
-                    Value::Confidential(..) => true,
-                    _ => false,
-                };
-                let reissuance_token =
-                    AssetId::reissuance_token_from_entropy(asset_entropy, is_confidential);
+                let (_, reissuance_token) = txi.issuance_ids();
 
                 issuances.push((
                     asset_id,
@@ -371,22 +380,26 @@ pub fn lookup_asset(
 
     let chain_row = history_db
         .get(&[b"i", &asset_id.into_inner()[..]].concat())
-        .map(|row| bincode::deserialize_little::<AssetRow>(&row).expect("failed parsing AssetRow"));
+        .map(|row| bincode::deserialize_little::<AssetRow>(&row))
+        .transpose()
+        .chain_err(|| "failed parsing AssetRow")?;
 
     let row = chain_row
         .as_ref()
         .or_else(|| mempool_issuances.get(asset_id));
 
     Ok(if let Some(row) = row {
-        let reissuance_token = parse_asset_id(&row.reissuance_token);
+        let reissuance_token = row.reissuance_token()?;
 
         let meta = meta
             .cloned()
             .or_else(|| registry.and_then(|r| r.read().unwrap().get(asset_id).cloned()));
         let stats = issued_asset_stats(query.chain(), &mempool, asset_id, &reissuance_token);
-        let status = query.get_tx_status(&deserialize(&row.issuance_txid).unwrap());
+        let issuance_txid =
+            deserialize(&row.issuance_txid).chain_err(|| "failed parsing issuance txid")?;
+        let status = query.get_tx_status(&issuance_txid);
 
-        let asset = IssuedAsset::new(asset_id, row, stats, meta, status);
+        let asset = IssuedAsset::new(asset_id, row, stats, meta, status)?;
 
         Some(LiquidAsset::Issued(asset))
     } else {
@@ -641,5 +654,113 @@ fn apply_pegged_asset_stats(
             // these history entries variants are never kept for native assets
             unreachable!();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hex::FromHex;
+    use elements::secp256k1_zkp::PedersenCommitment;
+
+    fn confidential() -> Value {
+        let generator_x = Vec::<u8>::from_hex(
+            "0879be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        Value::Confidential(PedersenCommitment::from_slice(&generator_x).unwrap())
+    }
+
+    fn issuance_tx(amount: Value, inflation_keys: Value) -> Transaction {
+        Transaction {
+            version: 2,
+            lock_time: elements::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: deserialize(&[1u8; 32]).unwrap(),
+                    vout: 3,
+                },
+                asset_issuance: AssetIssuance {
+                    asset_blinding_nonce: ZERO_TWEAK,
+                    asset_entropy: [7u8; 32],
+                    amount,
+                    inflation_keys,
+                },
+                ..Default::default()
+            }],
+            output: vec![],
+        }
+    }
+
+    fn index_issuance(tx: &Transaction) -> (AssetId, AssetRow) {
+        let (_, mut issuances) = index_tx_assets(tx, Network::LiquidRegtest, BNetwork::Regtest);
+        assert_eq!(issuances.len(), 1);
+        issuances.remove(0)
+    }
+
+    #[test]
+    fn reissuance_token_follows_issued_amount_confidentiality() {
+        let values = [Value::Null, Value::Explicit(5), confidential()];
+        for amount in values {
+            for inflation_keys in values {
+                if amount.is_null() && inflation_keys.is_null() {
+                    continue;
+                }
+                let tx = issuance_tx(amount, inflation_keys);
+                let (expected_asset, expected_token) = tx.input[0].issuance_ids();
+                let (asset_id, row) = index_issuance(&tx);
+
+                assert_eq!(asset_id, expected_asset);
+                assert_eq!(
+                    row.reissuance_token().unwrap(),
+                    expected_token,
+                    "{:?}",
+                    tx.input[0].asset_issuance
+                );
+                assert_eq!(
+                    row.reissuance_token,
+                    expected_token.into_inner().to_byte_array()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stored_reissuance_token_is_not_read() {
+        let tx = issuance_tx(confidential(), Value::Null);
+        let (asset_id, mut row) = index_issuance(&tx);
+        let expected_token = tx.input[0].issuance_ids().1;
+
+        row.reissuance_token = [0xff; 32];
+        let row: AssetRow =
+            bincode::deserialize_little(&bincode::serialize_little(&row).unwrap()).unwrap();
+        assert_eq!(row.reissuance_token().unwrap(), expected_token);
+
+        let asset = IssuedAsset::new(
+            &asset_id,
+            &row,
+            Default::default(),
+            None,
+            TransactionStatus::from(None),
+        )
+        .unwrap();
+        assert_eq!(asset.reissuance_token, expected_token);
+    }
+
+    #[test]
+    fn corrupt_issuance_is_an_error() {
+        let tx = issuance_tx(confidential(), Value::Null);
+        let (asset_id, mut row) = index_issuance(&tx);
+        row.issuance.truncate(1);
+
+        assert!(row.reissuance_token().is_err());
+        assert!(IssuedAsset::new(
+            &asset_id,
+            &row,
+            Default::default(),
+            None,
+            TransactionStatus::from(None),
+        )
+        .is_err());
     }
 }

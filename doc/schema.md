@@ -79,7 +79,7 @@ While cleanup is failing (the `stale_cleanup_failing` gauge is 1) after a reorg 
 
 Assets (re)issuances results in the following new rows (only for user-issued assets):
 
- * `"i{asset-id}" → "{issuing-txid:vin}{prev-txid:vout}{issuance}{reissuance_token}"`
+ * `"i{asset-id}" → "{issuing-txid:vin}{prev-txid:vout}{issuance}{reissuance_token}"` (`reissuance_token` is unused: it is derived from `prev-txid:vout` and `issuance` on read, since rows indexed by older versions may hold a token id derived from the wrong privacy bit. Being the last field, it can be dropped with the next `DB_VERSION` bump without a migration, since rows are read with trailing bytes allowed)
  * `"I{asset-id}{issuance-height}I{issuing-txid:vin}{is_reissuance}{amount}{tokens}" → ""`
 
 Peg-ins/peg-outs results in the following new rows (only for the native asset, typically L-BTC):
