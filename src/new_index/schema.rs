@@ -1,8 +1,13 @@
+mod reorg;
+
+pub use self::reorg::STALE_CLEANUP_FAILED;
+
 use bitcoin::hashes::{sha256, sha256d::Hash as Sha256dHash, Hash};
 use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 
+use error_chain::ChainedError;
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -54,6 +59,7 @@ pub struct Store {
     txstore_db: DB,
     history_db: DB,
     cache_db: DB,
+    pub(crate) history_cache_lock: RwLock<()>,
     added_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_headers: RwLock<HeaderList>,
@@ -87,16 +93,27 @@ impl Store {
         history_db.start_stats_exporter(Arc::clone(&db_metrics), "history_db");
         cache_db.start_stats_exporter(Arc::clone(&db_metrics), "cache_db");
 
-        let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
+        let headers = Self::load_headers(&txstore_db, &indexed_blockhashes);
+
+        Store {
+            txstore_db,
+            history_db,
+            cache_db,
+            history_cache_lock: RwLock::new(()),
+            added_blockhashes: RwLock::new(added_blockhashes),
+            indexed_blockhashes: RwLock::new(indexed_blockhashes),
+            indexed_headers: RwLock::new(headers),
+        }
+    }
+
+    fn load_headers(txstore_db: &DB, indexed_blockhashes: &HashSet<BlockHash>) -> HeaderList {
+        if let Some(tip_hash) = txstore_db.get(b"t") {
             let mut tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
             let headers_map = load_blockheaders(&txstore_db);
 
-            // Move the tip back until we reach a block that is indexed in the history db.
-            // It is possible for the tip recorded under the db "t" key to be un-indexed if electrs
-            // shuts down during reorg handling. Normally this wouldn't matter because the non-indexed
-            // block would be stale, but it could matter if the chain later re-orged back to
-            // include the previously stale block because more blocks were built on top of it.
-            // Without this, the stale-then-not-stale block(s) would not get re-indexed correctly.
+            // Databases written by older versions could save a tip whose history a
+            // crash during reorg cleanup had already removed. Current versions move
+            // the saved tip to the common ancestor before deleting anything.
             while !indexed_blockhashes.contains(&tip_hash) {
                 tip_hash = headers_map
                     .get(&tip_hash)
@@ -111,15 +128,6 @@ impl Store {
             HeaderList::new(headers_map, tip_hash)
         } else {
             HeaderList::empty()
-        };
-
-        Store {
-            txstore_db,
-            history_db,
-            cache_db,
-            added_blockhashes: RwLock::new(added_blockhashes),
-            indexed_blockhashes: RwLock::new(indexed_blockhashes),
-            indexed_headers: RwLock::new(headers),
         }
     }
 
@@ -182,13 +190,19 @@ impl Store {
 
     #[cfg(test)]
     fn open_test(path: &std::path::Path) -> Self {
+        let txstore_db = DB::open_test(&path.join("txstore"));
+        let history_db = DB::open_test(&path.join("history"));
+        let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
+        let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
+        let headers = Self::load_headers(&txstore_db, &indexed_blockhashes);
         Store {
-            txstore_db: DB::open_test(&path.join("txstore")),
-            history_db: DB::open_test(&path.join("history")),
+            txstore_db,
+            history_db,
             cache_db: DB::open_test(&path.join("cache")),
-            added_blockhashes: RwLock::new(HashSet::new()),
-            indexed_blockhashes: RwLock::new(HashSet::new()),
-            indexed_headers: RwLock::new(HeaderList::empty()),
+            history_cache_lock: RwLock::new(()),
+            added_blockhashes: RwLock::new(added_blockhashes),
+            indexed_blockhashes: RwLock::new(indexed_blockhashes),
+            indexed_headers: RwLock::new(headers),
         }
     }
 }
@@ -257,13 +271,46 @@ impl ScriptStats {
     }
 }
 
+const CLEANUP_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(5);
+const CLEANUP_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
+// Capped exponential backoff between failed stale-cleanup attempts.
+#[derive(Default)]
+struct CleanupRetry {
+    delay: Option<std::time::Duration>,
+    next_attempt: Option<std::time::Instant>,
+    failed_at_tip: Option<BlockHash>,
+}
+
+impl CleanupRetry {
+    fn due(&self, daemon_tip: &BlockHash) -> bool {
+        self.failed_at_tip.as_ref() != Some(daemon_tip)
+            || self
+                .next_attempt
+                .is_none_or(|at| std::time::Instant::now() >= at)
+    }
+
+    fn failed(&mut self, daemon_tip: BlockHash) -> std::time::Duration {
+        let delay = self
+            .delay
+            .map_or(CLEANUP_RETRY_INITIAL, |delay| (delay * 2).min(CLEANUP_RETRY_MAX));
+        self.delay = Some(delay);
+        self.next_attempt = Some(std::time::Instant::now() + delay);
+        self.failed_at_tip = Some(daemon_tip);
+        delay
+    }
+}
+
 pub struct Indexer {
     store: Arc<Store>,
     flush: DBFlush,
     from: FetchFrom,
+    uncommitted_blocks: HashSet<BlockHash>,
     iconfig: IndexerConfig,
     duration: HistogramVec,
     tip_metric: Gauge,
+    stale_cleanup_failing: Gauge,
+    cleanup_retry: CleanupRetry,
     sync_height: Gauge,
     sync_progress: prometheus::Gauge,
 }
@@ -307,6 +354,7 @@ pub struct ChainQuery {
 impl Indexer {
     pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
         Indexer {
+            uncommitted_blocks: store.uncommitted_blocks(),
             store,
             flush: DBFlush::Disable,
             from,
@@ -316,6 +364,11 @@ impl Indexer {
                 &["step"],
             ),
             tip_metric: metrics.gauge(MetricOpts::new("tip_height", "Current chain tip height")),
+            stale_cleanup_failing: metrics.gauge(MetricOpts::new(
+                "stale_cleanup_failing",
+                "1 while stale block history cleanup is failing and indexing cannot advance",
+            )),
+            cleanup_retry: CleanupRetry::default(),
             sync_height: metrics.gauge(MetricOpts::new(
                 "initial_sync_height",
                 "Height of the last block batch completed during initial sync",
@@ -329,6 +382,17 @@ impl Indexer {
 
     fn start_timer(&self, name: &str) -> HistogramTimer {
         self.duration.with_label_values(&[name]).start_timer()
+    }
+
+    /// Whether stale cleanup failed during the last update and needs retrying.
+    pub fn stale_cleanup_failing(&self) -> bool {
+        self.stale_cleanup_failing.get() != 0
+    }
+
+    /// Make the next update retry a failing cleanup without waiting out the backoff.
+    #[doc(hidden)]
+    pub fn retry_cleanup_now(&mut self) {
+        self.cleanup_retry.next_attempt = None;
     }
 
     fn start_auto_compactions(&self, db: &DB) {
@@ -378,128 +442,53 @@ impl Indexer {
         let (new_headers, reorged_since) = self.get_new_headers(&daemon, &tip)?;
         let chain_tip_height = new_headers.last().map(|h| h.height()).unwrap_or(0);
 
-        // Handle reorgs by undoing the reorged (stale) blocks first
-        if let Some(reorged_since) = reorged_since {
-            // Remove reorged headers from the in-memory HeaderList.
-            // This will also immediately invalidate all the history db entries originating from those blocks
-            // (even before the rows are deleted below), since they reference block heights that will no longer exist.
-            // This ensures consistency - it is not possible for blocks to be available (e.g. in GET /blocks/tip or /block/:hash)
-            // without the corresponding history entries for these blocks (e.g. in GET /address/:address/txs), or vice-versa.
-            let mut reorged_headers = self
-                .store
-                .indexed_headers
-                .write()
-                .unwrap()
-                .pop(reorged_since);
-            // The chain tip will temporarily drop to the common ancestor (at height reorged_since-1),
-            // until the new headers are `append()`ed (below).
-
-            info!(
-                "processing reorg of depth {} since height {}",
-                reorged_headers.len(),
-                reorged_since,
-            );
-
-            // Reorged blocks are undone in chunks of 100, processed in serial, each as an atomic batch.
-            // Reverse them so that chunks closest to the chain tip are processed first,
-            // which is necessary to properly recover from crashes during reorg handling.
-            // Also see the comment under `Store::open()`.
-            reorged_headers.reverse();
-
-            // Fetch the reorged blocks, then undo their history index db rows.
-            // The txstore db rows are kept for reorged blocks/transactions.
-            start_fetcher(self.from, &daemon, reorged_headers, self.iconfig.block_batch_size, chain_tip_height)?
-                .map(|blocks| {
-                    self.undo_index(&blocks);
-                    Ok(())
-                })?;
-        }
-
-        // Single-pass: add to txstore and index to history in the same per-batch loop.
-        //
-        // In the old two-pass approach, txstore_db was fully compacted between the add
-        // and index passes, which pushed all O rows into large SST files deep in the LSM
-        // tree. With only a small block cache, lookup_txos() during indexing then caused
-        // nearly every key to require a disk read.
-        //
-        // By interleaving add() and index() in the same batch, the O rows written by
-        // add() are still in the write buffer (or nearby L0 SST files) when index()
-        // calls lookup_txos() — dramatically increasing cache hit rate.
-        //
-        // Crash safety: added_blockhashes / indexed_blockhashes are persisted via the
-        // "D" done-marker rows. On restart, headers_to_process() re-derives which
-        // blocks still need work, so partially-processed batches are re-processed safely.
-        let to_process = self.store.headers_to_process(&new_headers);
-        debug!(
-            "processing {} blocks (add + index) using {:?}",
-            to_process.len(),
-            self.from
+        ensure!(
+            reorged_since != Some(0),
+            "daemon chain does not share a genesis block with the index (wrong network or database?)"
         );
-
-        let mut fetcher_count = 0;
-        let to_process_total = to_process.len();
-
-        let fetch_result = start_fetcher(
-            self.from,
-            &daemon,
-            to_process,
-            self.iconfig.block_batch_size,
-            chain_tip_height,
-        )?
-        .map(|blocks| {
-            if fetcher_count % 25 == 0 && to_process_total > 20 {
-                let batch_height = blocks.last().map(|b| b.entry.height()).unwrap_or(0);
-                info!(
-                    "processing blocks {}/{} ({:.1}%)",
-                    batch_height,
-                    chain_tip_height,
-                    batch_height as f32 / chain_tip_height.max(1) as f32 * 100.0
+        // A persistent failure would otherwise redo the fork walk, daemon calls and R write
+        // every main-loop cycle. A new daemon tip retries at once: that is when recovery is
+        // most likely.
+        if self.stale_cleanup_failing() && !self.cleanup_retry.due(&tip) {
+            return Ok(*self.store.headers().tip());
+        }
+        // Stale history must be removed before replacement blocks reuse its heights, so a
+        // failure stops this update. Retry next cycle rather than exiting: a restart
+        // cannot clear a block bitcoind no longer serves.
+        if let Err(err) = self.clean_up_stale_blocks(&daemon, &new_headers, reorged_since) {
+            if let ErrorKind::Interrupt(_) = err.kind() {
+                return Err(err);
+            }
+            let delay = self.cleanup_retry.failed(tip);
+            // Indexing stays at the common ancestor, so the mempool cannot sync against the
+            // daemon tip either: new unconfirmed transactions are not indexed until this clears.
+            if self.stale_cleanup_failing.get() == 0 {
+                error!(
+                    "{} (new unconfirmed transactions are not indexed until it succeeds), retrying in {:?}: {}",
+                    STALE_CLEANUP_FAILED,
+                    delay,
+                    err.display_chain()
+                );
+            } else {
+                warn!(
+                    "{}, retrying in {:?}: {}",
+                    STALE_CLEANUP_FAILED,
+                    delay,
+                    err.display_chain()
                 );
             }
-            fetcher_count += 1;
-
-            // Add blocks not yet in txstore (idempotent: crash recovery skips already-added blocks)
-            let to_add: Vec<_> = {
-                let added = self.store.added_blockhashes.read().unwrap();
-                blocks
-                    .iter()
-                    .filter(|b| !added.contains(b.entry.hash()))
-                    .cloned()
-                    .collect()
-            };
-
-            // Index blocks not yet in history (O rows for to_add are now in the write buffer)
-            let to_index: Vec<_> = {
-                let indexed = self.store.indexed_blockhashes.read().unwrap();
-                blocks
-                    .iter()
-                    .filter(|b| !indexed.contains(b.entry.hash()))
-                    .cloned()
-                    .collect()
-            };
-
-            if !to_add.is_empty() || !to_index.is_empty() {
-                let _batch_timer = self.start_timer("batch_total");
-                if !to_add.is_empty() {
-                    self.add(&to_add);
-                }
-                if !to_index.is_empty() {
-                    self.index(&to_index);
-                }
+            self.stale_cleanup_failing.set(1);
+            let headers = self.store.headers();
+            // Empty after a crash before the first tip commit; best_height() would panic.
+            if let Some(height) = headers.len().checked_sub(1) {
+                self.tip_metric.set(height as i64);
             }
-            if let Some(last) = blocks.last() {
-                let h = last.entry.height();
-                self.sync_height.set(h as i64);
-                if chain_tip_height > 0 {
-                    self.sync_progress.set(h as f64 / chain_tip_height as f64 * 100.0);
-                }
-            }
-            Ok(())
-        });
-
-        if let FetchFrom::BlkFiles = self.from {
-            self.from = FetchFrom::Bitcoind;
+            return Ok(*headers.tip());
         }
+        self.stale_cleanup_failing.set(0);
+        self.cleanup_retry = CleanupRetry::default();
+
+        let fetch_result = self.fetch_and_index(&daemon, &new_headers, chain_tip_height);
 
         if let Err(ref e) = fetch_result {
             warn!(
@@ -509,6 +498,7 @@ impl Indexer {
         }
 
         let completed_headers = self.store.completed_header_prefix(&new_headers);
+        self.remember_uncommitted_headers(&new_headers[completed_headers.len()..]);
         if fetch_result.is_ok() && completed_headers.len() != new_headers.len() {
             bail!(
                 "block fetch completed without indexing all headers: completed={} requested={}",
@@ -517,36 +507,10 @@ impl Indexer {
             );
         }
 
-        // Compact after all add+index work is done, not between passes.
-        self.start_auto_compactions(&self.store.txstore_db);
-        self.start_auto_compactions(&self.store.history_db);
-        self.start_auto_compactions(&self.store.cache_db);
+        self.finish_sync_writes();
 
-        if let DBFlush::Disable = self.flush {
-            let t = std::time::Instant::now();
-            info!("flushing txstore_db to disk");
-            self.store.txstore_db.flush();
-            info!("flushing txstore_db complete in {:.1?}", t.elapsed());
-
-            let t = std::time::Instant::now();
-            info!("flushing history_db to disk");
-            self.store.history_db.flush();
-            info!("flushing history_db complete in {:.1?}", t.elapsed());
-
-            // cache_db receives WAL-disabled writes when --address-search is enabled,
-            // so it needs the same explicit flush to ensure durability.
-            let t = std::time::Instant::now();
-            info!("flushing cache_db to disk");
-            self.store.cache_db.flush();
-            info!("flushing cache_db complete in {:.1?}", t.elapsed());
-
-            self.flush = DBFlush::Enable;
-        }
-
-        // Finally, append the completed headers to the in-memory HeaderList.
-        // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
-        // Done only once all the db writes above are flushed.
-        let synced_tip = self.store.advance_synced_tip(completed_headers)?;
+        // Publish headers only after their history writes are durable.
+        let synced_tip = self.commit_completed_headers(completed_headers)?;
 
         if fetch_result.is_ok() && synced_tip != tip {
             bail!(
@@ -560,6 +524,157 @@ impl Indexer {
             .set(self.store.headers().best_height() as i64);
 
         Ok(synced_tip)
+    }
+
+    fn clean_up_stale_blocks(
+        &mut self,
+        daemon: &Daemon,
+        new_headers: &[HeaderEntry],
+        reorged_since: Option<usize>,
+    ) -> Result<()> {
+        let tip_height = new_headers.last().map_or(0, |h| h.height());
+        // After a crash before the first tip commit, every indexed block is uncommitted,
+        // so this diff covers the whole chain once. It still has to run: the chain may
+        // have reorged while electrs was down.
+        let stale = self.stale_uncommitted(new_headers);
+        let rewrite_pending = reorg::pending_rewrite(&self.store)?.is_some();
+        if reorged_since.is_none() && stale.is_empty() && !rewrite_pending {
+            return Ok(());
+        }
+        let mut active_chain_view = reorg::ActiveChainView::new(
+            Arc::clone(&self.store),
+            new_headers,
+            reorged_since,
+            Some(daemon),
+        );
+        // Move the durable tip to the common ancestor first: both cleanups can delete
+        // C/S rows shared with blocks above it.
+        if let Some(height) = reorged_since {
+            self.undo_reorged_blocks(daemon, height, tip_height, &mut active_chain_view)?;
+        }
+        if !stale.is_empty() {
+            self.undo_uncommitted_blocks(daemon, stale, tip_height, &mut active_chain_view)?;
+        }
+        // Also completes a rewrite left pending by a crash in an earlier cleanup.
+        self.finish_rewrite(&active_chain_view)
+    }
+
+    fn commit_completed_headers(&mut self, completed: Vec<HeaderEntry>) -> Result<BlockHash> {
+        let tip = self.store.advance_synced_tip(completed)?;
+        let headers = self.store.headers();
+        self.uncommitted_blocks
+            .retain(|hash| headers.header_by_blockhash(hash).is_none());
+        Ok(tip)
+    }
+
+    // Address-search cache writes also disable the WAL during initial sync.
+    fn finish_sync_writes(&mut self) {
+        let databases = [
+            ("txstore_db", &self.store.txstore_db),
+            ("history_db", &self.store.history_db),
+            ("cache_db", &self.store.cache_db),
+        ];
+        for (_, db) in databases {
+            self.start_auto_compactions(db);
+        }
+        if let DBFlush::Disable = self.flush {
+            for (name, db) in databases {
+                let started = std::time::Instant::now();
+                info!("flushing {} to disk", name);
+                db.flush();
+                info!("flushing {} complete in {:.1?}", name, started.elapsed());
+            }
+            self.flush = DBFlush::Enable;
+        }
+    }
+
+    fn fetch_and_index(
+        &mut self,
+        daemon: &Daemon,
+        headers: &[HeaderEntry],
+        tip_height: usize,
+    ) -> Result<()> {
+        let result = self.fetch_index_batches(self.from, daemon, headers, tip_height);
+        if let FetchFrom::BlkFiles = self.from {
+            self.from = FetchFrom::Bitcoind;
+        }
+        result
+    }
+
+    fn fetch_index_batches(
+        &self,
+        from: FetchFrom,
+        daemon: &Daemon,
+        headers: &[HeaderEntry],
+        tip_height: usize,
+    ) -> Result<()> {
+        let to_process = self.store.headers_to_process(headers);
+        debug!(
+            "processing {} blocks (add + index) using {:?}",
+            to_process.len(),
+            from
+        );
+        let total = to_process.len();
+        let mut count = 0;
+        start_fetcher(
+            from,
+            daemon,
+            to_process,
+            self.iconfig.block_batch_size,
+            tip_height,
+        )?
+        .map(|blocks| {
+            if count % 25 == 0 && total > 20 {
+                let height = blocks.last().map_or(0, |b| b.entry.height());
+                info!(
+                    "processing blocks {}/{} ({:.1}%)",
+                    height,
+                    tip_height,
+                    height as f32 / tip_height.max(1) as f32 * 100.0
+                );
+            }
+            count += 1;
+            self.process_block_batch(&blocks, tip_height);
+            Ok(())
+        })
+    }
+
+    // Keep add and index adjacent: the output rows are still in RocksDB's write buffer
+    // when history indexing looks up prevouts. Done-markers make retries idempotent.
+    fn process_block_batch(&self, blocks: &[BlockEntry], tip_height: usize) {
+        let to_add: Vec<_> = {
+            let added = self.store.added_blockhashes.read().unwrap();
+            blocks
+                .iter()
+                .filter(|b| !added.contains(b.entry.hash()))
+                .cloned()
+                .collect()
+        };
+        let to_index: Vec<_> = {
+            let indexed = self.store.indexed_blockhashes.read().unwrap();
+            blocks
+                .iter()
+                .filter(|b| !indexed.contains(b.entry.hash()))
+                .cloned()
+                .collect()
+        };
+        if !to_add.is_empty() || !to_index.is_empty() {
+            let _timer = self.start_timer("batch_total");
+            if !to_add.is_empty() {
+                self.add(&to_add);
+            }
+            if !to_index.is_empty() {
+                self.index(&to_index);
+            }
+        }
+        if let Some(last) = blocks.last() {
+            let height = last.entry.height();
+            self.sync_height.set(height as i64);
+            if tip_height > 0 {
+                self.sync_progress
+                    .set(height as f64 / tip_height as f64 * 100.0);
+            }
+        }
     }
 
     fn add(&self, blocks: &[BlockEntry]) {
@@ -581,34 +696,19 @@ impl Indexer {
     }
 
     fn index(&self, blocks: &[BlockEntry]) {
-        self.store
-            .history_db
-            .write_rows(self._index(blocks), self.flush);
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut rows = self._index(blocks);
+        rows.par_sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        for row in rows {
+            batch.put(row.key, row.value);
+        }
+        for block in blocks {
+            batch.delete(reorg::undo_marker_key(block.entry.hash()));
+        }
+        self.store.history_db.write_batch(batch, self.flush);
 
         let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
         indexed_blockhashes.extend(blocks.iter().map(|b| b.entry.hash()));
-    }
-
-    // Undo the history db entries previously written for the given blocks (that were reorged).
-    // This includes the TxHistory, TxEdge, TxConf and BlockDone rows ('H', 'S', 'C' and 'D'),
-    // as well as the Elements history rows ('I' and 'i').
-    //
-    // This does *not* remove any txstore db entries, which are intentionally kept
-    // even for reorged blocks.
-    fn undo_index(&self, blocks: &[BlockEntry]) {
-        self.store
-            .history_db
-            .delete_rows(self._index(blocks), self.flush);
-        // Note this doesn't actually "undo" the rows - the keys are simply deleted, and won't get
-        // reverted back to their prior value (if there was one). It is expected that the history db
-        // keys created by blocks are always unique and impossible to already exist from a prior block.
-        // This is true for all history keys (which always include the height or txid), but for example
-        // not true for the address prefix search index (in the txstore).
-
-        let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
-        for block in blocks {
-            indexed_blockhashes.remove(block.entry.hash());
-        }
     }
 
     fn _index(&self, blocks: &[BlockEntry]) -> Vec<DBRow> {
@@ -933,6 +1033,7 @@ impl ChainQuery {
 
     // TODO: avoid duplication with stats/stats_delta?
     pub fn utxo(&self, scripthash: &[u8], limit: usize) -> Result<Vec<Utxo>> {
+        let _cache_guard = self.store.history_cache_lock.read().unwrap();
         let _timer = self.start_timer("utxo");
 
         // get the last known utxo set and the blockhash it was updated for.
@@ -1067,6 +1168,7 @@ impl ChainQuery {
     }
 
     pub fn stats(&self, scripthash: &[u8]) -> Result<ScriptStats> {
+        let _cache_guard = self.store.history_cache_lock.read().unwrap();
         let _timer = self.start_timer("stats");
 
         // get the last known stats and the blockhash they are updated for.
@@ -1610,7 +1712,10 @@ fn index_blocks(
                 let txid_hash = full_hash(&txid[..]);
                 index_transaction(tx, txid_hash, height, previous_txos_map, &mut rows, iconfig);
             }
-            rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
+            // The height lets cleanup rebuild a stale block's history keys without the daemon.
+            let mut done = BlockRow::new_done(full_hash(&b.entry.hash()[..]));
+            done.value = height.to_le_bytes().to_vec();
+            rows.push(done.into_row());
             rows
         })
         .flatten()
@@ -2351,7 +2456,7 @@ mod tests {
     }
 
     #[cfg(not(feature = "liquid"))]
-    fn test_header(prev_blockhash: BlockHash) -> BlockHeader {
+    pub(super) fn test_header(prev_blockhash: BlockHash) -> BlockHeader {
         BlockHeader {
             version: bitcoin::block::Version::ONE,
             prev_blockhash,
@@ -2363,7 +2468,7 @@ mod tests {
     }
 
     #[cfg(feature = "liquid")]
-    fn test_header(prev_blockhash: BlockHash) -> BlockHeader {
+    pub(super) fn test_header(prev_blockhash: BlockHash) -> BlockHeader {
         BlockHeader {
             version: 1,
             prev_blockhash,

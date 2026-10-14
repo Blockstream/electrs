@@ -203,9 +203,9 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
             break;
         }
 
-        // Index new blocks
+        // Cleanup can fail even when the saved and daemon tips match, so retry explicitly.
         let current_tip = daemon.getbestblockhash()?;
-        if current_tip != tip {
+        if current_tip != tip || indexer.stale_cleanup_failing() {
             tip = indexer.update(&daemon)?;
         };
 
