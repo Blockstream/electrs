@@ -1,13 +1,12 @@
 use std::str::FromStr;
 use std::sync::{Arc, Once, RwLock};
-use std::{env, net};
+use std::{env, net, thread};
 
 use log::LevelFilter;
 use stderrlog::StdErrLog;
 use tempfile::TempDir;
 
 use serde_json::json;
-#[cfg(feature = "liquid")]
 use serde_json::Value;
 
 #[cfg(not(feature = "liquid"))]
@@ -49,7 +48,7 @@ impl TestRunner {
     }
 
     pub fn new_with(configure: impl FnOnce(&mut Config)) -> Result<TestRunner> {
-        let log = init_log();
+        init_log();
 
         // Setup the bitcoind/elementsd config
         let mut node_conf = noded::Conf::default();
@@ -82,77 +81,17 @@ impl TestRunner {
         #[cfg(feature = "liquid")]
         node_client.call::<Value>("rescanblockchain", &[])?;
 
-        #[cfg(not(feature = "liquid"))]
-        let network_type = Network::Regtest;
-        #[cfg(feature = "liquid")]
-        let network_type = Network::LiquidRegtest;
-
         let mut daemon_subdir = params.cookie_file.clone();
         // drop `.cookie` filename, leaving just the network subdirectory
         daemon_subdir.pop();
 
         let electrsdb = tempfile::tempdir().unwrap();
 
-        let mut config = Config {
-            log,
-            network_type,
-            db_path: electrsdb.path().to_path_buf(),
-            daemon_dir: daemon_subdir.clone(),
-            daemon_parallelism: 3,
-            daemon_conn_max_age: None,
-            blocks_dir: daemon_subdir.join("blocks"),
-            daemon_rpc_addr: params.rpc_socket.into(),
-            daemon_rpc_fallback_addr: None,
-            cookie: None,
-            electrum_rpc_addr: rand_available_addr(),
-            electrum_rpc_conn_max_age: None,
-            electrum_rpc_write_timeout: Some(std::time::Duration::from_secs(30)),
-            electrum_rpc_max_request_num_bytes: 1_048_576,
-            #[cfg(not(feature = "liquid"))]
-            electrum_rpc_max_response_num_bytes: 8_388_608,
-            #[cfg(feature = "liquid")]
-            electrum_rpc_max_response_num_bytes: 33_554_432,
-            #[cfg(not(feature = "liquid"))]
-            electrum_rpc_global_response_budget_bytes: 67_108_864,
-            #[cfg(feature = "liquid")]
-            electrum_rpc_global_response_budget_bytes: 268_435_456,
-            http_addr: rand_available_addr(),
-            http_socket_file: None, // XXX test with socket file or tcp?
-            monitoring_addr: rand_available_addr(),
-            jsonrpc_import: false,
-            light_mode: false,
-            address_search: true,
-            index_unspendables: false,
-            enable_mining_rest: true,
-            cors: None,
-            precache_scripts: None,
-            utxos_limit: 100,
-            history_scan_limit: 100_000,
-            utxos_checkpoint_limit: 1_000,
-            electrum_txs_limit: 100,
-            electrum_subscription_limit: 10_000,
-            electrum_checkpoint_proof_concurrency_limit: 2,
-            electrum_checkpoint_merkle_cache_mb: 256,
-            electrum_banner: "".into(),
-            rpc_logging: RpcLogging::default(),
-            zmq_addr: None,
-
-            #[cfg(feature = "liquid")]
-            asset_db_path: None, // XXX
-            #[cfg(feature = "liquid")]
-            parent_network: bitcoin::Network::Regtest,
-            db_block_cache_mb: 8,
-            db_parallelism: 2,
-            db_write_buffer_size_mb: 256,
-            initial_sync_batch_size: 250,
-            db_cache_index_filter_blocks: false,
-            //#[cfg(feature = "electrum-discovery")]
-            //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
-            //#[cfg(feature = "electrum-discovery")]
-            //electrum_announce: bool,
-            //#[cfg(feature = "electrum-discovery")]
-            //tor_proxy: Option<std::net::SocketAddr>,
-        };
+        let mut config = test_config(
+            electrsdb.path().to_path_buf(),
+            daemon_subdir,
+            params.rpc_socket.into(),
+        );
         configure(&mut config);
         let config = Arc::new(config);
 
@@ -648,5 +587,255 @@ impl From<ureq::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::from(ErrorKind::Json(e))
+    }
+}
+
+pub fn test_config(
+    db_path: std::path::PathBuf,
+    daemon_dir: std::path::PathBuf,
+    daemon_rpc_addr: net::SocketAddr,
+) -> Config {
+    Config {
+        log: init_log(),
+        network_type: {
+            #[cfg(not(feature = "liquid"))]
+            {
+                Network::Regtest
+            }
+            #[cfg(feature = "liquid")]
+            {
+                Network::LiquidRegtest
+            }
+        },
+        db_path,
+        daemon_dir: daemon_dir.clone(),
+        daemon_parallelism: 3,
+        daemon_conn_max_age: None,
+        blocks_dir: daemon_dir.join("blocks"),
+        daemon_rpc_addr,
+        daemon_rpc_fallback_addr: None,
+        cookie: None,
+        electrum_rpc_addr: rand_available_addr(),
+        electrum_rpc_conn_max_age: None,
+        electrum_rpc_write_timeout: Some(std::time::Duration::from_secs(30)),
+        electrum_rpc_max_request_num_bytes: 1_048_576,
+        #[cfg(not(feature = "liquid"))]
+        electrum_rpc_max_response_num_bytes: 8_388_608,
+        #[cfg(feature = "liquid")]
+        electrum_rpc_max_response_num_bytes: 33_554_432,
+        #[cfg(not(feature = "liquid"))]
+        electrum_rpc_global_response_budget_bytes: 67_108_864,
+        #[cfg(feature = "liquid")]
+        electrum_rpc_global_response_budget_bytes: 268_435_456,
+        http_addr: rand_available_addr(),
+        http_socket_file: None,
+        monitoring_addr: rand_available_addr(),
+        jsonrpc_import: false,
+        light_mode: false,
+        address_search: true,
+        index_unspendables: false,
+        enable_mining_rest: true,
+        cors: None,
+        precache_scripts: None,
+        utxos_limit: 100,
+        history_scan_limit: 100_000,
+        utxos_checkpoint_limit: 1_000,
+        electrum_txs_limit: 100,
+        electrum_subscription_limit: 10_000,
+        electrum_checkpoint_proof_concurrency_limit: 2,
+        electrum_checkpoint_merkle_cache_mb: 256,
+        electrum_banner: "".into(),
+        rpc_logging: RpcLogging::default(),
+        zmq_addr: None,
+
+        #[cfg(feature = "liquid")]
+        asset_db_path: None,
+        #[cfg(feature = "liquid")]
+        parent_network: bitcoin::Network::Regtest,
+        db_block_cache_mb: 8,
+        db_parallelism: 2,
+        db_write_buffer_size_mb: 256,
+        initial_sync_batch_size: 250,
+        db_cache_index_filter_blocks: false,
+    }
+}
+
+/// A controlled JSON-RPC server that accepts the daemon client's LF-only HTTP headers.
+///
+/// Failures stay bounded: a panicking `reply` becomes a JSON-RPC error (so the client
+/// fails instead of reconnecting forever) and is recorded for `assert_no_panics`, and
+/// teardown never panics, so an already-failing test reports its own assertion.
+pub struct MockRpc {
+    addr: net::SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    panics: Arc<std::sync::Mutex<Vec<String>>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+type Reply = dyn Fn(&str, &Value) -> std::result::Result<Value, Value> + Send + Sync;
+
+impl MockRpc {
+    pub fn new(
+        reply: impl Fn(&str, &Value) -> std::result::Result<Value, Value> + Send + Sync + 'static,
+    ) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let panics = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stopped = Arc::clone(&stop);
+        let recorded = Arc::clone(&panics);
+        let reply: Arc<Reply> = Arc::new(reply);
+        let worker = thread::spawn(move || {
+            let mut clients = Vec::new();
+            let mut sockets = Vec::new();
+            for socket in listener.incoming() {
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                let socket = match socket {
+                    Ok(socket) => socket,
+                    Err(_) => continue,
+                };
+                if let Ok(clone) = socket.try_clone() {
+                    sockets.push(clone);
+                }
+                let reply = Arc::clone(&reply);
+                let recorded = Arc::clone(&recorded);
+                clients.push(thread::spawn(move || {
+                    serve_rpc_connection(socket, &*reply, &recorded)
+                }));
+            }
+            for socket in sockets {
+                let _ = socket.shutdown(net::Shutdown::Both);
+            }
+            for client in clients {
+                let _ = client.join();
+            }
+        });
+        Self {
+            addr,
+            stop,
+            panics,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn addr(&self) -> net::SocketAddr {
+        self.addr
+    }
+
+    /// Fail the calling test if any `reply` invocation panicked.
+    pub fn assert_no_panics(&self) {
+        let panics = self.panics.lock().unwrap();
+        assert!(
+            panics.is_empty(),
+            "mock RPC handler panicked: {:?}",
+            *panics
+        );
+    }
+}
+
+fn serve_rpc_connection(
+    socket: net::TcpStream,
+    reply: &Reply,
+    panics: &std::sync::Mutex<Vec<String>>,
+) {
+    use std::io::Write;
+    if socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .is_err()
+    {
+        return;
+    }
+    let mut reader = std::io::BufReader::new(socket);
+    while let Some(body) = read_rpc_request(&mut reader) {
+        let method = body["method"].as_str().unwrap_or_default().to_owned();
+        let result = match method.as_str() {
+            "getnetworkinfo" => {
+                Ok(json!({"version": 290000, "subversion": "test", "relayfee": 0.00001}))
+            }
+            method => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reply(method, &body["params"])
+            }))
+            .unwrap_or_else(|panic| {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "non-string panic".to_owned());
+                let message = format!("{}: {}", method, message);
+                panics.lock().unwrap().push(message.clone());
+                Err(json!({"code": -32603, "message": message}))
+            }),
+        };
+        let (result, error) = match result {
+            Ok(result) => (result, Value::Null),
+            Err(error) => (Value::Null, error),
+        };
+        let response = json!({"id": body["id"], "result": result, "error": error}).to_string();
+        if write!(
+            reader.get_mut(),
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .is_err()
+        {
+            // A deadline may close the client connection before the reply.
+            return;
+        }
+    }
+}
+
+// None on EOF, timeout, or a malformed request; the caller then closes the connection.
+fn read_rpc_request(reader: &mut impl std::io::BufRead) -> Option<Value> {
+    let mut line = String::new();
+    if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+        return None;
+    }
+    let mut length = 0;
+    loop {
+        line.clear();
+        if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+            return None;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            length = value.trim().parse().ok()?;
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
+pub fn test_daemon(config: &Config, metrics: &Metrics) -> Arc<Daemon> {
+    Arc::new(
+        Daemon::new(
+            &config.daemon_dir,
+            &config.blocks_dir,
+            config.daemon_rpc_addr,
+            None,
+            config.daemon_parallelism,
+            config.cookie_getter(),
+            config.network_type,
+            Waiter::start(crossbeam_channel::never()),
+            metrics,
+            None,
+        )
+        .unwrap(),
+    )
+}
+
+impl Drop for MockRpc {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = net::TcpStream::connect(self.addr);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }

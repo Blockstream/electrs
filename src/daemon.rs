@@ -1283,6 +1283,19 @@ impl Daemon {
     }
 
     #[trace]
+    pub(crate) fn getblockheight(&self, blockhash: &BlockHash) -> Result<usize> {
+        let info = self.request("getblockheader", json!([blockhash, /*verbose=*/ true]))?;
+        let height = info.get("height").and_then(|v| v.as_u64()).chain_err(|| {
+            format!(
+                "bitcoind returned malformed getblockheader info='{:?}'",
+                info
+            )
+        })?;
+        usize::try_from(height)
+            .chain_err(|| format!("bitcoind returned out-of-range height='{}'", height))
+    }
+
+    #[trace]
     pub fn getblockheaders(&self, heights: &[usize]) -> Result<Vec<BlockHeader>> {
         let heights: Vec<Value> = heights.iter().map(|height| json!([height])).collect();
         let params_list: Vec<Value> = self
@@ -1531,14 +1544,7 @@ impl Daemon {
     fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
         const CHUNK_SIZE: usize = 100_000;
 
-        let info: Value = self.request("getblockheader", json!([tip]))?;
-        let tip_height = info
-            .get("height")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| format!("bitcoind returned malformed getblockheader info='{:?}'", info))?;
-        let tip_height = usize::try_from(tip_height).map_err(|_| {
-            format!("bitcoind returned out-of-range tip_height='{tip_height}'")
-        })?;
+        let tip_height = self.getblockheight(tip)?;
 
         // Chunked so the height allocation stays bounded whatever height bitcoind reports.
         let mut result = vec![];

@@ -40,6 +40,10 @@ When the indexer is synced up to the tip of the chain, the hash of the tip is sa
 
  * `"t" →  "{blockhash}"`
 
+Before undoing blocks removed from the saved chain, `t` is moved back to the common ancestor. Repairing stale blocks left by older versions can also affect rows shared with already-indexed active blocks; `R` tracks their restoration.
+
+Rows for reorged blocks are kept, so their transactions remain available and cleanup can rebuild those blocks without bitcoind.
+
 ### `history`
 
 Each transaction results in the following new row:
@@ -58,7 +62,18 @@ Each spending input (except the coinbase) results in the following new rows (`S`
 
 Each block results in the following new row:
 
- * `"D{blockhash}" → ""` (signifies the block was indexed)
+ * `"D{blockhash}" → "{height}"` (signifies the block was indexed; `height` is a 4-byte little-endian u32. Older versions wrote an empty value.)
+
+The height lets indexed blocks above a fetch gap, which are not in the saved header chain, be located and undone if the chain switches branch.
+
+While stale-block cleanup is in progress, the following rows may be present:
+
+ * `"u{blockhash}" → "{height}"` (4-byte little-endian u32: the block has partially undone history, with spending rows still to remove. Replaces `D` atomically with the first deletion batch, so a block that becomes active again is reindexed. Removed atomically when undo or reindexing completes.)
+ * `"R" → "{height}"` (4-byte little-endian u32: the confirmation, spending-edge and issuance rows of indexed active blocks from the affected fork boundary up still need rewriting. Written before cleanup deletes anything and removed after all rewrite batches are durable.)
+
+Older versions ignore `u` and/or `R` and cannot finish this recovery protocol. Downgrading during cleanup can leave missing or stale history until a version supporting both markers completes recovery. Before rolling back, confirm `history_db` has no `R` key and no key starting with `u`, and that the `stale_cleanup_failing` gauge is 0; once cleanup completes, both keys are gone and rolling back is safe.
+
+While cleanup is failing (the `stale_cleanup_failing` gauge is 1) after a reorg or above a gap, indexing stays at the common ancestor, so the mempool is not synced either and new unconfirmed transactions are not indexed until cleanup succeeds. A failure that leaves the saved tip at the daemon tip (for example a pending `R` rewrite on a quiet chain) does not stall the mempool.
 
 #### Elements only
 
@@ -85,6 +100,7 @@ The cache is created on-demand, the first time the scripthash is requested by a 
 The cached data is kept next to the `blockhash` the cache is up-to-date for.
 When requesting data, the cache is updated with the new history rows added since the `blockhash`.
 If the `blockhash` was since orphaned, the cache is removed and re-computed.
+Stale-history cleanup also invalidates affected script and asset caches, since older versions may have cached stale rows under an active block hash. Invalidation is durable before history deletion and excludes concurrent cache updates.
 
  * `"A{scripthash}" → "{stats}{blockhash}"` (where `stats` is composed of `tx_count`, `funded_txo_{count,sum}` and `spent_txo_{count,sum}`)
 

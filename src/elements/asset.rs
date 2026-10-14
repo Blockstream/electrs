@@ -486,6 +486,7 @@ fn chain_asset_stats<T>(chain: &ChainQuery, asset_id: &AssetId, apply_fn: AssetS
 where
     T: Default + serde::Serialize + serde::de::DeserializeOwned,
 {
+    let _cache_guard = chain.store().history_cache_lock.read().unwrap();
     // get the last known stats and the blockhash they are updated for.
     // invalidates the cache if the block was orphaned.
     let cache: Option<(T, usize)> = chain
