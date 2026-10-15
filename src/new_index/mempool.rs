@@ -51,9 +51,9 @@ pub struct Mempool {
     backlog_stats: (BacklogStats, Instant),
 
     // monitoring
-    latency: HistogramVec, // mempool requests latency
-    delta: HistogramVec,   // # of added/removed txs
-    count: GaugeVec,       // current state of the mempool
+    latency: HistogramVec,         // mempool requests latency
+    delta: HistogramVec,           // # of added/removed txs
+    count: GaugeVec,               // current state of the mempool
     sync_failed_to_index: Counter, // # of times a mempool sync failed to index fetched txs
 
     // elements only
@@ -646,9 +646,7 @@ impl Mempool {
                     Entry::Vacant(_) => {
                         warn!(
                             "mempool edge for outpoint {}:{} already gone (evicting {})",
-                            txin.previous_output.txid,
-                            txin.previous_output.vout,
-                            txid
+                            txin.previous_output.txid, txin.previous_output.vout, txid
                         );
                     }
                 }

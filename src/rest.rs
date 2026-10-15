@@ -530,10 +530,9 @@ impl MempoolTxs {
             |mut outpoints| {
                 outpoints.retain(|outpoint| !prevouts.contains_key(outpoint));
                 prevouts.extend(
-                    query
-                        .chain()
-                        .lookup_txos(outpoints)
-                        .map_err(|err| HttpError::mempool_prevout(err, query, &confirmed_prevouts))?,
+                    query.chain().lookup_txos(outpoints).map_err(|err| {
+                        HttpError::mempool_prevout(err, query, &confirmed_prevouts)
+                    })?,
                 );
                 Ok(prevouts)
             },
@@ -569,12 +568,24 @@ fn prepare_tx(
     query: &Query,
     config: &Config,
 ) -> Result<(TransactionValue, u32), HttpError> {
-    if let Some(tx) = query.chain().lookup_txn(hash, None).map_err(HttpError::lookup)? {
-        let blockid = query.chain().try_tx_confirming_block(hash).map_err(HttpError::lookup)?;
+    if let Some(tx) = query
+        .chain()
+        .lookup_txn(hash, None)
+        .map_err(HttpError::lookup)?
+    {
+        let blockid = query
+            .chain()
+            .try_tx_confirming_block(hash)
+            .map_err(HttpError::lookup)?;
         let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
         let tx = prepare_txs(
             vec![(tx, blockid)],
-            |outpoints| query.chain().lookup_txos(outpoints).map_err(HttpError::lookup),
+            |outpoints| {
+                query
+                    .chain()
+                    .lookup_txos(outpoints)
+                    .map_err(HttpError::lookup)
+            },
             config,
         )?
         .remove(0);
@@ -602,7 +613,10 @@ fn prepare_captured_tx(
         snapshot.txs.push((tx, None));
     }
     // Look up status after transaction selection, including the mempool path.
-    let blockid = query.chain().try_tx_confirming_block(hash).map_err(HttpError::lookup)?;
+    let blockid = query
+        .chain()
+        .try_tx_confirming_block(hash)
+        .map_err(HttpError::lookup)?;
     snapshot.txs[0].1 = blockid;
     let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
     Ok((snapshot.prepare(query, config)?.remove(0), ttl))
@@ -979,7 +993,9 @@ fn handle_blocking_request(
 
             // Add lightweight validation that block exists before fetching transactions,
             // to avoid expensive lookups in case of invalid block hash
-            query.chain().get_block_header(&hash)
+            query
+                .chain()
+                .get_block_header(&hash)
                 .ok_or_else(|| HttpError::not_found("Block not found".to_string()))?;
 
             let start_index = start_index
@@ -1009,7 +1025,12 @@ fn handle_blocking_request(
             json_response(
                 prepare_txs(
                     txs,
-                    |outpoints| query.chain().lookup_txos(outpoints).map_err(HttpError::lookup),
+                    |outpoints| {
+                        query
+                            .chain()
+                            .lookup_txos(outpoints)
+                            .map_err(HttpError::lookup)
+                    },
                     config,
                 )?,
                 ttl,
@@ -1092,7 +1113,12 @@ fn handle_blocking_request(
             json_response(
                 prepare_txs(
                     txs,
-                    |outpoints| query.chain().lookup_txos(outpoints).map_err(HttpError::lookup),
+                    |outpoints| {
+                        query
+                            .chain()
+                            .lookup_txos(outpoints)
+                            .map_err(HttpError::lookup)
+                    },
                     config,
                 )?,
                 TTL_SHORT,
@@ -1419,7 +1445,12 @@ fn handle_blocking_request(
             json_response(
                 prepare_txs(
                     txs,
-                    |outpoints| query.chain().lookup_txos(outpoints).map_err(HttpError::lookup),
+                    |outpoints| {
+                        query
+                            .chain()
+                            .lookup_txos(outpoints)
+                            .map_err(HttpError::lookup)
+                    },
                     config,
                 )?,
                 TTL_SHORT,
@@ -1677,8 +1708,8 @@ impl HttpError {
             let used_by_confirmed_tx = confirmed_prevouts
                 .iter()
                 .any(|outpoint| outpoint.to_string() == *missing);
-            let confirmed_parent = missing_txo_txid(missing)
-                .map(|txid| query.chain().try_tx_confirming_block(&txid));
+            let confirmed_parent =
+                missing_txo_txid(missing).map(|txid| query.chain().try_tx_confirming_block(&txid));
             let confirmed_parent = match confirmed_parent {
                 Some(Ok(blockid)) => blockid.is_some(),
                 Some(Err(err)) => return HttpError::lookup(err),

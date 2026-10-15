@@ -385,7 +385,13 @@ fn test_utxo_checkpoint_limit_bounds_the_saved_set() -> Result<()> {
         electrs::new_index::precache::compute_script_hash(addr1.script_pubkey().as_bytes());
     let key = [b"U".as_slice(), &scripthash[..]].concat();
     assert!(
-        tester.query().chain().store().cache_db().get(&key).is_none(),
+        tester
+            .query()
+            .chain()
+            .store()
+            .cache_db()
+            .get(&key)
+            .is_none(),
         "a utxo set above --utxos-checkpoint-limit must not be checkpointed"
     );
 

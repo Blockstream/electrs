@@ -601,7 +601,15 @@ impl Connection {
         max_age: Option<Duration>,
     ) -> Result<Connection> {
         let (conn, active_addr) = tcp_connect(addr, fallback, &signal)?;
-        Connection::from_stream(conn, active_addr, addr, fallback, cookie_getter, signal, max_age)
+        Connection::from_stream(
+            conn,
+            active_addr,
+            addr,
+            fallback,
+            cookie_getter,
+            signal,
+            max_age,
+        )
     }
 
     /// Build a `Connection` wrapper around an already-established TCP stream.
@@ -1346,7 +1354,7 @@ impl Daemon {
                 Err(e) => {
                     let err_msg = format!("{e:?}");
                     if err_msg.contains("Block not found on disk")
-                       || err_msg.contains("Block not available")
+                        || err_msg.contains("Block not available")
                     {
                         // There is a small chance the node returns the header but didn't finish to index the block
                         if attempts == 0 {
@@ -1893,7 +1901,10 @@ mod tests {
     fn recv_rejects_an_endless_header_stream() {
         let (mut connection, server) = fake_daemon(secs(10), |mut socket| {
             let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n");
-            while socket.write_all(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n").is_ok() {}
+            while socket
+                .write_all(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n")
+                .is_ok()
+            {}
         });
 
         let err = connection.recv().unwrap_err();

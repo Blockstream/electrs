@@ -33,8 +33,7 @@ impl WalletTester {
             vec!["--server", &server_arg]
         };
         electrum_wallet_conf.view_stdout = true;
-        let electrum_wallet =
-            ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
+        let electrum_wallet = ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
 
         log::info!(
             "Electrum wallet version: {:?}",
@@ -51,7 +50,9 @@ impl WalletTester {
     fn notify_wallet(&self) {
         self.electrum_server.notify();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        self.electrum_wallet.call("wait_for_sync", &json!([])).unwrap();
+        self.electrum_wallet
+            .call("wait_for_sync", &json!([]))
+            .unwrap();
     }
 
     fn assert_balance(&self, confirmed: f64, unconfirmed: f64) {
@@ -433,7 +434,12 @@ fn test_electrum_broadcast_package_updates_mempool() -> Result<()> {
     );
     let v: electrumd::jsonrpc::serde_json::Value =
         electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
-    assert_eq!(v["result"]["success"].as_bool(), Some(true), "response: {}", s);
+    assert_eq!(
+        v["result"]["success"].as_bool(),
+        Some(true),
+        "response: {}",
+        s
+    );
 
     // the accepted tx must now be visible in the scripthash history immediately
     assert_eq!(
@@ -517,15 +523,17 @@ fn test_electrum_checkpoint_proofs() -> Result<()> {
         ),
     ));
     let result = &v["result"];
-    let header_bytes =
-        Vec::<u8>::from_hex(result["header"].as_str().expect("header hex")).unwrap();
+    let header_bytes = Vec::<u8>::from_hex(result["header"].as_str().expect("header hex")).unwrap();
     assert_eq!(
         sha256d::Hash::hash(&header_bytes),
         leaves[height],
         "returned header must hash to the block hash at the requested height"
     );
     let root = sha256d::Hash::from_str(result["root"].as_str().expect("root")).unwrap();
-    assert_eq!(root, expected_root, "proof root must match the independent tree");
+    assert_eq!(
+        root, expected_root,
+        "proof root must match the independent tree"
+    );
     let branch: Vec<sha256d::Hash> = result["branch"]
         .as_array()
         .expect("branch array")
@@ -572,7 +580,10 @@ fn test_electrum_checkpoint_proofs() -> Result<()> {
             height, tip + 1
         ),
     ));
-    assert!(!v["error"].is_null(), "cp_height above the tip must be an error");
+    assert!(
+        !v["error"].is_null(),
+        "cp_height above the tip must be an error"
+    );
 
     let (start, count) = (0usize, 10usize);
     let v = parse(&write_and_read(
@@ -683,8 +694,7 @@ fn test_electrum_checkpoint_proof_reorg_consistency() -> Result<()> {
         new_root,
         "post-reorg branch must connect the leaf to the new root"
     );
-    let header_bytes =
-        Vec::<u8>::from_hex(result["header"].as_str().expect("header hex")).unwrap();
+    let header_bytes = Vec::<u8>::from_hex(result["header"].as_str().expect("header hex")).unwrap();
     assert_eq!(
         sha256d::Hash::hash(&header_bytes),
         leaves[height],

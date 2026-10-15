@@ -2,7 +2,10 @@ extern crate electrs;
 
 use bitcoin::hex::DisplayHex;
 use electrs::{
-    config::Config, metrics::Metrics, new_index::{Store, TxHistoryKey}, util::bincode
+    config::Config,
+    metrics::Metrics,
+    new_index::{Store, TxHistoryKey},
+    util::bincode,
 };
 
 fn main() {
