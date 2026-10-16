@@ -105,7 +105,8 @@ fn bitcoind_fetcher(
             for entries in new_headers.chunks(batch_size) {
                 if fetcher_count % 50 == 0 && total_blocks_fetched >= 50 {
                     let batch_height = entries.last().map(|e| e.height()).unwrap_or(0);
-                    info!("fetching blocks {}/{} ({:.1}%)",
+                    info!(
+                        "fetching blocks {}/{} ({:.1}%)",
                         batch_height,
                         chain_tip_height,
                         batch_height as f32 / chain_tip_height.max(1) as f32 * 100.0
@@ -179,17 +180,24 @@ fn blkfiles_fetcher(
                     .into_iter()
                     .filter_map(|(block, size)| {
                         index += 1;
-                        debug!("fetch block {:}/{:} {:.2}%",
+                        debug!(
+                            "fetch block {:}/{:} {:.2}%",
                             index,
                             block_count,
-                            (index/block_count) as f32/100.0
+                            (index / block_count) as f32 / 100.0
                         );
                         let blockhash = block.block_hash();
                         entry_map
                             .remove(&blockhash)
                             .map(|entry| {
-                                let txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
-                                BlockEntry { block, entry, size, txids }
+                                let txids =
+                                    block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+                                BlockEntry {
+                                    block,
+                                    entry,
+                                    size,
+                                    txids,
+                                }
                             })
                             .or_else(|| {
                                 trace!("skipping block {}", blockhash);
@@ -198,9 +206,9 @@ fn blkfiles_fetcher(
                     })
                     .collect();
                 trace!("fetched {} blocks", block_entries.len());
-                sender.send(block_entries).chain_err(|| {
-                    "failed to send block entries from blk*.dat files"
-                })?;
+                sender
+                    .send(block_entries)
+                    .chain_err(|| "failed to send block entries from blk*.dat files")?;
                 Ok(())
             })?;
             if !entry_map.is_empty() {
@@ -226,15 +234,16 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>, xor_key: Option<[u8; 8]>) -> Fetcher
         spawn_thread("blkfiles_reader", move || {
             let blk_files_len = blk_files.len();
             for (count, path) in blk_files.iter().enumerate() {
-                info!("block file reading {:}/{:} {:.2}%",
+                info!(
+                    "block file reading {:}/{:} {:.2}%",
                     count,
                     blk_files_len,
                     count / blk_files_len
                 );
 
                 trace!("reading {:?}", path);
-                let mut blob = fs::read(&path)
-                    .chain_err(|| format!("failed to read {:?}", path))?;
+                let mut blob =
+                    fs::read(&path).chain_err(|| format!("failed to read {:?}", path))?;
                 if let Some(xor_key) = xor_key {
                     blkfile_apply_xor_key(xor_key, &mut blob);
                 }
@@ -330,8 +339,8 @@ fn parse_blocks(pool: &rayon::ThreadPool, blob: Vec<u8>, magic: u32) -> Result<V
         slices
             .into_par_iter()
             .map(|(slice, size)| {
-                let block = deserialize(slice)
-                    .chain_err(|| "failed to deserialize block from blk file")?;
+                let block =
+                    deserialize(slice).chain_err(|| "failed to deserialize block from blk file")?;
                 Ok((block, size))
             })
             .collect::<Result<Vec<SizedBlock>>>()
@@ -390,9 +399,7 @@ mod tests {
             }),
         );
 
-        let error = fetcher
-            .map(|_| bail!("consumer failed"))
-            .unwrap_err();
+        let error = fetcher.map(|_| bail!("consumer failed")).unwrap_err();
         assert!(format!("{:?}", error).contains("consumer failed"));
     }
 }

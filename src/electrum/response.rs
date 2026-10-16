@@ -921,9 +921,7 @@ mod tests {
         assert_eq!(bytes, b"[]\n");
         bytes.clear();
         let notification = json!({"method":"test", "params":["x".repeat(100_000)]});
-        writer
-            .send_notification(&mut bytes, &notification)
-            .unwrap();
+        writer.send_notification(&mut bytes, &notification).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&bytes).unwrap(),
             notification

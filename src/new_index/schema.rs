@@ -24,9 +24,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use crate::{chain::{
-    BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
-}, new_index::db_metrics::RocksDbMetrics};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
@@ -34,6 +31,10 @@ use crate::metrics::{Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricO
 use crate::util::{
     bincode, electrum_merkle::CheckpointMerkleCache, full_hash, has_prevout, is_spendable,
     BlockHeaderMeta, BlockId, BlockMeta, BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
+};
+use crate::{
+    chain::{BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value},
+    new_index::db_metrics::RocksDbMetrics,
 };
 
 use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
@@ -76,7 +77,10 @@ impl Store {
         // needs without being artificially capped at 1/3 of the total.
         let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
         let shared_cache = rocksdb::Cache::new_lru_cache(cache_size_bytes);
-        debug!("shared LRU block cache: db_block_cache_mb='{}'", config.db_block_cache_mb);
+        debug!(
+            "shared LRU block cache: db_block_cache_mb='{}'",
+            config.db_block_cache_mb
+        );
 
         let txstore_db = DB::open(&path.join("txstore"), config, verify_compat, &shared_cache);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
@@ -291,9 +295,9 @@ impl CleanupRetry {
     }
 
     fn failed(&mut self, daemon_tip: BlockHash) -> std::time::Duration {
-        let delay = self
-            .delay
-            .map_or(CLEANUP_RETRY_INITIAL, |delay| (delay * 2).min(CLEANUP_RETRY_MAX));
+        let delay = self.delay.map_or(CLEANUP_RETRY_INITIAL, |delay| {
+            (delay * 2).min(CLEANUP_RETRY_MAX)
+        });
         self.delay = Some(delay);
         self.next_attempt = Some(std::time::Instant::now() + delay);
         self.failed_at_tip = Some(daemon_tip);
@@ -794,13 +798,17 @@ impl ChainQuery {
                 Ok(blockinfo) => blockinfo,
                 Err(_) => return Ok(None),
             };
-            Ok(Some(serde_json::from_value(blockinfo["tx"].take())
-                .chain_err(|| "failed to parse block txids")?))
+            Ok(Some(
+                serde_json::from_value(blockinfo["tx"].take())
+                    .chain_err(|| "failed to parse block txids")?,
+            ))
         } else {
             self.store
                 .txstore_db
                 .try_get(&BlockRow::txids_key(full_hash(&hash[..])))?
-                .map(|val| bincode::deserialize_little(&val).chain_err(|| "failed to parse block txids"))
+                .map(|val| {
+                    bincode::deserialize_little(&val).chain_err(|| "failed to parse block txids")
+                })
                 .transpose()
         }
     }
@@ -811,7 +819,9 @@ impl ChainQuery {
         start_index: usize,
         limit: usize,
     ) -> Result<Vec<Transaction>> {
-        let txids = self.try_get_block_txids(hash)?.chain_err(|| "block not found")?;
+        let txids = self
+            .try_get_block_txids(hash)?
+            .chain_err(|| "block not found")?;
         ensure!(
             start_index < txids.len(),
             ErrorKind::InvalidParams("start index out of range".to_string())
@@ -1156,7 +1166,12 @@ impl ChainQuery {
             };
 
             if utxos.len() > self.utxos_checkpoint_limit {
-                return (utxos, None, processed_items, Some(UtxoScanStop::CheckpointLimit));
+                return (
+                    utxos,
+                    None,
+                    processed_items,
+                    Some(UtxoScanStop::CheckpointLimit),
+                );
             }
         }
 
@@ -1429,10 +1444,15 @@ impl ChainQuery {
         }
     }
 
-    fn try_lookup_raw_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Result<Option<Bytes>> {
+    fn try_lookup_raw_txn(
+        &self,
+        txid: &Txid,
+        blockhash: Option<&BlockHash>,
+    ) -> Result<Option<Bytes>> {
         if self.light_mode {
             let queried_blockhash = if blockhash.is_none() {
-                self.try_tx_confirming_block(txid)?.map(|blockid| blockid.hash)
+                self.try_tx_confirming_block(txid)?
+                    .map(|blockid| blockid.hash)
             } else {
                 None
             };
@@ -1444,8 +1464,12 @@ impl ChainQuery {
                 Ok(txval) => txval,
                 Err(_) => return Ok(None),
             };
-            let txhex = txval.as_str().chain_err(|| "invalid transaction RPC response")?;
-            Ok(Some(Bytes::from_hex(txhex).chain_err(|| "invalid transaction hex")?))
+            let txhex = txval
+                .as_str()
+                .chain_err(|| "invalid transaction RPC response")?;
+            Ok(Some(
+                Bytes::from_hex(txhex).chain_err(|| "invalid transaction hex")?,
+            ))
         } else {
             Ok(self.store.txstore_db.try_get(&TxRow::key(&txid[..]))?)
         }
@@ -1504,7 +1528,11 @@ impl ChainQuery {
         self.tx_confirming_block_with_headers(txid, &headers)
     }
 
-    fn tx_confirming_block_with_headers(&self, txid: &Txid, headers: &HeaderList) -> Option<BlockId> {
+    fn tx_confirming_block_with_headers(
+        &self,
+        txid: &Txid,
+        headers: &HeaderList,
+    ) -> Option<BlockId> {
         let row_value = self.store.history_db.get(&TxConfRow::key(txid))?;
         let height = TxConfRow::height_from_val(&row_value);
         // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
@@ -1731,7 +1759,6 @@ fn index_transaction(
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
 ) {
-
     // persist tx confirmation row:
     //      C{txid} → "{block_height}"
     rows.push(TxConfRow::new(txid, confirmed_height).into_row());
@@ -2170,8 +2197,7 @@ impl TxEdgeRow {
     }
 
     fn key(outpoint: &OutPoint) -> Bytes {
-        bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout))
-            .unwrap()
+        bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout)).unwrap()
     }
 
     pub fn into_row(self) -> DBRow {
@@ -2252,7 +2278,9 @@ impl UtxoCacheRow {
         value
             .get(..8)
             .and_then(|prefix| bincode::deserialize_little::<u64>(prefix).ok())
-            .map_or(0, |count| std::convert::TryFrom::try_from(count).unwrap_or(usize::MAX))
+            .map_or(0, |count| {
+                std::convert::TryFrom::try_from(count).unwrap_or(usize::MAX)
+            })
     }
 
     fn into_row(self) -> DBRow {
@@ -2425,7 +2453,10 @@ mod tests {
         let blockhash = tester.mine()?;
         let chain = tester.query().chain();
 
-        chain.store.txstore_db.put(&BlockRow::txids_key(full_hash(&blockhash[..])), &[]);
+        chain
+            .store
+            .txstore_db
+            .put(&BlockRow::txids_key(full_hash(&blockhash[..])), &[]);
         assert!(chain.get_block_txs(&blockhash, 0, 25).is_err());
 
         chain.store.history_db.put(&TxConfRow::key(&txid), &[]);

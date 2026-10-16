@@ -90,7 +90,12 @@ pub enum DBFlush {
 }
 
 impl DB {
-    pub fn open(path: &Path, config: &Config, verify_compat: bool, shared_cache: &rocksdb::Cache) -> DB {
+    pub fn open(
+        path: &Path,
+        config: &Config,
+        verify_compat: bool,
+        shared_cache: &rocksdb::Cache,
+    ) -> DB {
         info!("opening DB at {:?}", path);
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
@@ -103,7 +108,9 @@ impl DB {
         // After open, apply_bulk_load_triggers() widens them for initial sync
         // when the full-compaction sentinel 'F' is absent.
 
-        let parallelism: i32 = config.db_parallelism.try_into()
+        let parallelism: i32 = config
+            .db_parallelism
+            .try_into()
             .expect("db_parallelism value too large for i32");
 
         // Configure parallelism (background jobs and thread pools)
@@ -167,14 +174,20 @@ impl DB {
         db_opts.set_block_based_table_factory(&block_opts);
 
         let db = DB {
-            db: Arc::new(rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB"))
+            db: Arc::new(rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB")),
         };
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
-            info!("sentinel 'F' absent in {:?} — widening L0 triggers for bulk load", path);
+            info!(
+                "sentinel 'F' absent in {:?} — widening L0 triggers for bulk load",
+                path
+            );
             db.apply_bulk_load_triggers();
         } else {
-            info!("sentinel 'F' present in {:?} — using steady-state L0 triggers", path);
+            info!(
+                "sentinel 'F' present in {:?} — using steady-state L0 triggers",
+                path
+            );
         }
         if verify_compat {
             db.verify_compatibility(config);
@@ -187,9 +200,13 @@ impl DB {
         let start = std::time::Instant::now();
         let mut opts = rocksdb::CompactOptions::default();
         opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
-        self.db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &opts);
+        self.db
+            .compact_range_opt(None::<&[u8]>, None::<&[u8]>, &opts);
         let elapsed = start.elapsed();
-        info!("finished full compaction on {:?} in elapsed='{:.1?}'", self.db, elapsed);
+        info!(
+            "finished full compaction on {:?} in elapsed='{:.1?}'",
+            self.db, elapsed
+        );
     }
 
     fn apply_bulk_load_triggers(&self) {
@@ -382,8 +399,7 @@ impl DB {
     fn verify_compatibility(&self, config: &Config) {
         let version_bytes = bincode::serialize_little(&(DB_VERSION, config.light_mode)).unwrap();
         let flags_bytes =
-            bincode::serialize_little(&(config.index_unspendables, config.address_search))
-                .unwrap();
+            bincode::serialize_little(&(config.index_unspendables, config.address_search)).unwrap();
         // Kept apart from "V" so binaries that only know (DB_VERSION, light_mode) can still open the DB.
         const FLAGS_KEY: &[u8] = b"VF";
 
@@ -460,45 +476,123 @@ impl DB {
         };
 
         spawn_thread("db_stats_exporter", move || loop {
-            update_gauge(&db_metrics.num_immutable_mem_table, "rocksdb.num-immutable-mem-table");
-            update_gauge(&db_metrics.mem_table_flush_pending, "rocksdb.mem-table-flush-pending");
+            update_gauge(
+                &db_metrics.num_immutable_mem_table,
+                "rocksdb.num-immutable-mem-table",
+            );
+            update_gauge(
+                &db_metrics.mem_table_flush_pending,
+                "rocksdb.mem-table-flush-pending",
+            );
             update_gauge(&db_metrics.compaction_pending, "rocksdb.compaction-pending");
             update_gauge(&db_metrics.background_errors, "rocksdb.background-errors");
-            update_gauge(&db_metrics.cur_size_active_mem_table, "rocksdb.cur-size-active-mem-table");
-            update_gauge(&db_metrics.cur_size_all_mem_tables, "rocksdb.cur-size-all-mem-tables");
-            update_gauge(&db_metrics.size_all_mem_tables, "rocksdb.size-all-mem-tables");
-            update_gauge(&db_metrics.num_entries_active_mem_table, "rocksdb.num-entries-active-mem-table");
-            update_gauge(&db_metrics.num_entries_imm_mem_tables, "rocksdb.num-entries-imm-mem-tables");
-            update_gauge(&db_metrics.num_deletes_active_mem_table, "rocksdb.num-deletes-active-mem-table");
-            update_gauge(&db_metrics.num_deletes_imm_mem_tables, "rocksdb.num-deletes-imm-mem-tables");
+            update_gauge(
+                &db_metrics.cur_size_active_mem_table,
+                "rocksdb.cur-size-active-mem-table",
+            );
+            update_gauge(
+                &db_metrics.cur_size_all_mem_tables,
+                "rocksdb.cur-size-all-mem-tables",
+            );
+            update_gauge(
+                &db_metrics.size_all_mem_tables,
+                "rocksdb.size-all-mem-tables",
+            );
+            update_gauge(
+                &db_metrics.num_entries_active_mem_table,
+                "rocksdb.num-entries-active-mem-table",
+            );
+            update_gauge(
+                &db_metrics.num_entries_imm_mem_tables,
+                "rocksdb.num-entries-imm-mem-tables",
+            );
+            update_gauge(
+                &db_metrics.num_deletes_active_mem_table,
+                "rocksdb.num-deletes-active-mem-table",
+            );
+            update_gauge(
+                &db_metrics.num_deletes_imm_mem_tables,
+                "rocksdb.num-deletes-imm-mem-tables",
+            );
             update_gauge(&db_metrics.estimate_num_keys, "rocksdb.estimate-num-keys");
-            update_gauge(&db_metrics.estimate_table_readers_mem, "rocksdb.estimate-table-readers-mem");
-            update_gauge(&db_metrics.is_file_deletions_enabled, "rocksdb.is-file-deletions-enabled");
+            update_gauge(
+                &db_metrics.estimate_table_readers_mem,
+                "rocksdb.estimate-table-readers-mem",
+            );
+            update_gauge(
+                &db_metrics.is_file_deletions_enabled,
+                "rocksdb.is-file-deletions-enabled",
+            );
             update_gauge(&db_metrics.num_snapshots, "rocksdb.num-snapshots");
-            update_gauge(&db_metrics.oldest_snapshot_time, "rocksdb.oldest-snapshot-time");
+            update_gauge(
+                &db_metrics.oldest_snapshot_time,
+                "rocksdb.oldest-snapshot-time",
+            );
             update_gauge(&db_metrics.num_live_versions, "rocksdb.num-live-versions");
-            update_gauge(&db_metrics.current_super_version_number, "rocksdb.current-super-version-number");
-            update_gauge(&db_metrics.estimate_live_data_size, "rocksdb.estimate-live-data-size");
-            update_gauge(&db_metrics.min_log_number_to_keep, "rocksdb.min-log-number-to-keep");
-            update_gauge(&db_metrics.min_obsolete_sst_number_to_keep, "rocksdb.min-obsolete-sst-number-to-keep");
-            update_gauge(&db_metrics.total_sst_files_size, "rocksdb.total-sst-files-size");
-            update_gauge(&db_metrics.live_sst_files_size, "rocksdb.live-sst-files-size");
+            update_gauge(
+                &db_metrics.current_super_version_number,
+                "rocksdb.current-super-version-number",
+            );
+            update_gauge(
+                &db_metrics.estimate_live_data_size,
+                "rocksdb.estimate-live-data-size",
+            );
+            update_gauge(
+                &db_metrics.min_log_number_to_keep,
+                "rocksdb.min-log-number-to-keep",
+            );
+            update_gauge(
+                &db_metrics.min_obsolete_sst_number_to_keep,
+                "rocksdb.min-obsolete-sst-number-to-keep",
+            );
+            update_gauge(
+                &db_metrics.total_sst_files_size,
+                "rocksdb.total-sst-files-size",
+            );
+            update_gauge(
+                &db_metrics.live_sst_files_size,
+                "rocksdb.live-sst-files-size",
+            );
             update_gauge(&db_metrics.base_level, "rocksdb.base-level");
-            update_gauge(&db_metrics.estimate_pending_compaction_bytes, "rocksdb.estimate-pending-compaction-bytes");
-            update_gauge(&db_metrics.num_running_compactions, "rocksdb.num-running-compactions");
-            update_gauge(&db_metrics.num_running_flushes, "rocksdb.num-running-flushes");
-            update_gauge(&db_metrics.actual_delayed_write_rate, "rocksdb.actual-delayed-write-rate");
+            update_gauge(
+                &db_metrics.estimate_pending_compaction_bytes,
+                "rocksdb.estimate-pending-compaction-bytes",
+            );
+            update_gauge(
+                &db_metrics.num_running_compactions,
+                "rocksdb.num-running-compactions",
+            );
+            update_gauge(
+                &db_metrics.num_running_flushes,
+                "rocksdb.num-running-flushes",
+            );
+            update_gauge(
+                &db_metrics.actual_delayed_write_rate,
+                "rocksdb.actual-delayed-write-rate",
+            );
             update_gauge(&db_metrics.is_write_stopped, "rocksdb.is-write-stopped");
-            update_gauge(&db_metrics.estimate_oldest_key_time, "rocksdb.estimate-oldest-key-time");
-            update_gauge(&db_metrics.block_cache_capacity, "rocksdb.block-cache-capacity");
+            update_gauge(
+                &db_metrics.estimate_oldest_key_time,
+                "rocksdb.estimate-oldest-key-time",
+            );
+            update_gauge(
+                &db_metrics.block_cache_capacity,
+                "rocksdb.block-cache-capacity",
+            );
             update_gauge(&db_metrics.block_cache_usage, "rocksdb.block-cache-usage");
-            update_gauge(&db_metrics.block_cache_pinned_usage, "rocksdb.block-cache-pinned-usage");
+            update_gauge(
+                &db_metrics.block_cache_pinned_usage,
+                "rocksdb.block-cache-pinned-usage",
+            );
             for level in 0..ROCKSDB_NUM_LEVELS {
                 let prop = format!("rocksdb.num-files-at-level{}", level);
                 if let Ok(Some(value)) = db_arc2.property_value(&prop) {
                     if let Ok(v) = value.parse::<f64>() {
                         let level_str = level.to_string();
-                        db_metrics.num_files_at_level.with_label_values(&[&label2, &level_str]).set(v);
+                        db_metrics
+                            .num_files_at_level
+                            .with_label_values(&[&label2, &level_str])
+                            .set(v);
                     }
                 }
             }
@@ -522,18 +616,45 @@ mod tests {
     fn write_test_rows(db: &DB) {
         let rows = vec![
             // B rows (block headers) — scanned with 1-byte prefix b"B"
-            DBRow { key: make_key(b'B', 0x01, &[]), value: b"header1".to_vec() },
-            DBRow { key: make_key(b'B', 0x02, &[]), value: b"header2".to_vec() },
+            DBRow {
+                key: make_key(b'B', 0x01, &[]),
+                value: b"header1".to_vec(),
+            },
+            DBRow {
+                key: make_key(b'B', 0x02, &[]),
+                value: b"header2".to_vec(),
+            },
             // D rows (done markers) — scanned with 1-byte prefix b"D"
-            DBRow { key: make_key(b'D', 0x01, &[]), value: vec![] },
-            DBRow { key: make_key(b'D', 0x02, &[]), value: vec![] },
+            DBRow {
+                key: make_key(b'D', 0x01, &[]),
+                value: vec![],
+            },
+            DBRow {
+                key: make_key(b'D', 0x02, &[]),
+                value: vec![],
+            },
             // H rows (history) — scanned with 33-byte prefix b"H" + scripthash
-            DBRow { key: make_key(b'H', 0xAA, &[0, 0, 0, 1]), value: vec![] },
-            DBRow { key: make_key(b'H', 0xAA, &[0, 0, 0, 2]), value: vec![] },
-            DBRow { key: make_key(b'H', 0xBB, &[0, 0, 0, 1]), value: vec![] },
+            DBRow {
+                key: make_key(b'H', 0xAA, &[0, 0, 0, 1]),
+                value: vec![],
+            },
+            DBRow {
+                key: make_key(b'H', 0xAA, &[0, 0, 0, 2]),
+                value: vec![],
+            },
+            DBRow {
+                key: make_key(b'H', 0xBB, &[0, 0, 0, 1]),
+                value: vec![],
+            },
             // O rows (txouts) — looked up by exact key, but scannable by 33-byte prefix
-            DBRow { key: make_key(b'O', 0xCC, &[0, 1]), value: b"txout1".to_vec() },
-            DBRow { key: make_key(b'O', 0xCC, &[0, 2]), value: b"txout2".to_vec() },
+            DBRow {
+                key: make_key(b'O', 0xCC, &[0, 1]),
+                value: b"txout1".to_vec(),
+            },
+            DBRow {
+                key: make_key(b'O', 0xCC, &[0, 2]),
+                value: b"txout2".to_vec(),
+            },
         ];
         db.write_rows(rows, DBFlush::Enable);
     }
@@ -564,17 +685,32 @@ mod tests {
         // 33-byte prefix scan — must find only H rows for hash 0xAA
         let prefix = make_key(b'H', 0xAA, &[]);
         let h_rows: Vec<DBRow> = db.iter_scan(&prefix).collect();
-        assert_eq!(h_rows.len(), 2, "expected 2 H/0xAA rows, got {}", h_rows.len());
+        assert_eq!(
+            h_rows.len(),
+            2,
+            "expected 2 H/0xAA rows, got {}",
+            h_rows.len()
+        );
 
         // 33-byte prefix scan — must find only H rows for hash 0xBB
         let prefix = make_key(b'H', 0xBB, &[]);
         let h_rows: Vec<DBRow> = db.iter_scan(&prefix).collect();
-        assert_eq!(h_rows.len(), 1, "expected 1 H/0xBB row, got {}", h_rows.len());
+        assert_eq!(
+            h_rows.len(),
+            1,
+            "expected 1 H/0xBB row, got {}",
+            h_rows.len()
+        );
 
         // 33-byte prefix scan — O rows for hash 0xCC
         let prefix = make_key(b'O', 0xCC, &[]);
         let o_rows: Vec<DBRow> = db.iter_scan(&prefix).collect();
-        assert_eq!(o_rows.len(), 2, "expected 2 O/0xCC rows, got {}", o_rows.len());
+        assert_eq!(
+            o_rows.len(),
+            2,
+            "expected 2 O/0xCC rows, got {}",
+            o_rows.len()
+        );
     }
 
     #[test]
@@ -587,7 +723,12 @@ mod tests {
         let prefix = make_key(b'H', 0xAA, &[]);
         let start = make_key(b'H', 0xAA, &[0, 0, 0, 2]);
         let rows: Vec<DBRow> = db.iter_scan_from(&prefix, &start).collect();
-        assert_eq!(rows.len(), 1, "expected 1 H/0xAA row from height 2, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected 1 H/0xAA row from height 2, got {}",
+            rows.len()
+        );
     }
 
     #[test]
@@ -600,9 +741,17 @@ mod tests {
         let prefix = make_key(b'H', 0xAA, &[]);
         let prefix_max = make_key(b'H', 0xAA, &[0xFF, 0xFF, 0xFF, 0xFF]);
         let rows: Vec<DBRow> = db.iter_scan_reverse(&prefix, &prefix_max).collect();
-        assert_eq!(rows.len(), 2, "expected 2 H/0xAA rows in reverse, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected 2 H/0xAA rows in reverse, got {}",
+            rows.len()
+        );
         // Should be in reverse order
-        assert!(rows[0].key > rows[1].key, "reverse scan should return descending keys");
+        assert!(
+            rows[0].key > rows[1].key,
+            "reverse scan should return descending keys"
+        );
     }
 
     #[test]
@@ -639,7 +788,11 @@ mod tests {
         assert_eq!(count, 9, "expected 9 total rows, got {}", count);
     }
 
-    fn make_test_config(index_unspendables: bool, address_search: bool, light_mode: bool) -> crate::config::Config {
+    fn make_test_config(
+        index_unspendables: bool,
+        address_search: bool,
+        light_mode: bool,
+    ) -> crate::config::Config {
         use crate::config::{Config, RpcLogging};
         use std::path::PathBuf;
 
@@ -764,7 +917,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             db.verify_compatibility(&toggled);
         }));
-        assert!(result.is_err(), "recorded flags should still guard future mismatches");
+        assert!(
+            result.is_err(),
+            "recorded flags should still guard future mismatches"
+        );
     }
 
     #[test]
@@ -784,7 +940,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             db.verify_compatibility(&toggled);
         }));
-        assert!(result.is_err(), "flags from the combined record must be carried over");
+        assert!(
+            result.is_err(),
+            "flags from the combined record must be carried over"
+        );
     }
 
     #[test]

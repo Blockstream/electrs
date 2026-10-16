@@ -1104,7 +1104,14 @@ fn failing_cleanup_backs_off_until_the_daemon_tip_changes() {
     // A new daemon tip retries immediately and, with bitcoind recovered, succeeds.
     fixture.extend_chain();
     fixture.chain.lock().unwrap().unavailable.clear();
-    let tip = fixture.chain.lock().unwrap().active.last().unwrap().block_hash();
+    let tip = fixture
+        .chain
+        .lock()
+        .unwrap()
+        .active
+        .last()
+        .unwrap()
+        .block_hash();
     assert_eq!(indexer.update(&daemon).unwrap(), tip);
     assert!(!indexer.stale_cleanup_failing());
     assert!(store.history_db().get(b"R").is_none());

@@ -151,7 +151,10 @@ fn value_or_default_or_exit(
         None => default,
         Some(raw) => raw.parse::<usize>().unwrap_or_else(|_| {
             clap::Error::with_description(
-                &format!("--{} expects a non-negative integer (got {:?})", cli_name, raw),
+                &format!(
+                    "--{} expects a non-negative integer (got {:?})",
+                    cli_name, raw
+                ),
                 clap::ErrorKind::ValueValidation,
             )
             .exit()
@@ -580,18 +583,16 @@ impl Config {
                 0 => None, // 0 = unlimited / never disconnect
                 secs => Some(Duration::from_secs(secs)),
             };
-        let electrum_rpc_write_timeout = match value_t_or_exit!(m, "electrum_rpc_write_timeout", u64) {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
-        let electrum_rpc_max_request_num_bytes: usize = match value_t_or_exit!(
-            m,
-            "electrum_rpc_max_request_num_bytes",
-            usize
-        ) {
-            0 => usize::MAX, // 0 = unlimited
-            bytes => bytes,
-        };
+        let electrum_rpc_write_timeout =
+            match value_t_or_exit!(m, "electrum_rpc_write_timeout", u64) {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            };
+        let electrum_rpc_max_request_num_bytes: usize =
+            match value_t_or_exit!(m, "electrum_rpc_max_request_num_bytes", usize) {
+                0 => usize::MAX, // 0 = unlimited
+                bytes => bytes,
+            };
         let electrum_rpc_max_response_num_bytes: usize = match value_or_default_or_exit(
             &m,
             "electrum_rpc_max_response_num_bytes",
@@ -619,8 +620,7 @@ impl Config {
                     "--electrum-rpc-global-response-budget-bytes ({}) must be >= \
                      --electrum-rpc-max-response-num-bytes ({}); a single maximum-size \
                      reply cannot succeed otherwise",
-                    electrum_rpc_global_response_budget_bytes,
-                    electrum_rpc_max_response_num_bytes,
+                    electrum_rpc_global_response_budget_bytes, electrum_rpc_max_response_num_bytes,
                 ),
                 clap::ErrorKind::ValueValidation,
             )

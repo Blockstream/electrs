@@ -1204,7 +1204,13 @@ mod tests {
                 || usize::MAX,
                 4,
                 || Ok((blocked_hash, leaf)),
-                || Ok((blocked_hash, build_levels_above_leaves(&entry_leaves)?, leaf)),
+                || {
+                    Ok((
+                        blocked_hash,
+                        build_levels_above_leaves(&entry_leaves)?,
+                        leaf,
+                    ))
+                },
             )
             .unwrap();
     }
@@ -1521,7 +1527,13 @@ mod tests {
                     || usize::MAX,
                     1,
                     || Ok((hash, filler_leaves[0])),
-                    || Ok((hash, build_levels_above_leaves(&filler_leaves)?, filler_leaves[0])),
+                    || {
+                        Ok((
+                            hash,
+                            build_levels_above_leaves(&filler_leaves)?,
+                            filler_leaves[0],
+                        ))
+                    },
                 )
                 .unwrap();
             resident += filler_bytes;
