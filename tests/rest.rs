@@ -1641,6 +1641,99 @@ fn test_rest_liquid_unblinded_issuance() -> Result<()> {
 
 #[cfg(feature = "liquid")]
 #[test]
+fn test_rest_liquid_reissuance_token_matches_elements() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    struct Shape {
+        amount: f64,
+        tokens: f64,
+        blind: bool,
+    }
+    let shapes = [
+        Shape {
+            amount: 1.0,
+            tokens: 0.0,
+            blind: true,
+        },
+        Shape {
+            amount: 0.0,
+            tokens: 1.0,
+            blind: true,
+        },
+        Shape {
+            amount: 1.0,
+            tokens: 1.0,
+            blind: true,
+        },
+        Shape {
+            amount: 1.0,
+            tokens: 0.0,
+            blind: false,
+        },
+        Shape {
+            amount: 0.0,
+            tokens: 1.0,
+            blind: false,
+        },
+        Shape {
+            amount: 1.0,
+            tokens: 1.0,
+            blind: false,
+        },
+    ];
+    let mut issuances = vec![];
+    for shape in shapes {
+        let args = [shape.amount.into(), shape.tokens.into(), shape.blind.into()];
+        issuances.push(tester.node_client().call::<Value>("issueasset", &args)?);
+    }
+    tester.sync()?;
+
+    let assert_tokens = || -> Result<()> {
+        for issuance in &issuances {
+            let asset_id = issuance["asset"].as_str().expect("asset id");
+            let asset = get_json(rest_addr, &format!("/asset/{}", asset_id))?;
+            assert_eq!(asset["reissuance_token"], issuance["token"], "{}", issuance);
+        }
+        Ok(())
+    };
+    assert_tokens()?;
+    tester.mine()?;
+    assert_tokens()?;
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(feature = "liquid")]
+#[test]
+fn test_rest_liquid_burned_reissuance_tokens() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    let issuance = tester
+        .node_client()
+        .call::<Value>("issueasset", &[0.into(), 1.into(), true.into()])?;
+    tester.mine()?;
+    let asset_id = issuance["asset"].as_str().expect("asset id");
+    let token_id = issuance["token"].as_str().expect("token id");
+
+    tester
+        .node_client()
+        .call::<Value>("destroyamount", &[token_id.into(), 0.25.into()])?;
+    tester.mine()?;
+
+    let asset = get_json(rest_addr, &format!("/asset/{}", asset_id))?;
+    assert_eq!(asset["reissuance_token"].as_str(), Some(token_id));
+    assert_eq!(
+        asset["chain_stats"]["burned_reissuance_tokens"].as_u64(),
+        Some(25_000_000)
+    );
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[cfg(feature = "liquid")]
+#[test]
 fn test_rest_liquid_asset_transfer() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
 

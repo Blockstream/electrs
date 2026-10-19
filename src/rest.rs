@@ -1385,7 +1385,9 @@ fn handle_blocking_request(
 
             let sorting = AssetSorting::from_query_params(&query_params)?;
 
-            let (total_num, assets) = query.list_registry_assets(start_index, limit, sorting)?;
+            let (total_num, assets) = query
+                .list_registry_assets(start_index, limit, sorting)
+                .map_err(HttpError::lookup)?;
 
             Ok(Response::builder()
                 // Disable caching because we don't currently support caching with query string params
@@ -1400,7 +1402,8 @@ fn handle_blocking_request(
         (&Method::GET, Some(&"asset"), Some(asset_str), None, None, None) => {
             let asset_id = AssetId::from_str(asset_str)?;
             let asset_entry = query
-                .lookup_asset(&asset_id)?
+                .lookup_asset(&asset_id)
+                .map_err(HttpError::lookup)?
                 .ok_or_else(|| HttpError::not_found("Asset id not found".to_string()))?;
 
             json_response(asset_entry, TTL_SHORT)
@@ -1472,7 +1475,8 @@ fn handle_blocking_request(
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"supply"), param, None) => {
             let asset_id = AssetId::from_str(asset_str)?;
             let asset_entry = query
-                .lookup_asset(&asset_id)?
+                .lookup_asset(&asset_id)
+                .map_err(HttpError::lookup)?
                 .ok_or_else(|| HttpError::not_found("Asset id not found".to_string()))?;
 
             let supply = asset_entry
