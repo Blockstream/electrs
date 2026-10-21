@@ -4,6 +4,7 @@ use crate::chain::{
 };
 use crate::config::Config;
 use crate::errors;
+use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{compute_script_hash, Mempool, Query, SpendingInput, Utxo};
 #[cfg(feature = "liquid")]
 use crate::util::optional_value_for_newer_blocks;
@@ -65,6 +66,10 @@ const TTL_LONG: u32 = 157_784_630; // ttl for static resources (5 years)
 const TTL_SHORT: u32 = 10; // ttl for volatie resources
 const TTL_MEMPOOL_RECENT: u32 = 5; // ttl for GET /mempool/recent
 const CONF_FINAL: usize = 10; // reorgs deeper than this are considered unlikely
+
+/// Route label for requests that matched no route: unknown paths, and requests rejected
+/// before dispatch (body too large, body timeout, handler panic). Their status tells them apart.
+const ROUTE_UNKNOWN: &str = "unknown";
 
 #[derive(Serialize, Deserialize)]
 struct BlockValue {
@@ -648,18 +653,85 @@ where
         .collect())
 }
 
+struct RestMetrics {
+    duration: HistogramVec,
+    in_flight: Gauge,
+}
+
+impl RestMetrics {
+    fn new(metrics: &Metrics) -> Self {
+        RestMetrics {
+            duration: metrics.histogram_vec(
+                HistogramOpts::new(
+                    "rest_request_duration_seconds",
+                    "REST request latency by method, route and status (seconds)",
+                ),
+                &["method", "route", "status"],
+            ),
+            in_flight: metrics.gauge(MetricOpts::new(
+                "rest_requests_in_flight",
+                "# of REST requests being handled",
+            )),
+        }
+    }
+
+    fn observe(&self, method: &Method, route: &str, status: StatusCode, elapsed: time::Duration) {
+        self.duration
+            .with_label_values(&[method_label(method), route, status.as_str()])
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
+/// Decrements `rest_requests_in_flight` on drop, so requests whose future hyper drops
+/// (e.g. the client disconnected) are not left counted as in flight.
+struct InFlightGuard(Gauge);
+
+impl InFlightGuard {
+    fn new(gauge: &Gauge) -> Self {
+        gauge.inc();
+        InFlightGuard(gauge.clone())
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+/// The method as a metric label. Hyper accepts arbitrary extension methods, so anything
+/// non-standard collapses to "other" to keep label cardinality bounded.
+fn method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::PATCH => "PATCH",
+        Method::CONNECT => "CONNECT",
+        Method::TRACE => "TRACE",
+        _ => "other",
+    }
+}
+
 fn spawn_conn(
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     query: Arc<Query>,
     config: Arc<Config>,
+    metrics: Arc<RestMetrics>,
     graceful: &GracefulShutdown,
 ) {
     let io = TokioIo::new(stream);
     let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let query = Arc::clone(&query);
         let config = Arc::clone(&config);
+        let metrics = Arc::clone(&metrics);
 
         async move {
+            let started = time::Instant::now();
+            let _in_flight = InFlightGuard::new(&metrics.in_flight);
             let method = req.method().clone();
             let uri = req.uri().clone();
 
@@ -670,10 +742,10 @@ fn spawn_conn(
             )
             .await;
 
-            let resp_result = match body_result {
+            let (route, resp_result) = match body_result {
                 Ok(Ok(collected)) => {
                     handle_request(
-                        method,
+                        method.clone(),
                         uri,
                         collected.to_bytes(),
                         query,
@@ -682,16 +754,25 @@ fn spawn_conn(
                     .await
                 }
                 // Inner Err by http_body_util::Limited, either a LengthLimitError or an error by the underlying body stream
-                Ok(Err(e)) if e.is::<LengthLimitError>() => Err(HttpError(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Request body too large".to_string(),
-                )),
-                Ok(Err(e)) => Err(HttpError(StatusCode::BAD_REQUEST, e.to_string())),
+                Ok(Err(e)) if e.is::<LengthLimitError>() => (
+                    ROUTE_UNKNOWN,
+                    Err(HttpError(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Request body too large".to_string(),
+                    )),
+                ),
+                Ok(Err(e)) => (
+                    ROUTE_UNKNOWN,
+                    Err(HttpError(StatusCode::BAD_REQUEST, e.to_string())),
+                ),
                 // Outer Err by tokio::time::timeout()
-                Err(_) => Err(HttpError(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "Request timeout".to_string(),
-                )),
+                Err(_) => (
+                    ROUTE_UNKNOWN,
+                    Err(HttpError(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "Request timeout".to_string(),
+                    )),
+                ),
             };
 
             let mut resp = resp_result.unwrap_or_else(|err| {
@@ -706,6 +787,7 @@ fn spawn_conn(
                 resp.headers_mut()
                     .insert("Access-Control-Allow-Origin", origins.parse().unwrap());
             }
+            metrics.observe(&method, route, resp.status(), started.elapsed());
             Ok::<_, hyper::Error>(resp)
         }
     });
@@ -723,7 +805,12 @@ fn spawn_conn(
 }
 
 #[tokio::main]
-async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receiver<()>) {
+async fn run_server(
+    config: Arc<Config>,
+    query: Arc<Query>,
+    metrics: Arc<RestMetrics>,
+    rx: oneshot::Receiver<()>,
+) {
     let addr = &config.http_addr;
     let socket_file = &config.http_socket_file;
 
@@ -749,7 +836,7 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
                         match result {
                             Ok((stream, _)) => {
                                 stream.set_nodelay(true).expect("failed to set TCP_NODELAY");
-                                spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful);
+                                spawn_conn(stream, Arc::clone(&query), Arc::clone(&config), Arc::clone(&metrics), &graceful);
                             }
                             Err(e) => warn!("accept error: {}", e),
                         }
@@ -773,7 +860,7 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
                 tokio::select! {
                     result = listener.accept() => {
                         match result {
-                            Ok((stream, _)) => spawn_conn(stream, Arc::clone(&query), Arc::clone(&config),  &graceful),
+                            Ok((stream, _)) => spawn_conn(stream, Arc::clone(&query), Arc::clone(&config), Arc::clone(&metrics), &graceful),
                             Err(e) => warn!("accept error: {}", e),
                         }
                     }
@@ -794,13 +881,14 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
     }
 }
 
-pub fn start(config: Arc<Config>, query: Arc<Query>) -> Handle {
+pub fn start(config: Arc<Config>, query: Arc<Query>, metrics: &Metrics) -> Handle {
     let (tx, rx) = oneshot::channel::<()>();
+    let metrics = Arc::new(RestMetrics::new(metrics));
 
     Handle {
         tx,
         thread: thread::spawn(move || {
-            run_server(config, query, rx);
+            run_server(config, query, metrics, rx);
         }),
     }
 }
@@ -837,6 +925,8 @@ fn is_block_template_request(method: &Method, uri: &hyper::Uri) -> bool {
 /// The block template endpoint is the exception: it is genuinely asynchronous (concurrent
 /// callers share one in-flight daemon fetch) and already does its own blocking work on the
 /// blocking pool, so it stays on the runtime.
+///
+/// Returns the matched route template alongside the response, for the request metrics.
 #[trace]
 async fn handle_request(
     method: Method,
@@ -844,22 +934,32 @@ async fn handle_request(
     body: Bytes,
     query: Arc<Query>,
     config: Arc<Config>,
-) -> Result<Response<Full<Bytes>>, HttpError> {
+) -> (&'static str, Result<Response<Full<Bytes>>, HttpError>) {
     if is_block_template_request(&method, &uri) {
-        return handle_block_template_request(&query, &config).await;
+        return (
+            "block-template",
+            handle_block_template_request(&query, &config).await,
+        );
     }
 
     let path = uri.path().to_string();
-    tokio::task::spawn_blocking(move || handle_blocking_request(method, uri, body, &query, &config))
-        .await
-        .unwrap_or_else(|err| {
-            // The handler panicked or was cancelled; hyper still needs a response.
-            warn!("request handler for path='{}' failed: {}", path, err);
+    tokio::task::spawn_blocking(move || {
+        let mut route = ROUTE_UNKNOWN;
+        let resp = handle_blocking_request(method, uri, body, &query, &config, &mut route);
+        (route, resp)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        // The handler panicked or was cancelled; hyper still needs a response.
+        warn!("request handler for path='{}' failed: {}", path, err);
+        (
+            ROUTE_UNKNOWN,
             Err(HttpError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
-            ))
-        })
+            )),
+        )
+    })
 }
 
 async fn handle_block_template_request(
@@ -876,6 +976,10 @@ async fn handle_block_template_request(
 
 /// The synchronous body of the router. Always invoked from the blocking pool by
 /// `handle_request`, never directly from an async worker thread.
+///
+/// Each arm sets `route` to its route template before doing any work, so the metrics label
+/// is right even when the handler returns early with an error. Templates never contain path
+/// parameters, which keeps addresses, txids and hashes out of the metric labels.
 #[trace]
 fn handle_blocking_request(
     method: Method,
@@ -883,6 +987,7 @@ fn handle_blocking_request(
     body: Bytes,
     query: &Query,
     config: &Config,
+    route: &mut &'static str,
 ) -> Result<Response<Full<Bytes>>, HttpError> {
     // TODO it looks hyper does not have routing and query parsing :(
     let path: Vec<&str> = uri.path().split('/').skip(1).collect();
@@ -902,23 +1007,31 @@ fn handle_blocking_request(
         path.get(3),
         path.get(4),
     ) {
-        (&Method::GET, Some(&"blocks"), Some(&"tip"), Some(&"hash"), None, None) => http_message(
-            StatusCode::OK,
-            query.chain().best_hash().to_string(),
-            TTL_SHORT,
-        ),
+        (&Method::GET, Some(&"blocks"), Some(&"tip"), Some(&"hash"), None, None) => {
+            *route = "blocks/tip/hash";
+            http_message(
+                StatusCode::OK,
+                query.chain().best_hash().to_string(),
+                TTL_SHORT,
+            )
+        }
 
-        (&Method::GET, Some(&"blocks"), Some(&"tip"), Some(&"height"), None, None) => http_message(
-            StatusCode::OK,
-            query.chain().best_height().to_string(),
-            TTL_SHORT,
-        ),
+        (&Method::GET, Some(&"blocks"), Some(&"tip"), Some(&"height"), None, None) => {
+            *route = "blocks/tip/height";
+            http_message(
+                StatusCode::OK,
+                query.chain().best_height().to_string(),
+                TTL_SHORT,
+            )
+        }
 
         (&Method::GET, Some(&"blocks"), start_height, None, None, None) => {
+            *route = "blocks/:start_height?";
             let start_height = start_height.and_then(|height| height.parse::<usize>().ok());
             blocks(&query, start_height)
         }
         (&Method::GET, Some(&"block-height"), Some(height), None, None, None) => {
+            *route = "block-height/:height";
             let height = height.parse::<usize>()?;
             let header = query
                 .chain()
@@ -928,6 +1041,7 @@ fn handle_blocking_request(
             http_message(StatusCode::OK, header.hash().to_string(), ttl)
         }
         (&Method::GET, Some(&"block"), Some(hash), None, None, None) => {
+            *route = "block/:hash";
             let hash = BlockHash::from_str(hash)?;
             let blockhm = query
                 .chain()
@@ -937,12 +1051,14 @@ fn handle_blocking_request(
             json_response(block_value, TTL_LONG)
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"status"), None, None) => {
+            *route = "block/:hash/status";
             let hash = BlockHash::from_str(hash)?;
             let status = query.chain().get_block_status(&hash);
             let ttl = ttl_by_depth(status.height, query);
             json_response(status, ttl)
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txids"), None, None) => {
+            *route = "block/:hash/txids";
             let hash = BlockHash::from_str(hash)?;
             let txids = query
                 .chain()
@@ -952,6 +1068,7 @@ fn handle_blocking_request(
             json_response(txids, TTL_LONG)
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"header"), None, None) => {
+            *route = "block/:hash/header";
             let hash = BlockHash::from_str(hash)?;
             let header = query
                 .chain()
@@ -962,6 +1079,7 @@ fn handle_blocking_request(
             http_message(StatusCode::OK, header_hex, TTL_LONG)
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"raw"), None, None) => {
+            *route = "block/:hash/raw";
             let hash = BlockHash::from_str(hash)?;
             let raw = query
                 .chain()
@@ -976,6 +1094,7 @@ fn handle_blocking_request(
                 .unwrap())
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txid"), Some(index), None) => {
+            *route = "block/:hash/txid/:index";
             let hash = BlockHash::from_str(hash)?;
             let index: usize = index.parse()?;
             let txids = query
@@ -989,6 +1108,7 @@ fn handle_blocking_request(
             http_message(StatusCode::OK, txids[index].to_string(), TTL_LONG)
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txs"), start_index, None) => {
+            *route = "block/:hash/txs/:start_index?";
             let hash = BlockHash::from_str(hash)?;
 
             // Add lightweight validation that block exists before fetching transactions,
@@ -1038,6 +1158,7 @@ fn handle_blocking_request(
         }
         (&Method::GET, Some(script_type @ &"address"), Some(script_str), None, None, None)
         | (&Method::GET, Some(script_type @ &"scripthash"), Some(script_str), None, None, None) => {
+            *route = script_route(script_type, "address/:address", "scripthash/:scripthash");
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
             let stats = query.stats(&script_hash[..])?;
             json_response(
@@ -1065,6 +1186,11 @@ fn handle_blocking_request(
             None,
             None,
         ) => {
+            *route = script_route(
+                script_type,
+                "address/:address/txs",
+                "scripthash/:scripthash/txs",
+            );
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
             let txs = prepare_history(
                 query,
@@ -1096,6 +1222,11 @@ fn handle_blocking_request(
             Some(&"chain"),
             last_seen_txid,
         ) => {
+            *route = script_route(
+                script_type,
+                "address/:address/txs/chain/:last_seen_txid?",
+                "scripthash/:scripthash/txs/chain/:last_seen_txid?",
+            );
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
             let last_seen_txid = last_seen_txid.and_then(|txid| Txid::from_str(txid).ok());
             let txs = query
@@ -1140,6 +1271,11 @@ fn handle_blocking_request(
             Some(&"mempool"),
             None,
         ) => {
+            *route = script_route(
+                script_type,
+                "address/:address/txs/mempool",
+                "scripthash/:scripthash/txs/mempool",
+            );
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
             let txs = MempoolTxs::capture(query, |mempool| {
                 mempool.history(&script_hash[..], MAX_MEMPOOL_TXS)
@@ -1165,6 +1301,11 @@ fn handle_blocking_request(
             None,
             None,
         ) => {
+            *route = script_route(
+                script_type,
+                "address/:address/utxo",
+                "scripthash/:scripthash/utxo",
+            );
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
             let utxos: Vec<UtxoValue> = query
                 .utxo(&script_hash[..])?
@@ -1175,6 +1316,7 @@ fn handle_blocking_request(
             json_response(utxos, TTL_SHORT)
         }
         (&Method::GET, Some(&"address-prefix"), Some(prefix), None, None, None) => {
+            *route = "address-prefix/:prefix";
             if !config.address_search {
                 return Err(HttpError::from("address search disabled".to_string()));
             }
@@ -1182,6 +1324,7 @@ fn handle_blocking_request(
             json_response(results, TTL_SHORT)
         }
         (&Method::GET, Some(&"tx"), Some(hash), None, None, None) => {
+            *route = "tx/:txid";
             let hash = Txid::from_str(hash)?;
             let (tx, ttl) = prepare_tx(&hash, query, config)?;
 
@@ -1189,6 +1332,10 @@ fn handle_blocking_request(
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(out_type @ &"hex"), None, None)
         | (&Method::GET, Some(&"tx"), Some(hash), Some(out_type @ &"raw"), None, None) => {
+            *route = match *out_type {
+                "raw" => "tx/:txid/raw",
+                _ => "tx/:txid/hex",
+            };
             let hash = Txid::from_str(hash)?;
             let rawtx = query
                 .lookup_raw_txn(&hash)
@@ -1209,6 +1356,7 @@ fn handle_blocking_request(
                 .unwrap())
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"status"), None, None) => {
+            *route = "tx/:txid/status";
             let hash = Txid::from_str(hash)?;
             let status = query.get_tx_status(&hash);
             let ttl = ttl_by_depth(status.block_height, query);
@@ -1216,6 +1364,7 @@ fn handle_blocking_request(
         }
 
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"merkle-proof"), None, None) => {
+            *route = "tx/:txid/merkle-proof";
             let hash = Txid::from_str(hash)?;
             let blockid = query.chain().tx_confirming_block(&hash).ok_or_else(|| {
                 HttpError::not_found("Transaction not found or is unconfirmed".to_string())
@@ -1231,6 +1380,7 @@ fn handle_blocking_request(
         }
         #[cfg(not(feature = "liquid"))]
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"merkleblock-proof"), None, None) => {
+            *route = "tx/:txid/merkleblock-proof";
             let hash = Txid::from_str(hash)?;
 
             let merkleblock = query.chain().get_merkleblock_proof(&hash).ok_or_else(|| {
@@ -1248,6 +1398,7 @@ fn handle_blocking_request(
             )
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"outspend"), Some(index), None) => {
+            *route = "tx/:txid/outspend/:vout";
             let hash = Txid::from_str(hash)?;
             let outpoint = OutPoint {
                 txid: hash,
@@ -1266,6 +1417,7 @@ fn handle_blocking_request(
             json_response(spend, ttl)
         }
         (&Method::GET, Some(&"tx"), Some(hash), Some(&"outspends"), None, None) => {
+            *route = "tx/:txid/outspends";
             let hash = Txid::from_str(hash)?;
             let tx = query
                 .lookup_txn(&hash)
@@ -1281,6 +1433,10 @@ fn handle_blocking_request(
         }
         (&Method::GET, Some(&"broadcast"), None, None, None, None)
         | (&Method::POST, Some(&"tx"), None, None, None, None) => {
+            *route = match method {
+                Method::POST => "tx",
+                _ => "broadcast",
+            };
             // accept both POST and GET for backward compatibility.
             // GET will eventually be removed in favor of POST.
             let txhex = match method {
@@ -1295,6 +1451,7 @@ fn handle_blocking_request(
             http_message(StatusCode::OK, txid.to_string(), 0)
         }
         (&Method::POST, Some(&"txs"), Some(&"package"), None, None, None) => {
+            *route = "txs/package";
             let txhexes: Vec<String> =
                 serde_json::from_str(String::from_utf8(body.to_vec())?.as_str())?;
 
@@ -1353,18 +1510,22 @@ fn handle_blocking_request(
         }
 
         (&Method::GET, Some(&"mempool"), None, None, None, None) => {
+            *route = "mempool";
             json_response(query.mempool().backlog_stats(), TTL_SHORT)
         }
         (&Method::GET, Some(&"mempool"), Some(&"txids"), None, None, None) => {
+            *route = "mempool/txids";
             json_response(query.mempool().txids(), TTL_SHORT)
         }
         (&Method::GET, Some(&"mempool"), Some(&"recent"), None, None, None) => {
+            *route = "mempool/recent";
             let mempool = query.mempool();
             let recent = mempool.recent_txs_overview();
             json_response(recent, TTL_MEMPOOL_RECENT)
         }
 
         (&Method::GET, Some(&"fee-estimates"), None, None, None, None) => {
+            *route = "fee-estimates";
             json_response(query.estimate_fee_map(), TTL_SHORT)
         }
 
@@ -1372,6 +1533,7 @@ fn handle_blocking_request(
         // here, because it is the only asynchronous handler. See `is_block_template_request`.
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"assets"), Some(&"registry"), None, None, None) => {
+            *route = "assets/registry";
             let start_index: usize = query_params
                 .get("start_index")
                 .and_then(|n| n.parse().ok())
@@ -1400,6 +1562,7 @@ fn handle_blocking_request(
 
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), None, None, None) => {
+            *route = "asset/:asset_id";
             let asset_id = AssetId::from_str(asset_str)?;
             let asset_entry = query
                 .lookup_asset(&asset_id)
@@ -1411,6 +1574,7 @@ fn handle_blocking_request(
 
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"txs"), None, None) => {
+            *route = "asset/:asset_id/txs";
             let asset_id = AssetId::from_str(asset_str)?;
             let txs = prepare_history(
                 query,
@@ -1435,6 +1599,7 @@ fn handle_blocking_request(
             Some(&"chain"),
             last_seen_txid,
         ) => {
+            *route = "asset/:asset_id/txs/chain/:last_seen_txid?";
             let asset_id = AssetId::from_str(asset_str)?;
             let last_seen_txid = last_seen_txid.and_then(|txid| Txid::from_str(txid).ok());
             let txs = query
@@ -1462,6 +1627,7 @@ fn handle_blocking_request(
 
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"txs"), Some(&"mempool"), None) => {
+            *route = "asset/:asset_id/txs/mempool";
             let asset_id = AssetId::from_str(asset_str)?;
             let txs = MempoolTxs::capture(query, |mempool| {
                 mempool.asset_history(&asset_id, MAX_MEMPOOL_TXS)
@@ -1473,6 +1639,7 @@ fn handle_blocking_request(
 
         #[cfg(feature = "liquid")]
         (&Method::GET, Some(&"asset"), Some(asset_str), Some(&"supply"), param, None) => {
+            *route = "asset/:asset_id/supply/:format?";
             let asset_id = AssetId::from_str(asset_str)?;
             let asset_entry = query
                 .lookup_asset(&asset_id)
@@ -1496,6 +1663,19 @@ fn handle_blocking_request(
             "endpoint does not exist {:?}",
             uri.path()
         ))),
+    }
+}
+
+/// The route template of an arm shared by the `address` and `scripthash` endpoints.
+fn script_route(
+    script_type: &str,
+    address: &'static str,
+    scripthash: &'static str,
+) -> &'static str {
+    if script_type == "address" {
+        address
+    } else {
+        scripthash
     }
 }
 
@@ -1828,7 +2008,8 @@ impl From<address::AddressError> for HttpError {
 #[cfg(test)]
 mod tests {
     use crate::rest::{
-        is_block_template_request, ttl_by_confirmations, HttpError, TTL_LONG, TTL_SHORT,
+        is_block_template_request, method_label, script_route, ttl_by_confirmations, HttpError,
+        TTL_LONG, TTL_SHORT,
     };
     use crate::{errors, errors::ErrorKind};
     use http_body_util::BodyExt;
@@ -1859,6 +2040,23 @@ mod tests {
         assert!(!is_async(Method::POST, "/block-template"));
         assert!(!is_async(Method::GET, "/blocks/tip/height"));
         assert!(!is_async(Method::POST, "/tx"));
+    }
+
+    #[test]
+    fn method_label_is_bounded() {
+        assert_eq!(method_label(&Method::GET), "GET");
+        assert_eq!(method_label(&Method::POST), "POST");
+        assert_eq!(method_label(&Method::OPTIONS), "OPTIONS");
+        let custom = Method::from_bytes(b"ARBITRARY-CLIENT-METHOD").unwrap();
+        assert_eq!(method_label(&custom), "other");
+    }
+
+    #[test]
+    fn script_route_follows_script_type() {
+        let route =
+            |script_type| script_route(script_type, "address/:address", "scripthash/:scripthash");
+        assert_eq!(route("address"), "address/:address");
+        assert_eq!(route("scripthash"), "scripthash/:scripthash");
     }
 
     #[test]

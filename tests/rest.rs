@@ -599,6 +599,97 @@ fn test_rest_package_validation() -> Result<()> {
 }
 
 #[test]
+fn test_rest_request_metrics() -> Result<()> {
+    use std::io::Write;
+
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let txid = tester.send(&addr1, "0.5 BTC".parse().unwrap())?;
+    let blockhash = tester.mine()?;
+
+    let status = |method: &str, path: &str| -> Result<u16> {
+        let url = format!("http://{}{}", rest_addr, path);
+        let resp = match method {
+            "GET" => ureq::get(&url)
+                .config()
+                .http_status_as_error(false)
+                .build()
+                .call()?,
+            _ => ureq::post(&url)
+                .config()
+                .http_status_as_error(false)
+                .build()
+                .send("")?,
+        };
+        Ok(resp.status().as_u16())
+    };
+
+    assert_eq!(status("GET", "/blocks/tip/hash")?, 200);
+    assert_eq!(status("GET", "/blocks/tip/hash")?, 200);
+    assert_eq!(status("GET", &format!("/block/{}", blockhash))?, 200);
+    assert_eq!(status("GET", &format!("/tx/{}/status", txid))?, 200);
+    assert_eq!(status("GET", &format!("/address/{}/txs", addr1))?, 200);
+    assert_eq!(status("GET", "/tx/not-a-txid")?, 400);
+    assert_eq!(status("GET", "/no/such/endpoint")?, 404);
+    assert_eq!(status("POST", "/tx/not-routed")?, 404);
+
+    // A body over the limit is rejected before dispatch. The server may reset the connection
+    // before the client reads the response, so assert on the server-side metric instead. The
+    // stream stays open while polling: closing it would make hyper cancel the request.
+    let mut stream = net::TcpStream::connect(rest_addr)?;
+    let body = vec![b'0'; 1_000_001];
+    let head = format!(
+        "POST /tx HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n",
+        rest_addr,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).ok();
+    stream.write_all(&body).ok();
+    let too_large = ("POST".to_string(), "unknown".to_string(), "413".to_string());
+    for _ in 0..50 {
+        if tester.rest_request_counts().contains_key(&too_large) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    drop(stream);
+
+    let counts = tester.rest_request_counts();
+    let count = |method: &str, route: &str, status: &str| {
+        counts
+            .get(&(method.to_string(), route.to_string(), status.to_string()))
+            .copied()
+            .unwrap_or(0)
+    };
+    assert_eq!(count("GET", "blocks/tip/hash", "200"), 2);
+    assert_eq!(count("GET", "block/:hash", "200"), 1);
+    assert_eq!(count("GET", "tx/:txid/status", "200"), 1);
+    assert_eq!(count("GET", "address/:address/txs", "200"), 1);
+    assert_eq!(count("GET", "tx/:txid", "400"), 1);
+    assert_eq!(count("GET", "unknown", "404"), 1);
+    assert_eq!(count("POST", "unknown", "404"), 1);
+    assert_eq!(count("POST", "unknown", "413"), 1, "counts: {:?}", counts);
+
+    // Path parameters must never leak into labels, or each would create a new series.
+    let (txid, blockhash, addr1) = (txid.to_string(), blockhash.to_string(), addr1.to_string());
+    for (method, route, status) in counts.keys() {
+        for label in [method, route, status] {
+            assert!(
+                !label.contains(&txid) && !label.contains(&blockhash) && !label.contains(&addr1),
+                "path parameter leaked into label='{}'",
+                label
+            );
+        }
+    }
+
+    assert_eq!(tester.gauge_value("rest_requests_in_flight"), 0.0);
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[test]
 fn test_rest_block_status() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
 
