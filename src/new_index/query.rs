@@ -270,7 +270,14 @@ impl Query {
     fn refresh_fee_estimates_if_stale(&self) {
         let _guard = match self.estimates_refresh.try_lock() {
             Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::WouldBlock) => {
+                if self.cached_estimates.read().unwrap().1.is_some() {
+                    return;
+                }
+                self.estimates_refresh
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            }
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
         if let (_, Some(cache_time)) = *self.cached_estimates.read().unwrap() {

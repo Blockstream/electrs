@@ -1,6 +1,14 @@
 use std::net;
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier, Mutex, RwLock};
 use std::thread;
+use std::time::Duration;
+
+use electrs::chain::Network;
+use electrs::config::SensitiveAuth;
+use electrs::metrics::Metrics;
+use electrs::new_index::{ChainQuery, Mempool, Query, Store};
+use serde_json::json;
 
 pub mod common;
 
@@ -36,28 +44,114 @@ fn daemon_rpc_count(metrics_addr: net::SocketAddr, method: &str) -> u64 {
 
 #[test]
 fn test_estimate_fee_refresh_is_single_flight() -> Result<()> {
-    let tester = common::TestRunner::new()?;
-    let query = tester.query();
-    let metrics_addr = tester.metrics_addr();
+    let rpc_count = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&rpc_count);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let rpc = common::MockRpc::new(move |method, params| match method {
+        "getblockchaininfo" => Ok(json!({
+            "chain": "main", "blocks": 0, "headers": 0,
+            "bestblockhash": "00".repeat(32), "pruned": false,
+            "verificationprogress": 1.0, "initialblockdownload": false
+        })),
+        "estimatesmartfee" => {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if params[0] == 1 {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("fee refresh was not released");
+            }
+            Ok(json!({"feerate": 0.00002}))
+        }
+        _ => panic!("unexpected RPC: {}", method),
+    });
+    let dir = tempfile::tempdir()?;
+    let mut config = common::test_config(dir.path().join("db"), dir.path().to_owned(), rpc.addr());
+    config.cookie = Some(SensitiveAuth::new("test:test".to_owned()));
+    config.db_write_buffer_size_mb = 8;
+    #[cfg(not(feature = "liquid"))]
+    {
+        config.network_type = Network::Bitcoin;
+    }
+    #[cfg(feature = "liquid")]
+    {
+        config.network_type = Network::Liquid;
+    }
+    let config = Arc::new(config);
+    let metrics = Metrics::new("127.0.0.1:0".parse().unwrap());
+    let daemon = common::test_daemon(&config, &metrics);
+    let store = Arc::new(Store::open(&config, &metrics, false));
+    let chain = Arc::new(ChainQuery::new(
+        store,
+        Arc::clone(&daemon),
+        &config,
+        &metrics,
+    ));
+    let mempool = Arc::new(RwLock::new(Mempool::new(
+        Arc::clone(&chain),
+        &metrics,
+        Arc::clone(&config),
+    )));
+    let query = Arc::new(Query::new(
+        chain,
+        mempool,
+        daemon,
+        config,
+        #[cfg(feature = "liquid")]
+        None,
+    ));
 
-    let before = daemon_rpc_count(metrics_addr, "estimatesmartfee");
+    let before = rpc_count.load(Ordering::SeqCst);
+    let refreshing = {
+        let query = Arc::clone(&query);
+        thread::spawn(move || query.estimate_fee_map())
+    };
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("fee refresh did not start");
 
-    let barrier = Arc::new(Barrier::new(CONCURRENT_CALLERS));
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let barrier = Arc::new(Barrier::new(CONCURRENT_CALLERS + 1));
     let handles: Vec<_> = (0..CONCURRENT_CALLERS)
-        .map(|_| {
-            let query = query.clone();
+        .map(|i| {
+            let query = Arc::clone(&query);
             let barrier = Arc::clone(&barrier);
+            let completed_tx = completed_tx.clone();
             thread::spawn(move || {
                 barrier.wait();
-                query.estimate_fee_map()
+                let estimate = if i % 2 == 0 {
+                    let estimates = query.estimate_fee_map();
+                    assert_eq!(estimates.len(), 28);
+                    assert!(estimates.values().all(|fee| *fee == 2.0));
+                    estimates.get(&6).copied()
+                } else {
+                    query.estimate_fee(6)
+                };
+                completed_tx.send(()).unwrap();
+                estimate
             })
         })
         .collect();
+    barrier.wait();
+    let early_result = completed_rx.recv_timeout(Duration::from_millis(100));
+    release_tx.send(()).unwrap();
+    assert_eq!(early_result, Err(mpsc::RecvTimeoutError::Timeout));
+
+    let estimates = refreshing.join().expect("initial fee refresh panicked");
+    assert_eq!(estimates.len(), 28);
+    assert!(estimates.values().all(|fee| *fee == 2.0));
     for handle in handles {
-        handle.join().expect("estimate_fee_map panicked");
+        assert_eq!(handle.join().expect("fee estimate panicked"), Some(2.0));
     }
 
-    let after = daemon_rpc_count(metrics_addr, "estimatesmartfee");
+    assert_eq!(query.estimate_fee_map(), estimates);
+    assert_eq!(query.estimate_fee(6), Some(2.0));
+
+    let after = rpc_count.load(Ordering::SeqCst);
 
     assert_eq!(
         after - before,
@@ -66,6 +160,7 @@ fn test_estimate_fee_refresh_is_single_flight() -> Result<()> {
         CONCURRENT_CALLERS,
         after - before
     );
+    rpc.assert_no_panics();
     Ok(())
 }
 
