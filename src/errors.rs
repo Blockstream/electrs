@@ -69,6 +69,12 @@ error_chain! {
             display("Daemon is unavailable: {}", msg)
         }
 
+        // A checkpoint Merkle proof rebuild refused at the "concurrency" or "memory" limit.
+        CheckpointProofBusy(reason: &'static str) {
+            description("Checkpoint Merkle proof rebuild refused")
+            display("checkpoint merkle proof rebuild refused ({} limit reached), try again later", reason)
+        }
+
         PerLineResponseOverflow {
             description("Response line exceeds configured cap")
             display("response line exceeds max_response_bytes")

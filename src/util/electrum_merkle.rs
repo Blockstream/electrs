@@ -37,7 +37,7 @@ impl<'a> RebuildPermit<'a> {
         let mut current = counter.load(Ordering::Relaxed);
         loop {
             if current >= limit {
-                bail!("too many concurrent checkpoint merkle proof rebuilds, try again later");
+                bail!(ErrorKind::CheckpointProofBusy("concurrency"));
             }
             match counter.compare_exchange_weak(
                 current,
@@ -68,7 +68,7 @@ impl<'a> MemoryPermit<'a> {
         let mut current = counter.load(Ordering::Relaxed);
         loop {
             if current > 0 && current.saturating_add(weight_bytes) > limit_bytes {
-                bail!("checkpoint merkle proof rebuild would exceed the configured memory budget, try again later");
+                bail!(ErrorKind::CheckpointProofBusy("memory"));
             }
             match counter.compare_exchange_weak(
                 current,
@@ -1264,7 +1264,13 @@ mod tests {
             permits.push(RebuildPermit::acquire(&counter, LIMIT).unwrap());
         }
 
-        assert!(RebuildPermit::acquire(&counter, LIMIT).is_err());
+        assert!(matches!(
+            RebuildPermit::acquire(&counter, LIMIT)
+                .map(|_| ())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::CheckpointProofBusy("concurrency")
+        ));
 
         permits.pop();
         let extra = RebuildPermit::acquire(&counter, LIMIT).unwrap();
@@ -1418,7 +1424,10 @@ mod tests {
             || panic!("must not rebuild once the memory budget is fully held"),
         );
         assert!(
-            result.is_err(),
+            matches!(
+                result.map(|_| ()).unwrap_err().kind(),
+                ErrorKind::CheckpointProofBusy("memory")
+            ),
             "a third concurrent rebuild must be rejected once the memory budget is exhausted, even with a generous concurrency_limit"
         );
 
