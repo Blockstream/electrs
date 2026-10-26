@@ -103,3 +103,23 @@ scrape_configs:
 $ sudo systemctl restart prometheus
 $ firefox 'http://localhost:9090/graph?g0.range_input=1h&g0.expr=index_height&g0.tab=0'
 ```
+
+### REST request metrics
+
+`rest_request_duration_seconds{method,route,status}` measures server work duration:
+body reading, blocking-pool queueing, and handler execution up to response creation.
+It excludes response transmission. If the service future is dropped before a response
+is ready, a synthetic `status="499"` observation is recorded when its blocking work
+finishes (or immediately if no blocking work remains). This includes shutdown
+cancellation; it does not necessarily mean a client disconnected or received HTTP 499.
+Matched routes are retained, including `block-template`; requests that never reach
+routing use `route="unknown"`.
+
+`rest_requests_in_flight` counts requests with an active service future or unfinished
+request-owned blocking work. It is not a count of live connections or all daemon work:
+shared block-template fetching has its own lifetime beyond individual REST requests.
+
+Latency quantiles aggregated across statuses include synthetic 499 observations and
+therefore include work after disconnects. Work still running has no histogram sample
+yet; monitor the in-flight gauge alongside latency. Filter by status when comparing
+completed-response latency separately from cancelled work.
