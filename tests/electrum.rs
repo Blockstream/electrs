@@ -212,8 +212,7 @@ fn test_electrum_raw() {
     assert_eq!(s, expected);
 }
 
-#[cfg_attr(not(feature = "liquid"), test)]
-#[cfg_attr(feature = "liquid", allow(dead_code))]
+#[test]
 fn test_electrum_server_features_without_public_hosts() {
     // Electrum >= 4.7.0 calls server.features on connect, so it must answer
     // even when peer discovery is off (no --electrum-public-hosts). See #229.
@@ -233,6 +232,7 @@ fn test_electrum_server_features_without_public_hosts() {
     );
 
     let features = &reply["result"];
+    assert_eq!(features["hosts"], serde_json::json!({}));
     assert_eq!(features["server_version"], "electrs-esplora 0.4.1");
     assert_eq!(features["hash_function"], "sha256");
 
@@ -248,6 +248,12 @@ fn test_electrum_server_features_without_public_hosts() {
         .to_byte_array();
     genesis_bytes.reverse();
     let expected = genesis_bytes.to_lower_hex_string();
+    #[cfg(feature = "liquid")]
+    assert_ne!(
+        expected,
+        "0".repeat(64),
+        "Elements genesis must differ from the hardcoded placeholder"
+    );
     assert_eq!(
         features["genesis_hash"].as_str(),
         Some(expected.as_str()),

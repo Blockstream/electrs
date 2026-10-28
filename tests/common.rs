@@ -658,6 +658,10 @@ pub fn test_config(
         initial_sync_batch_size: 250,
         db_cache_index_filter_blocks: false,
         electrum_public_hosts: None,
+        #[cfg(feature = "electrum-discovery")]
+        electrum_announce: false,
+        #[cfg(feature = "electrum-discovery")]
+        tor_proxy: None,
     }
 }
 
