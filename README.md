@@ -46,7 +46,7 @@ but instead queried from bitcoind on demand.
 
 - Extended indexes and database storage for improved performance under high load:
 
-  - A full transaction store mapping txids to raw transactions is kept in the database under the prefix `t`.
+  - A full transaction store mapping txids to raw transactions is kept in the database under the prefix `T`.
   - An index of all spendable transaction outputs is kept under the prefix `O`.
   - An index of all addresses (encoded as string) is kept under the prefix `a` to enable by-prefix address search.
   - A map of blockhash to txids is kept in the database under the prefix `X`.
