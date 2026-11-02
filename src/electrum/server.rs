@@ -23,7 +23,9 @@ use crate::electrum::response::{
 };
 use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
-use crate::metrics::{Counter, Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
+use crate::metrics::{
+    Counter, CounterVec, Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics,
+};
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
 use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
@@ -97,6 +99,7 @@ fn jsonrpc_code(e: &Error) -> JsonRpcV2Error {
         ErrorKind::RpcError(..) | ErrorKind::DaemonBusy(_) | ErrorKind::DaemonUnavailable(_) => {
             JsonRpcV2Error::DaemonError
         }
+        ErrorKind::CheckpointProofBusy(_) => JsonRpcV2Error::DaemonError,
         _ => JsonRpcV2Error::InternalError,
     }
 }
@@ -642,6 +645,12 @@ impl Connection {
         Ok(match result {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err(e) => {
+                if let ErrorKind::CheckpointProofBusy(reason) = e.kind() {
+                    self.stats
+                        .checkpoint_proof_rejects
+                        .with_label_values(&[reason])
+                        .inc();
+                }
                 warn!(
                     "rpc #{} {} {:?} failed: {}",
                     id,
@@ -1141,6 +1150,7 @@ struct Stats {
     per_line_overflows: Counter,
     global_overflows: Counter,
     client_write_timeouts: Counter,
+    checkpoint_proof_rejects: CounterVec,
 }
 
 impl RPC {
@@ -1245,9 +1255,20 @@ impl RPC {
                 "electrum_client_write_timeouts_total",
                 "Connections closed because a client response write timed out",
             )),
+            checkpoint_proof_rejects: metrics.counter_vec(
+                MetricOpts::new(
+                    "electrum_checkpoint_proof_rejections_total",
+                    "Checkpoint Merkle proof rebuilds refused (by limit reached)",
+                ),
+                &["reason"],
+            ),
         });
         stats.clients.set(0);
         stats.subscriptions.set(0);
+        // Export both reason series at 0 so rate() and alerts see them before the first rejection.
+        for reason in ["concurrency", "memory"] {
+            stats.checkpoint_proof_rejects.with_label_values(&[reason]);
+        }
 
         let notification = Channel::unbounded();
 
@@ -1475,6 +1496,15 @@ mod tests {
         let error = ErrorKind::TooManySubscriptions(4).into();
         assert!(jsonrpc_code(&error) == JsonRpcV2Error::BadRequest);
         assert_eq!(jsonrpc_code(&error).into_i16(), 1);
+    }
+
+    #[test]
+    fn checkpoint_proof_busy_is_a_daemon_error() {
+        for reason in ["concurrency", "memory"] {
+            let error = ErrorKind::CheckpointProofBusy(reason).into();
+            assert!(jsonrpc_code(&error) == JsonRpcV2Error::DaemonError);
+            assert_eq!(jsonrpc_code(&error).into_i16(), 2);
+        }
     }
 
     #[test]
