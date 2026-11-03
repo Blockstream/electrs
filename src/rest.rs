@@ -5,7 +5,7 @@ use crate::chain::{
 use crate::config::Config;
 use crate::errors;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
-use crate::new_index::{compute_script_hash, Mempool, Query, SpendingInput, Utxo};
+use crate::new_index::{compute_script_hash, Mempool, Query, SpendingInput, Utxo, MAX_PACKAGE_TXS};
 #[cfg(feature = "liquid")]
 use crate::new_index::{AssetLookup, AssetRegistryStatus};
 #[cfg(feature = "liquid")]
@@ -1688,10 +1688,14 @@ fn handle_blocking_request(
             let txhexes: Vec<String> =
                 serde_json::from_str(String::from_utf8(body.to_vec())?.as_str())?;
 
-            if txhexes.len() > 25 {
-                Result::Err(HttpError::from(
-                    "Exceeded maximum of 25 transactions".to_string(),
-                ))?
+            // Query::submit_package() enforces this too; checking here first keeps the
+            // descriptive message (its error is mapped to a generic description below) and
+            // skips the per-item pre-checks for oversized packages.
+            if txhexes.len() > MAX_PACKAGE_TXS {
+                Result::Err(HttpError::from(format!(
+                    "Exceeded maximum of {} transactions",
+                    MAX_PACKAGE_TXS
+                )))?
             }
 
             let maxfeerate = query_params

@@ -420,6 +420,68 @@ fn test_electrum_broadcast_package() -> Result<()> {
     Ok(())
 }
 
+/// blockchain.transaction.broadcast_package must enforce bitcoind's 25-tx submitpackage limit
+/// locally: a 25-tx package is forwarded to the daemon, a 26-tx package is rejected with an
+/// invalid-params error before the daemon is consulted.
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_electrum_broadcast_package_tx_limit() -> Result<()> {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let (_electrum_server, electrum_addr, mut tester) = common::init_electrum_tester()?;
+
+    let addr = tester.newaddress()?;
+    let txid = tester.send(&addr, "0.1 BTC".parse().unwrap())?;
+    let tx_hex = serialize_hex(&tester.get_raw_transaction(txid)?);
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    let broadcast = |stream: &mut TcpStream, count: usize, id: u32| {
+        let txs = vec![tx_hex.clone(); count];
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.transaction.broadcast_package",
+            "params": [txs],
+            "id": id,
+        });
+        let s = write_and_read(stream, &req.to_string());
+        let v: electrumd::jsonrpc::serde_json::Value =
+            electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+        (s, v)
+    };
+
+    // At the limit: forwarded to bitcoind. The duplicated tx makes bitcoind reject the package,
+    // so a daemon error (not the local invalid-params limit error) proves it got through.
+    let (s, v) = broadcast(&mut stream, 25, 1);
+    assert_eq!(
+        v["error"]["code"].as_i64(),
+        Some(2),
+        "unexpected response: {}",
+        s
+    );
+    assert!(
+        !s.contains("Exceeded maximum"),
+        "25-tx package hit the local limit: {}",
+        s
+    );
+
+    // Over the limit: rejected locally with invalid params.
+    let (s, v) = broadcast(&mut stream, 26, 2);
+    assert_eq!(
+        v["error"]["code"].as_i64(),
+        Some(-32602),
+        "unexpected response: {}",
+        s
+    );
+    assert_eq!(
+        v["error"]["message"].as_str(),
+        Some("Exceeded maximum of 25 transactions"),
+        "unexpected response: {}",
+        s
+    );
+
+    Ok(())
+}
+
 /// Regression test: a package broadcast must add accepted txs to electrs' local mempool, so a
 /// subscribed/queried scripthash sees them immediately (not only after the next background sync).
 #[cfg(not(feature = "liquid"))]

@@ -26,6 +26,12 @@ use crate::{
 
 const FEE_ESTIMATES_TTL: u64 = 60; // seconds
 
+/// Maximum number of transactions accepted in a single package submission, matching Bitcoin
+/// Core's `submitpackage` limit (MAX_PACKAGE_COUNT). Enforced here so every entry point (REST
+/// `/txs/package`, Electrum `blockchain.transaction.broadcast_package`) rejects oversized
+/// packages locally, before anything is forwarded to the daemon.
+pub const MAX_PACKAGE_TXS: usize = 25;
+
 const CONF_TARGETS: [u16; 28] = [
     1u16, 2u16, 3u16, 4u16, 5u16, 6u16, 7u16, 8u16, 9u16, 10u16, 11u16, 12u16, 13u16, 14u16, 15u16,
     16u16, 17u16, 18u16, 19u16, 20u16, 21u16, 22u16, 23u16, 24u16, 25u16, 144u16, 504u16, 1008u16,
@@ -139,6 +145,13 @@ impl Query {
         maxfeerate: Option<f64>,
         maxburnamount: Option<f64>,
     ) -> Result<SubmitPackageResult> {
+        ensure!(
+            txhex.len() <= MAX_PACKAGE_TXS,
+            ErrorKind::InvalidParams(format!(
+                "Exceeded maximum of {} transactions",
+                MAX_PACKAGE_TXS
+            ))
+        );
         let result = self
             .daemon
             .submit_package(txhex.clone(), maxfeerate, maxburnamount)?;
