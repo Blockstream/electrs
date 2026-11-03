@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Once, RwLock};
 use std::{env, net, thread};
@@ -424,6 +425,41 @@ impl TestRunner {
             .map(|metric| metric.get_counter().value())
             .sum()
     }
+
+    pub fn gauge_value(&self, name: &str) -> f64 {
+        self.metrics
+            .gather()
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(|family| family.get_metric())
+            .map(|metric| metric.get_gauge().value())
+            .sum()
+    }
+
+    /// Number of observations of each `rest_request_duration_seconds` series, keyed by its
+    /// (method, route, status) labels.
+    pub fn rest_request_counts(&self) -> HashMap<(String, String, String), u64> {
+        self.metrics
+            .gather()
+            .iter()
+            .filter(|family| family.name() == "rest_request_duration_seconds")
+            .flat_map(|family| family.get_metric())
+            .map(|metric| {
+                let label = |name: &str| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .find(|label| label.name() == name)
+                        .map(|label| label.value().to_string())
+                        .unwrap_or_default()
+                };
+                (
+                    (label("method"), label("route"), label("status")),
+                    metric.get_histogram().get_sample_count(),
+                )
+            })
+            .collect()
+    }
 }
 
 pub fn init_rest_tester() -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
@@ -434,7 +470,11 @@ pub fn init_rest_tester_with(
 ) -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
     let tester = TestRunner::new_with(configure)?;
     let addr = tester.config.http_addr;
-    let rest_server = rest::start(Arc::clone(&tester.config), Arc::clone(&tester.query));
+    let rest_server = rest::start(
+        Arc::clone(&tester.config),
+        Arc::clone(&tester.query),
+        &tester.metrics,
+    );
     wait_for_tcp(addr, "REST");
     Ok((rest_server, addr, tester))
 }
