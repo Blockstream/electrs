@@ -38,7 +38,6 @@
               LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
               ELEMENTSD_SKIP_DOWNLOAD = true;
               BITCOIND_SKIP_DOWNLOAD = true;
-              ELECTRUMD_SKIP_DOWNLOAD = true;
 
               # link rocksdb dynamically
               ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
@@ -47,7 +46,6 @@
               # for integration testing
               BITCOIND_EXE = "${pkgs.bitcoind}/bin/bitcoind";
               ELEMENTSD_EXE = "${pkgs.elementsd}/bin/elementsd";
-              ELECTRUMD_EXE = "${pkgs.electrum}/bin/electrum";
             };
 
           commonArgs = {

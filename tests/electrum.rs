@@ -4,130 +4,129 @@ use std::net::TcpStream;
 
 use common::Result;
 
-use electrumd::jsonrpc::serde_json::json;
-use electrumd::ElectrumD;
-
-use electrs::chain::Address;
-use electrs::electrum::RPC as ElectrumRPC;
+#[cfg(not(feature = "liquid"))]
+use serde_json::json;
 
 #[cfg(not(feature = "liquid"))]
-use bitcoin::address;
-#[cfg(feature = "liquid")]
-use elementsd::bitcoincore_rpc::RpcApi;
+use bdk_electrum::{electrum_client, BdkElectrumClient};
+#[cfg(not(feature = "liquid"))]
+use bdk_wallet::{KeychainKind, SignOptions, Wallet};
+#[cfg(not(feature = "liquid"))]
+use bitcoin::{bip32::Xpriv, Amount, Network, Txid};
 
+#[cfg(not(feature = "liquid"))]
+use electrs::chain::Address;
+#[cfg(not(feature = "liquid"))]
+use electrs::electrum::RPC as ElectrumRPC;
+
+/// An in-process BDK wallet synced through the electrs Electrum server under test.
+#[cfg(not(feature = "liquid"))]
 struct WalletTester {
-    electrum_server: ElectrumRPC,
-    electrum_wallet: ElectrumD,
+    _electrum_server: ElectrumRPC,
+    client: BdkElectrumClient<electrum_client::Client>,
+    wallet: Wallet,
+    xprv: Xpriv,
     tester: common::TestRunner,
 }
 
+#[cfg(not(feature = "liquid"))]
 impl WalletTester {
     fn new() -> Result<Self> {
-        let (electrum_server, electrum_addr, tester) = common::init_electrum_tester().unwrap();
+        let (electrum_server, electrum_addr, tester) = common::init_electrum_tester()?;
 
-        let mut electrum_wallet_conf = electrumd::Conf::default();
-        let server_arg = format!("{}:t", electrum_addr);
-        electrum_wallet_conf.args = if std::env::var_os("RUST_LOG").is_some() {
-            vec!["-v", "--server", &server_arg]
-        } else {
-            vec!["--server", &server_arg]
-        };
-        electrum_wallet_conf.view_stdout = true;
-        let electrum_wallet = ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
+        // Deterministic test keys, regtest only.
+        let xprv = Xpriv::new_master(Network::Regtest, &[42u8; 32]).unwrap();
+        let wallet = Wallet::create(
+            format!("wpkh({}/84'/1'/0'/0/*)", xprv),
+            format!("wpkh({}/84'/1'/0'/1/*)", xprv),
+        )
+        .network(Network::Regtest)
+        .create_wallet_no_persist()
+        .expect("valid descriptors");
 
-        log::info!(
-            "Electrum wallet version: {:?}",
-            electrum_wallet.call("version", &json!([]))?
-        );
+        let client = electrum_client::Client::new(&format!("tcp://{}", electrum_addr))
+            .expect("connect to electrs");
+        let client = BdkElectrumClient::new(client);
 
         Ok(WalletTester {
-            electrum_server,
-            electrum_wallet,
+            _electrum_server: electrum_server,
+            client,
+            wallet,
+            xprv,
             tester,
         })
     }
 
-    fn notify_wallet(&self) {
-        self.electrum_server.notify();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        self.electrum_wallet
-            .call("wait_for_sync", &json!([]))
-            .unwrap();
+    /// Scan the wallet's scripts through electrs and apply the result.
+    fn sync_wallet(&mut self) {
+        let request = self.wallet.start_full_scan().build();
+        let update = self
+            .client
+            .full_scan(request, 10, 5, true)
+            .expect("full scan through electrs");
+        self.wallet.apply_update(update).expect("apply update");
     }
 
-    fn assert_balance(&self, confirmed: f64, unconfirmed: f64) {
-        let balance = self.electrum_wallet.call("getbalance", &json!([])).unwrap();
+    /// Assert the wallet's confirmed and unconfirmed balances, in sats.
+    fn assert_balance(&self, confirmed: u64, unconfirmed: u64) {
+        let balance = self.wallet.balance();
         log::info!("balance: {}", balance);
-
+        assert_eq!(balance.confirmed.to_sat(), confirmed, "confirmed balance");
         assert_eq!(
-            balance["confirmed"].as_str(),
-            Some(confirmed.to_string().as_str())
+            (balance.trusted_pending + balance.untrusted_pending).to_sat(),
+            unconfirmed,
+            "unconfirmed balance"
         );
-        if unconfirmed != 0.0 {
-            assert_eq!(
-                balance["unconfirmed"].as_str(),
-                Some(unconfirmed.to_string().as_str())
-            );
-        } else {
-            assert!(balance["unconfirmed"].is_null())
-        }
+        assert_eq!(balance.immature.to_sat(), 0);
     }
 
-    fn newaddress(&self) -> Address {
-        #[cfg(not(feature = "liquid"))]
-        type ParseAddrType = Address<address::NetworkUnchecked>;
-        #[cfg(feature = "liquid")]
-        type ParseAddrType = Address;
+    fn newaddress(&mut self) -> Address {
+        self.wallet
+            .reveal_next_address(KeychainKind::External)
+            .address
+    }
 
-        let addr = self
-            .electrum_wallet
-            .call("createnewaddress", &json!([]))
-            .unwrap()
-            .as_str()
-            .expect("missing address")
-            .parse::<ParseAddrType>()
-            .expect("invalid address");
-
-        #[cfg(not(feature = "liquid"))]
-        let addr = addr.assume_checked();
-
-        addr
+    /// Height of the block that confirmed `txid` according to the synced wallet.
+    fn confirmation_height(&self, txid: Txid) -> Option<u32> {
+        let tx = self.wallet.get_tx(txid).expect("tx known to the wallet");
+        tx.chain_position.confirmation_height_upper_bound()
     }
 }
 
 /// Test balance tracking with confirmed and unconfirmed transactions
-#[cfg_attr(not(feature = "liquid"), test)]
-#[cfg_attr(feature = "liquid", allow(dead_code))]
+#[cfg(not(feature = "liquid"))]
+#[test]
 fn test_electrum_balance() -> Result<()> {
     let mut wt = WalletTester::new()?;
 
     let addr1 = wt.newaddress();
     let addr2 = wt.newaddress();
 
-    wt.assert_balance(0.0, 0.0);
+    wt.sync_wallet();
+    wt.assert_balance(0, 0);
 
     wt.tester.send(&addr1, "0.1 BTC".parse().unwrap())?;
-    wt.notify_wallet();
-    wt.assert_balance(0.0, 0.1);
+    wt.sync_wallet();
+    wt.assert_balance(0, 10_000_000);
 
     wt.tester.mine()?;
-    wt.notify_wallet();
-    wt.assert_balance(0.1, 0.0);
+    wt.sync_wallet();
+    wt.assert_balance(10_000_000, 0);
 
     wt.tester.send(&addr2, "0.2 BTC".parse().unwrap())?;
-    wt.notify_wallet();
-    wt.assert_balance(0.1, 0.2);
+    wt.sync_wallet();
+    wt.assert_balance(10_000_000, 20_000_000);
 
     wt.tester.mine()?;
-    wt.notify_wallet();
-    wt.assert_balance(0.3, 0.0);
+    wt.sync_wallet();
+    wt.assert_balance(30_000_000, 0);
 
     Ok(())
 }
 
-/// Test transaction history via onchain_history
-#[cfg_attr(not(feature = "liquid"), test)]
-#[cfg_attr(feature = "liquid", allow(dead_code))]
+/// Test transaction history and confirmation heights
+#[cfg(not(feature = "liquid"))]
+#[test]
 fn test_electrum_history() -> Result<()> {
     let mut wt = WalletTester::new()?;
 
@@ -138,56 +137,137 @@ fn test_electrum_history() -> Result<()> {
     wt.tester.mine()?;
     let txid2 = wt.tester.send(&addr2, "0.2 BTC".parse().unwrap())?;
     wt.tester.mine()?;
-    wt.notify_wallet();
+    wt.sync_wallet();
 
-    let history = wt.electrum_wallet.call("onchain_history", &json!([]))?;
-    log::debug!("history = {:#?}", history);
-    assert_eq!(
-        history[0]["txid"].as_str(),
-        Some(txid1.to_string().as_str())
-    );
-    assert_eq!(history[0]["height"].as_u64(), Some(102));
-    assert_eq!(history[0]["bc_value"].as_str(), Some("0.1"));
+    assert_eq!(wt.wallet.transactions().count(), 2);
 
+    assert_eq!(wt.confirmation_height(txid1), Some(102));
+    let tx1 = wt.wallet.get_tx(txid1).unwrap().tx_node.tx;
     assert_eq!(
-        history[1]["txid"].as_str(),
-        Some(txid2.to_string().as_str())
+        wt.wallet.sent_and_received(&tx1).1,
+        Amount::from_sat(10_000_000)
     );
-    assert_eq!(history[1]["height"].as_u64(), Some(103));
-    assert_eq!(history[1]["bc_value"].as_str(), Some("0.2"));
+
+    assert_eq!(wt.confirmation_height(txid2), Some(103));
+    let tx2 = wt.wallet.get_tx(txid2).unwrap().tx_node.tx;
+    assert_eq!(
+        wt.wallet.sent_and_received(&tx2).1,
+        Amount::from_sat(20_000_000)
+    );
 
     Ok(())
 }
 
-/// Test sending an outgoing payment
-#[cfg_attr(not(feature = "liquid"), test)]
-#[cfg_attr(feature = "liquid", allow(dead_code))]
+/// Test signing an outgoing payment and broadcasting it through electrs
+#[cfg(not(feature = "liquid"))]
+#[test]
 fn test_electrum_payment() -> Result<()> {
     let mut wt = WalletTester::new()?;
 
     let addr1 = wt.newaddress();
     wt.tester.send(&addr1, "0.3 BTC".parse().unwrap())?;
     wt.tester.mine()?;
-    wt.notify_wallet();
-    wt.assert_balance(0.3, 0.0);
+    wt.sync_wallet();
+    wt.assert_balance(30_000_000, 0);
 
-    wt.electrum_wallet.call(
-        "broadcast",
-        &json!([wt.electrum_wallet.call(
-            "payto",
-            &json!({
-                "destination": wt.tester.node_client().get_new_address(None, None)?,
-                "amount": 0.16,
-                "fee": 0.001,
-            }),
-        )?]),
-    )?;
-    wt.notify_wallet();
-    wt.assert_balance(0.139, 0.0);
+    let destination = wt.tester.node_client().new_address()?;
+    let mut builder = wt.wallet.build_tx();
+    builder
+        .add_recipient(destination.script_pubkey(), Amount::from_sat(16_000_000))
+        .fee_absolute(Amount::from_sat(100_000));
+    let mut psbt = builder.finish().expect("build payment");
+    psbt.sign(&wt.xprv, wt.wallet.secp_ctx())
+        .expect("sign payment");
+    assert!(wt
+        .wallet
+        .finalize_psbt(&mut psbt, SignOptions::default())
+        .expect("finalize payment"));
+    let tx = psbt.extract_tx().expect("extract signed tx");
+
+    let txid = wt.client.transaction_broadcast(&tx).expect("broadcast");
+    assert_eq!(txid, tx.compute_txid());
+    assert!(wt
+        .tester
+        .node_client()
+        .get_raw_mempool()?
+        .0
+        .contains(&txid.to_string()));
+
+    // The change output (0.3 - 0.16 - 0.001 fee) is unconfirmed until mined.
+    wt.tester.sync()?;
+    wt.sync_wallet();
+    assert_eq!(
+        wt.wallet.calculate_fee(&tx).unwrap(),
+        Amount::from_sat(100_000)
+    );
+    wt.assert_balance(0, 13_900_000);
 
     wt.tester.mine()?;
-    wt.notify_wallet();
-    wt.assert_balance(0.139, 0.0);
+    wt.sync_wallet();
+    wt.assert_balance(13_900_000, 0);
+    assert!(wt.confirmation_height(txid).is_some());
+
+    Ok(())
+}
+
+/// BDK syncs by polling, so cover the server's subscription push path over a raw socket:
+/// `blockchain.headers.subscribe` and `blockchain.scripthash.subscribe` notifications.
+#[cfg(not(feature = "liquid"))]
+#[test]
+fn test_electrum_subscription_notifications() -> Result<()> {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::hex::DisplayHex;
+
+    let (electrum_server, electrum_addr, mut tester) = common::init_electrum_tester()?;
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let parse = |s: &str| -> serde_json::Value { serde_json::from_str(s).unwrap() };
+
+    let reply = parse(&write_and_read(
+        &mut stream,
+        "{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.headers.subscribe\", \"params\": [], \"id\": 1}",
+    ));
+    let tip_height = reply["result"]["height"].as_u64().unwrap();
+    assert_eq!(tip_height, tester.get_block_count()?);
+
+    let addr = tester.newaddress()?;
+    let mut hash = sha256::Hash::hash(addr.script_pubkey().as_bytes()).to_byte_array();
+    hash.reverse();
+    let scripthash = hash.to_lower_hex_string();
+
+    let reply = parse(&write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.scripthash.subscribe\", \"params\": [\"{}\"], \"id\": 2}}",
+            scripthash
+        ),
+    ));
+    assert!(reply["result"].is_null(), "unused script has no status");
+
+    // A mempool tx changes the script's status.
+    tester.send(&addr, "0.1 BTC".parse().unwrap())?;
+    electrum_server.notify();
+    let note = parse(&read_line(&mut stream));
+    assert_eq!(note["method"], "blockchain.scripthash.subscribe");
+    assert_eq!(note["params"][0], scripthash.as_str());
+    let mempool_status = note["params"][1].as_str().unwrap().to_string();
+
+    // Mining it pushes a new header and a new (confirmed) status.
+    tester.mine()?;
+    electrum_server.notify();
+    let mut notes: Vec<serde_json::Value> =
+        (0..2).map(|_| parse(&read_line(&mut stream))).collect();
+    notes.sort_by_key(|n| n["method"].as_str().unwrap().to_string());
+    assert_eq!(notes[0]["method"], "blockchain.headers.subscribe");
+    assert_eq!(
+        notes[0]["params"][0]["height"].as_u64(),
+        Some(tip_height + 1)
+    );
+    assert_eq!(notes[1]["method"], "blockchain.scripthash.subscribe");
+    assert_eq!(notes[1]["params"][0], scripthash.as_str());
+    assert_ne!(notes[1]["params"][1].as_str().unwrap(), mempool_status);
 
     Ok(())
 }
@@ -223,8 +303,7 @@ fn test_electrum_server_features_without_public_hosts() {
         &mut stream,
         "{\"jsonrpc\": \"2.0\", \"method\": \"server.features\", \"params\": [], \"id\": 1}",
     );
-    let reply: electrumd::jsonrpc::serde_json::Value =
-        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    let reply: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert!(
         reply.get("error").is_none(),
         "server.features errored: {}",
@@ -348,8 +427,7 @@ fn test_electrum_scripthash_get_mempool() -> Result<()> {
     let txid = tester.send(&addr, "0.1 BTC".parse().unwrap())?;
 
     let s = write_and_read(&mut stream, &request(2));
-    let v: electrumd::jsonrpc::serde_json::Value =
-        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
     let entries = v["result"].as_array().expect("result array");
     assert_eq!(entries.len(), 1);
     assert_eq!(
@@ -391,8 +469,7 @@ fn test_electrum_broadcast_package() -> Result<()> {
             tx_hex
         ),
     );
-    let v: electrumd::jsonrpc::serde_json::Value =
-        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert_eq!(
         v["result"]["success"].as_bool(),
         Some(true),
@@ -408,8 +485,7 @@ fn test_electrum_broadcast_package() -> Result<()> {
             tx_hex
         ),
     );
-    let v: electrumd::jsonrpc::serde_json::Value =
-        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert_eq!(
         v["result"]["package_msg"].as_str(),
         Some("success"),
@@ -458,8 +534,7 @@ fn test_electrum_broadcast_package_updates_mempool() -> Result<()> {
                 scripthash, id
             ),
         );
-        let v: electrumd::jsonrpc::serde_json::Value =
-            electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         v["result"]
             .as_array()
             .expect("result array")
@@ -482,8 +557,7 @@ fn test_electrum_broadcast_package_updates_mempool() -> Result<()> {
             tx_hex
         ),
     );
-    let v: electrumd::jsonrpc::serde_json::Value =
-        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert_eq!(
         v["result"]["success"].as_bool(),
         Some(true),
@@ -560,9 +634,7 @@ fn test_electrum_checkpoint_proofs() -> Result<()> {
     let expected_root = checkpoint::merkle_root(leaves.clone());
 
     let mut stream = TcpStream::connect(electrum_addr).unwrap();
-    let parse = |s: &str| -> electrumd::jsonrpc::serde_json::Value {
-        electrumd::jsonrpc::serde_json::from_str(s).unwrap()
-    };
+    let parse = |s: &str| -> serde_json::Value { serde_json::from_str(s).unwrap() };
 
     let height = 5usize;
     let v = parse(&write_and_read(
@@ -689,9 +761,7 @@ fn test_electrum_checkpoint_proof_reorg_consistency() -> Result<()> {
     let height = 3usize;
 
     let mut stream = TcpStream::connect(electrum_addr).unwrap();
-    let parse = |s: &str| -> electrumd::jsonrpc::serde_json::Value {
-        electrumd::jsonrpc::serde_json::from_str(s).unwrap()
-    };
+    let parse = |s: &str| -> serde_json::Value { serde_json::from_str(s).unwrap() };
     let request = |stream: &mut TcpStream, id: u32| {
         write_and_read(
             stream,
@@ -706,7 +776,7 @@ fn test_electrum_checkpoint_proof_reorg_consistency() -> Result<()> {
     let old_root = sha256d::Hash::from_str(v["result"]["root"].as_str().expect("root")).unwrap();
 
     let old_tip_hash = tester.get_block_hash(tip as u64)?;
-    let _: electrumd::jsonrpc::serde_json::Value = tester
+    let _: serde_json::Value = tester
         .node_client()
         .call("invalidateblock", &[json!(old_tip_hash.to_string())])?;
     tester.mine()?;
@@ -758,6 +828,10 @@ fn write_and_read(stream: &mut TcpStream, write: &str) -> String {
     stream.write_all(write.as_bytes()).unwrap();
     stream.write(b"\n").unwrap();
     stream.flush().unwrap();
+    read_line(stream)
+}
+
+fn read_line(stream: &mut TcpStream) -> String {
     let mut result = vec![];
     loop {
         let mut buf = [0u8];
