@@ -40,6 +40,11 @@ lazy_static! {
     static ref DAEMON_WRITE_TIMEOUT: Duration = Duration::from_secs(
         env::var("DAEMON_WRITE_TIMEOUT").map_or(10 * 60, |s| s.parse().unwrap())
     );
+    // Past bitcoind's -rpcmaxconnections cap the TCP connect still succeeds and the first
+    // request waits out DAEMON_READ_TIMEOUT. See `Connection::handshake`.
+    static ref DAEMON_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(
+        env::var("DAEMON_HANDSHAKE_TIMEOUT").map_or(10, |s| s.parse().unwrap())
+    );
     // Minimum delay between *failed* proactive max-age recycle attempts, so that a sustained
     // inability to open new connections doesn't make every request pay a connect timeout.
     static ref DAEMON_CONN_RECYCLE_COOLDOWN: Duration = Duration::from_secs(
@@ -89,6 +94,13 @@ const MAX_ATTEMPTS: u32 = 5;
 const RETRY_WAIT_DURATION: Duration = Duration::from_secs(1);
 const RECONNECT_RETRY_WAIT_DURATION: Duration = Duration::from_secs(3);
 const BLOCK_TEMPLATE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+// estimatesmartfee accepts options.fee_rate_estimator from 32.1, older versions reject it.
+#[cfg(not(feature = "liquid"))]
+const FEE_RATE_ESTIMATOR_MIN_VERSION: u64 = 32_01_00;
+
+// uptime takes no locks, so it answers even while cs_main is held.
+const HANDSHAKE_REQUEST: &str = r#"{"method":"uptime","params":[],"id":0}"#;
 
 fn retry_reconnect_with_backoff<T, F, W>(mut reconnect: F, mut wait: W) -> Result<T>
 where
@@ -298,6 +310,7 @@ struct ConnectionConfig {
     cookie_getter: Arc<dyn CookieGetter>,
     signal: Waiter,
     max_age: Option<Duration>,
+    handshakes: CounterVec,
 }
 
 impl ConnectionConfig {
@@ -308,10 +321,17 @@ impl ConnectionConfig {
             Arc::clone(&self.cookie_getter),
             self.signal.clone(),
             self.max_age,
+            self.handshakes.clone(),
         )
     }
 
     fn connect_once(&self, io_timeout: Duration) -> Result<Connection> {
+        let mut conn = self.connect_once_unchecked(io_timeout)?;
+        conn.handshake()?;
+        Ok(conn)
+    }
+
+    fn connect_once_unchecked(&self, io_timeout: Duration) -> Result<Connection> {
         let (conn, active_addr) = tcp_connect_once(self.addr, self.fallback)?;
         conn.set_read_timeout(Some(io_timeout))
             .chain_err(|| "failed to configure one-shot daemon read timeout")?;
@@ -325,6 +345,7 @@ impl ConnectionConfig {
             Arc::clone(&self.cookie_getter),
             self.signal.clone(),
             None, // a one-shot connection never needs proactive recycling
+            self.handshakes.clone(),
         )
     }
 }
@@ -351,6 +372,9 @@ struct Connection {
     // only bounds a single read syscall, so a peer that keeps trickling bytes resets it
     // indefinitely and pins the calling thread.
     recv_budget: Duration,
+    handshakes: CounterVec,
+    #[cfg(not(feature = "liquid"))]
+    fee_rate_estimator_supported: Option<bool>,
 }
 
 fn configure_stream(conn: &TcpStream) {
@@ -599,20 +623,39 @@ impl Connection {
         cookie_getter: Arc<dyn CookieGetter>,
         signal: Waiter,
         max_age: Option<Duration>,
+        handshakes: CounterVec,
     ) -> Result<Connection> {
-        let (conn, active_addr) = tcp_connect(addr, fallback, &signal)?;
-        Connection::from_stream(
-            conn,
-            active_addr,
-            addr,
-            fallback,
-            cookie_getter,
-            signal,
-            max_age,
-        )
+        loop {
+            let (conn, active_addr) = tcp_connect(addr, fallback, &signal)?;
+            let mut connection = Connection::from_stream(
+                conn,
+                active_addr,
+                addr,
+                fallback,
+                Arc::clone(&cookie_getter),
+                signal.clone(),
+                max_age,
+                handshakes.clone(),
+            )?;
+            match connection.handshake() {
+                Ok(()) => return Ok(connection),
+                Err(e @ Error(ErrorKind::Connection(_), _)) => {
+                    // Close it so it does not hold a place in the accept queue while we back off.
+                    drop(connection);
+                    warn!(
+                        "{}; backoff {:?} before next attempt",
+                        e.display_chain(),
+                        RECONNECT_RETRY_WAIT_DURATION
+                    );
+                    signal.wait(RECONNECT_RETRY_WAIT_DURATION, false)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Build a `Connection` wrapper around an already-established TCP stream.
+    #[allow(clippy::too_many_arguments)]
     fn from_stream(
         conn: TcpStream,
         active_addr: SocketAddr,
@@ -621,6 +664,7 @@ impl Connection {
         cookie_getter: Arc<dyn CookieGetter>,
         signal: Waiter,
         max_age: Option<Duration>,
+        handshakes: CounterVec,
     ) -> Result<Connection> {
         debug!("connected to bitcoind at {}", active_addr);
         let reader = BufReader::new(
@@ -646,7 +690,67 @@ impl Connection {
             max_age,
             last_recycle_attempt: None,
             recv_budget,
+            handshakes,
+            #[cfg(not(feature = "liquid"))]
+            fee_rate_estimator_supported: None,
         })
+    }
+
+    /// Confirm the daemon is serving a newly opened connection. Any complete HTTP response
+    /// passes, including warmup and empty 401/403 rejections, so the real request still
+    /// reports them.
+    fn handshake(&mut self) -> Result<()> {
+        let budget = (*DAEMON_HANDSHAKE_TIMEOUT).min(self.recv_budget);
+        let deadline = Instant::now() + budget;
+        let result = self
+            .send(HANDSHAKE_REQUEST)
+            .and_then(|()| self.read_response_by(deadline));
+
+        match result {
+            Ok(response) if response.is_jsonrpc_reply() => {
+                self.handshakes.with_label_values(&["ok"]).inc();
+                Ok(())
+            }
+            // Served but refused (e.g. 401 bad cookie, 403 -rpcwhitelist). Counted apart
+            // from "ok" so a misconfigured daemon or a non-bitcoind listener stands out.
+            Ok(response) => {
+                self.handshakes.with_label_values(&["rejected"]).inc();
+                debug!(
+                    "daemon handshake was rejected addr='{}' status='{}'",
+                    self.active_addr, response.status
+                );
+                Ok(())
+            }
+            Err(e @ Error(ErrorKind::Connection(_), _)) if Instant::now() >= deadline => {
+                self.handshakes.with_label_values(&["timeout"]).inc();
+                Err(e).chain_err(|| {
+                    ErrorKind::Connection(format!(
+                        "daemon accepted the connection but did not answer the handshake \
+                         addr='{}' timeout='{:?}'; it may be overloaded or at its \
+                         -rpcmaxconnections limit",
+                        self.active_addr, budget
+                    ))
+                })
+            }
+            Err(e @ Error(ErrorKind::Connection(_), _)) => {
+                self.handshakes.with_label_values(&["error"]).inc();
+                Err(e).chain_err(|| {
+                    ErrorKind::Connection(format!(
+                        "daemon handshake failed addr='{}'",
+                        self.active_addr
+                    ))
+                })
+            }
+            // Answered, but not as well-formed HTTP (e.g. no Content-Length).
+            Err(e) => {
+                self.handshakes.with_label_values(&["rejected"]).inc();
+                debug!(
+                    "daemon handshake got a malformed response addr='{}' error='{}'",
+                    self.active_addr, e
+                );
+                Ok(())
+            }
+        }
     }
 
     #[trace]
@@ -657,6 +761,7 @@ impl Connection {
             self.cookie_getter.clone(),
             self.signal.clone(),
             self.max_age,
+            self.handshakes.clone(),
         )
     }
 
@@ -667,7 +772,7 @@ impl Connection {
     #[trace]
     fn try_reconnect_once(&self) -> Result<Connection> {
         let (conn, active_addr) = tcp_connect_once(self.addr, self.fallback)?;
-        Connection::from_stream(
+        let mut connection = Connection::from_stream(
             conn,
             active_addr,
             self.addr,
@@ -675,7 +780,10 @@ impl Connection {
             self.cookie_getter.clone(),
             self.signal.clone(),
             self.max_age,
-        )
+            self.handshakes.clone(),
+        )?;
+        connection.handshake()?;
+        Ok(connection)
     }
 
     /// Whether this connection is due to be proactively recycled now: it has exceeded its
@@ -688,6 +796,65 @@ impl Connection {
             self.last_recycle_attempt.map(|at| at.elapsed()),
             *DAEMON_CONN_RECYCLE_COOLDOWN,
         )
+    }
+
+    // Called after any proactive recycling, while the connection is exclusively held.
+    // Capabilities belong to this socket: pooled workers and replacement connections
+    // may reach different daemon versions during an upgrade or failover.
+    fn encode_request(&mut self, method: &str, request: &Value) -> Result<String> {
+        #[cfg(not(feature = "liquid"))]
+        if method == "estimatesmartfee" {
+            let supported = match self.fee_rate_estimator_supported {
+                Some(supported) => supported,
+                None => {
+                    let supported = match self.probe_fee_rate_estimator() {
+                        Ok(supported) => supported,
+                        // Transport failures and warmup are retried by the caller.
+                        Err(e @ Error(ErrorKind::Connection(_), _))
+                        | Err(e @ Error(ErrorKind::RpcError(-28, _, _), _)) => return Err(e),
+                        // Fee estimates worked before this probe existed, so a rejected
+                        // probe (e.g. getnetworkinfo outside -rpcwhitelist) must not stop them.
+                        Err(e) => {
+                            warn!(
+                                "could not detect estimatesmartfee fee_rate_estimator support, \
+                                 sending without it addr='{}' error='{}'",
+                                self.active_addr, e
+                            );
+                            false
+                        }
+                    };
+                    self.fee_rate_estimator_supported = Some(supported);
+                    supported
+                }
+            };
+            if supported {
+                let mut request = request.clone();
+                request["params"] = json!([
+                    request["params"][0],
+                    request["params"][1],
+                    { "fee_rate_estimator": "block_policy" }
+                ]);
+                return Ok(request.to_string());
+            }
+        }
+        #[cfg(feature = "liquid")]
+        let _ = method;
+        Ok(request.to_string())
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    fn probe_fee_rate_estimator(&mut self) -> Result<bool> {
+        self.send(&json!({"method": "getnetworkinfo", "params": [], "id": 0}).to_string())?;
+        // Read the raw response: through `recv` an empty 403 is a connection error, which
+        // would make the fee request reconnect and retry forever.
+        let response = self.read_response_by(Instant::now() + self.recv_budget)?;
+        if response.content_length == 0 {
+            bail!("getnetworkinfo was rejected status='{}'", response.status);
+        }
+        let reply = from_str(&response.into_jsonrpc_body()?).chain_err(|| "invalid JSON")?;
+        let info: NetworkInfo = from_value(parse_jsonrpc_reply(reply, "getnetworkinfo", 0)?)
+            .chain_err(|| "invalid network info")?;
+        Ok(info.version >= FEE_RATE_ESTIMATOR_MIN_VERSION)
     }
 
     #[trace]
@@ -706,15 +873,21 @@ impl Connection {
 
     #[trace]
     fn recv(&mut self) -> Result<String> {
+        self.read_response_by(Instant::now() + self.recv_budget)?
+            .into_jsonrpc_body()
+    }
+
+    /// Read one complete HTTP response by `deadline`, without interpreting its status.
+    fn read_response_by(&mut self, deadline: Instant) -> Result<HttpResponse> {
         // The read helpers shrink the socket timeout as the deadline approaches, so put it
         // back on the way out and leave the socket as `configure_stream` set it.
         let restore = self.rx.get_ref().read_timeout().ok().flatten();
-        let result = self.recv_within(Instant::now() + self.recv_budget);
+        let result = self.read_response(deadline);
         let _ = self.rx.get_ref().set_read_timeout(restore);
         result
     }
 
-    fn recv_within(&mut self, deadline: Instant) -> Result<String> {
+    fn read_response(&mut self, deadline: Instant) -> Result<HttpResponse> {
         // TODO: use proper HTTP parser.
         let status = read_line_bounded(&mut self.rx, *DAEMON_MAX_HEADER_LINE_BYTES, deadline)?
             .chain_err(|| {
@@ -763,13 +936,6 @@ impl Connection {
             .parse()
             .chain_err(|| format!("invalid Content-Length: {:?}", contents_length))?;
 
-        // A zero length leaves no room for the trailing EOL that bitcoind always sends,
-        // so it cannot be a well-formed reply.
-        if contents_length == 0 {
-            bail!(ErrorKind::Connection(
-                "daemon sent an empty response body content_length='0'".to_owned()
-            ));
-        }
         if contents_length > *DAEMON_MAX_BODY_BYTES {
             bail!(ErrorKind::Connection(format!(
                 "daemon response body exceeds cap content_length='{}' max_bytes='{}'",
@@ -796,19 +962,56 @@ impl Connection {
             ErrorKind::Connection("daemon sent a non-UTF8 response body".to_owned())
         })?;
 
-        Ok(if status == "HTTP/1.1 200 OK" {
-            contents
-        } else if status == "HTTP/1.1 500 Internal Server Error" {
-            debug!("RPC HTTP 500 error: {}", contents);
-            contents // the contents should have a JSONRPC error field
-        } else {
-            bail!(
-                "request failed {:?}: {:?} = {:?}",
-                status,
-                headers,
-                contents
-            );
+        Ok(HttpResponse {
+            status,
+            headers,
+            content_length: contents_length,
+            body: contents,
         })
+    }
+}
+
+/// A complete HTTP response from the daemon, before its status is interpreted.
+struct HttpResponse {
+    status: String,
+    headers: HashMap<String, String>,
+    content_length: usize,
+    body: String,
+}
+
+impl HttpResponse {
+    /// Whether this carries a JSON-RPC reply: bitcoind answers 200, or 500 for an RPC error.
+    fn is_jsonrpc_reply(&self) -> bool {
+        self.content_length > 0
+            && matches!(
+                self.status.as_str(),
+                "HTTP/1.1 200 OK" | "HTTP/1.1 500 Internal Server Error"
+            )
+    }
+
+    fn into_jsonrpc_body(self) -> Result<String> {
+        // A JSON-RPC reply always has a body. bitcoind sends empty ones for 401 (bad cookie)
+        // and 403 (-rpcwhitelist), and treating those as connection failures makes the
+        // caller reconnect and retry, and the client path report the daemon as unavailable.
+        if self.content_length == 0 {
+            bail!(ErrorKind::Connection(format!(
+                "daemon sent an empty response body status='{}' content_length='0'",
+                self.status
+            )));
+        }
+        match self.status.as_str() {
+            "HTTP/1.1 200 OK" => Ok(self.body),
+            "HTTP/1.1 500 Internal Server Error" => {
+                debug!("RPC HTTP 500 error: {}", self.body);
+                Ok(self.body) // the body should have a JSONRPC error field
+            }
+            _ => bail!(
+                "request failed {:?}: {:?} = {:?}",
+                self.status,
+                self.headers,
+                self.body
+            ),
+        }
     }
 }
 
@@ -933,6 +1136,13 @@ impl Daemon {
             cookie_getter,
             signal: signal.clone(),
             max_age: conn_max_age,
+            handshakes: metrics.counter_vec(
+                MetricOpts::new(
+                    "daemon_rpc_conn_handshake",
+                    "Handshake probes on newly opened daemon RPC connections (by result)",
+                ),
+                &["result"],
+            ),
         };
         let conn = connection_config.connect()?;
         let daemon = Daemon {
@@ -1098,7 +1308,7 @@ impl Daemon {
             }
         }
         let timer = self.latency.with_label_values(&[method]).start_timer();
-        let request = request.to_string();
+        let request = conn.encode_request(method, request)?;
         conn.send(&request)?;
         self.size
             .with_label_values(&[method, "send"])
@@ -1649,6 +1859,7 @@ mod tests {
         DAEMON_MAX_HEADER_LINE_BYTES,
     };
     use crate::errors::{Error, ErrorKind, Result};
+    use crate::metrics::{CounterVec, MetricOpts};
     use crate::signal::Waiter;
     use serde_json::json;
     use std::io::{Read, Write};
@@ -1761,9 +1972,10 @@ mod tests {
             cookie_getter: Arc::new(StaticCookie),
             signal: Waiter::start(crossbeam_channel::never()),
             max_age: None,
+            handshakes: test_handshakes(),
         };
 
-        (config.connect_once(io_timeout).unwrap(), server)
+        (config.connect_once_unchecked(io_timeout).unwrap(), server)
     }
 
     /// Go silent until the client hangs up, so the responder thread joins promptly instead
@@ -1778,6 +1990,376 @@ mod tests {
             ErrorKind::Connection(msg) => msg.clone(),
             other => panic!("expected a connection error, got {:?}", other),
         }
+    }
+
+    fn test_handshakes() -> CounterVec {
+        CounterVec::new(MetricOpts::new("test_handshakes", "test"), &["result"]).unwrap()
+    }
+
+    fn handshake_count(config: &ConnectionConfig, result: &str) -> u64 {
+        config.handshakes.with_label_values(&[result]).get() as u64
+    }
+
+    fn config_for(addr: std::net::SocketAddr) -> ConnectionConfig {
+        ConnectionConfig {
+            addr,
+            fallback: None,
+            cookie_getter: Arc::new(StaticCookie),
+            signal: Waiter::start(crossbeam_channel::never()),
+            max_age: None,
+            handshakes: test_handshakes(),
+        }
+    }
+
+    fn read_request(reader: &mut std::io::BufReader<TcpStream>) -> Option<serde_json::Value> {
+        use std::io::BufRead;
+        let mut length = 0;
+        let mut first = true;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).ok()? == 0 {
+                return None;
+            }
+            if line.trim().is_empty() {
+                if first {
+                    continue;
+                }
+                break;
+            }
+            first = false;
+            if let Some(v) = line.strip_prefix("Content-Length: ") {
+                length = v.trim().parse().ok()?;
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).ok()?;
+        serde_json::from_slice(&body).ok()
+    }
+
+    fn serve_jsonrpc(
+        socket: TcpStream,
+        status: &str,
+        reply: impl Fn(&str) -> serde_json::Value,
+    ) -> Vec<String> {
+        let mut writer = socket.try_clone().unwrap();
+        let mut reader = std::io::BufReader::new(socket);
+        let mut methods = vec![];
+        while let Some(request) = read_request(&mut reader) {
+            let method = request["method"].as_str().unwrap_or_default().to_owned();
+            let body = reply(&method).to_string();
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Length: {}\r\n\r\n{}\n",
+                status,
+                body.len() + 1,
+                body
+            );
+            methods.push(method);
+            if writer.write_all(response.as_bytes()).is_err() {
+                break;
+            }
+        }
+        methods
+    }
+
+    #[test]
+    fn handshake_times_out_when_the_daemon_never_accepts() {
+        // A listener that never accepts behaves like bitcoind past -rpcmaxconnections.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+
+        let started = Instant::now();
+        let err = match config.connect_once(secs(1)) {
+            Ok(_) => panic!("handshake should not pass when the daemon never answers"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("-rpcmaxconnections"),
+            "the error should point at the connection cap, got {:?}",
+            msg
+        );
+        assert!(
+            elapsed >= secs(1) && elapsed < secs(3),
+            "handshake should give up at its deadline, took {:?}",
+            elapsed
+        );
+        assert_eq!(handshake_count(&config, "timeout"), 1);
+        assert_eq!(handshake_count(&config, "ok"), 0);
+        drop(listener);
+    }
+
+    #[test]
+    fn handshake_reports_a_daemon_that_hangs_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || drop(listener.accept().unwrap()));
+
+        let err = match config.connect_once(secs(5)) {
+            Ok(_) => panic!("handshake should fail when the daemon hangs up"),
+            Err(err) => err,
+        };
+        assert!(matches!(err.kind(), ErrorKind::Connection(_)), "{:?}", err);
+        assert_eq!(handshake_count(&config, "error"), 1);
+        assert_eq!(handshake_count(&config, "timeout"), 0);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn handshake_probe_precedes_the_request_on_the_same_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            serve_jsonrpc(
+                socket,
+                "200 OK",
+                |method| json!({"result": method, "error": null, "id": 0}),
+            )
+        });
+
+        let mut connection = config.connect_once(secs(5)).unwrap();
+        connection
+            .send(&json!({"method": "getblockcount", "params": [], "id": 1}).to_string())
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&connection.recv().unwrap()).unwrap();
+        assert_eq!(reply["result"], "getblockcount");
+        drop(connection);
+
+        assert_eq!(server.join().unwrap(), vec!["uptime", "getblockcount"]);
+        assert_eq!(handshake_count(&config, "ok"), 1);
+    }
+
+    #[test]
+    #[cfg(not(feature = "liquid"))]
+    fn fee_estimator_capability_follows_reconnected_and_recycled_sockets() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for version in [310000, 320100, 310000] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                // Capability is queried once per socket, even across multiple fee requests.
+                for method in [
+                    "uptime",
+                    "getnetworkinfo",
+                    "estimatesmartfee",
+                    "estimatesmartfee",
+                ] {
+                    let request = read_request(&mut reader).unwrap();
+                    assert_eq!(request["method"], method);
+                    let result = match method {
+                        "getnetworkinfo" => json!({
+                            "version": version, "subversion": "test", "relayfee": 0.00001
+                        }),
+                        "estimatesmartfee" => {
+                            // The caller's estimate mode is kept either way.
+                            let expected = if version >= 320100 {
+                                json!([2, "CONSERVATIVE", {"fee_rate_estimator": "block_policy"}])
+                            } else {
+                                json!([2, "CONSERVATIVE"])
+                            };
+                            assert_eq!(request["params"], expected);
+                            json!({"feerate": 0.00001})
+                        }
+                        _ => json!(0),
+                    };
+                    let body =
+                        json!({"result": result, "error": null, "id": request["id"]}).to_string();
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            }
+        });
+
+        let mut connection = config.connect_once(secs(5)).unwrap();
+        for backend in 0..3 {
+            if backend == 1 {
+                connection = connection.reconnect().unwrap();
+            } else if backend == 2 {
+                connection = connection.try_reconnect_once().unwrap();
+            }
+            for id in 1..=2 {
+                let request =
+                    json!({"method": "estimatesmartfee", "params": [2, "CONSERVATIVE"], "id": id});
+                let encoded = connection
+                    .encode_request("estimatesmartfee", &request)
+                    .unwrap();
+                connection.send(&encoded).unwrap();
+                let reply = serde_json::from_str(&connection.recv().unwrap()).unwrap();
+                assert_eq!(
+                    parse_jsonrpc_reply(reply, "estimatesmartfee", id).unwrap()["feerate"],
+                    0.00001
+                );
+            }
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn handshake_accepts_empty_forbidden_and_preserves_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(secs(5))).unwrap();
+            let mut writer = socket.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(socket);
+            assert_eq!(read_request(&mut reader).unwrap()["method"], "uptime");
+            writer
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            assert_eq!(
+                read_request(&mut reader).unwrap()["method"],
+                "getblockcount"
+            );
+            let body = json!({"result": 123, "error": null, "id": 1}).to_string();
+            write!(
+                writer,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let mut connection = config.connect_once(secs(5)).unwrap();
+        connection
+            .send(&json!({"method": "getblockcount", "params": [], "id": 1}).to_string())
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&connection.recv().unwrap()).unwrap();
+        assert_eq!(reply["result"], 123);
+        server.join().unwrap();
+        assert_eq!(handshake_count(&config, "rejected"), 1);
+        assert_eq!(handshake_count(&config, "ok"), 0);
+        assert_eq!(handshake_count(&config, "error"), 0);
+    }
+
+    #[test]
+    fn recv_treats_an_empty_forbidden_as_a_connection_error() {
+        // So the singleton path reconnects and retries, and the client path reports the
+        // daemon as unavailable instead of blaming the request.
+        let (mut connection, server) = fake_daemon(secs(5), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+            thread::sleep(millis(200));
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("status='HTTP/1.1 401 Unauthorized'"),
+            "expected an empty body connection error, got {:?}",
+            msg
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(not(feature = "liquid"))]
+    fn fee_estimator_probe_rejection_falls_back_to_plain_estimates() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(secs(5))).unwrap();
+            let mut writer = socket.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(socket);
+            assert_eq!(read_request(&mut reader).unwrap()["method"], "uptime");
+            let body = json!({"result": 0, "error": null, "id": 0}).to_string();
+            write!(
+                writer,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            // getnetworkinfo is outside -rpcwhitelist, and asked about only once.
+            assert_eq!(
+                read_request(&mut reader).unwrap()["method"],
+                "getnetworkinfo"
+            );
+            writer
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            for id in 1..=2 {
+                let request = read_request(&mut reader).unwrap();
+                assert_eq!(request["method"], "estimatesmartfee");
+                assert_eq!(request["params"], json!([2, "ECONOMICAL"]));
+                let body =
+                    json!({"result": {"feerate": 0.00001}, "error": null, "id": id}).to_string();
+                write!(
+                    writer,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let mut connection = config.connect_once(secs(5)).unwrap();
+        for id in 1..=2 {
+            let request =
+                json!({"method": "estimatesmartfee", "params": [2, "ECONOMICAL"], "id": id});
+            let encoded = connection
+                .encode_request("estimatesmartfee", &request)
+                .unwrap();
+            connection.send(&encoded).unwrap();
+            let reply = serde_json::from_str(&connection.recv().unwrap()).unwrap();
+            assert_eq!(
+                parse_jsonrpc_reply(reply, "estimatesmartfee", id).unwrap()["feerate"],
+                0.00001
+            );
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn handshake_accepts_a_warming_up_daemon() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            serve_jsonrpc(
+                socket,
+                "500 Internal Server Error",
+                |_| json!({"result": null, "error": {"code": -28, "message": "Loading"}, "id": 0}),
+            )
+        });
+
+        let connection = config.connect_once(secs(5)).unwrap();
+        drop(connection);
+        server.join().unwrap();
+        assert_eq!(handshake_count(&config, "ok"), 1);
+    }
+
+    #[test]
+    fn handshake_restores_the_socket_read_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            serve_jsonrpc(
+                socket,
+                "200 OK",
+                |_| json!({"result": 0, "error": null, "id": 0}),
+            )
+        });
+
+        let connection = config.connect_once(secs(5)).unwrap();
+        assert_eq!(
+            connection.rx.get_ref().read_timeout().unwrap(),
+            Some(secs(5))
+        );
+        drop(connection);
+        server.join().unwrap();
     }
 
     struct StaticCookie;
@@ -1797,9 +2379,10 @@ mod tests {
             cookie_getter: Arc::new(StaticCookie),
             signal: Waiter::start(crossbeam_channel::never()),
             max_age: None,
+            handshakes: test_handshakes(),
         };
 
-        let connection = config.connect_once(secs(2)).unwrap();
+        let connection = config.connect_once_unchecked(secs(2)).unwrap();
         assert_eq!(connection.tx.read_timeout().unwrap(), Some(secs(2)));
         assert_eq!(connection.tx.write_timeout().unwrap(), Some(secs(2)));
     }
@@ -1852,9 +2435,10 @@ mod tests {
             cookie_getter: Arc::new(StaticCookie),
             signal: Waiter::start(crossbeam_channel::never()),
             max_age: None,
+            handshakes: test_handshakes(),
         };
 
-        let mut connection = config.connect_once(secs(1)).unwrap();
+        let mut connection = config.connect_once_unchecked(secs(1)).unwrap();
         connection
             .send(&json!({"method": "getblockcount"}).to_string())
             .unwrap();

@@ -827,6 +827,7 @@ fn serve_rpc_connection(
             "getnetworkinfo" => {
                 Ok(json!({"version": 290000, "subversion": "test", "relayfee": 0.00001}))
             }
+            "uptime" => Ok(json!(0)),
             method => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 reply(method, &body["params"])
             }))
