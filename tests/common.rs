@@ -18,6 +18,8 @@ use elementsd::{self as noded, bitcoincore_rpc as nclient, ElementsD as NodeD};
 #[cfg(feature = "liquid")]
 use nclient::{Client, RpcApi};
 
+#[cfg(feature = "liquid")]
+use electrs::elements::RegistryClient;
 use electrs::{
     chain::{Address, BlockHash, Network, Txid},
     config::{Config, RpcLogging},
@@ -28,6 +30,8 @@ use electrs::{
     rest,
     signal::Waiter,
 };
+#[cfg(feature = "liquid")]
+use url::Url;
 
 pub struct TestRunner {
     config: Arc<Config>,
@@ -148,13 +152,24 @@ impl TestRunner {
             MempoolSyncStatus::Synced
         );
 
+        #[cfg(feature = "liquid")]
+        let asset_registry = config
+            .asset_registry_url
+            .as_ref()
+            .map(|url| {
+                RegistryClient::with_cache_ttl(url.clone(), std::time::Duration::from_secs(1))
+            })
+            .transpose()
+            .chain_err(|| "failed creating test asset registry client")?
+            .map(Arc::new);
+
         let query = Arc::new(Query::new(
             Arc::clone(&chain),
             Arc::clone(&mempool),
             Arc::clone(&daemon),
             Arc::clone(&config),
             #[cfg(feature = "liquid")]
-            None, // TODO
+            asset_registry,
         ));
 
         let salt_rwlock = Arc::new(RwLock::new(String::from("foobar")));
@@ -478,6 +493,17 @@ pub fn init_rest_tester_with(
     wait_for_tcp(addr, "REST");
     Ok((rest_server, addr, tester))
 }
+
+#[cfg(feature = "liquid")]
+pub fn init_rest_tester_with_asset_registry(
+    asset_registry_url: Url,
+    cors: Option<String>,
+) -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
+    init_rest_tester_with(|config| {
+        config.asset_registry_url = Some(asset_registry_url);
+        config.cors = cors;
+    })
+}
 pub fn init_electrum_tester() -> Result<(ElectrumRPC, net::SocketAddr, TestRunner)> {
     init_electrum_tester_with_config(|_| {})
 }
@@ -689,7 +715,7 @@ pub fn test_config(
         zmq_addr: None,
 
         #[cfg(feature = "liquid")]
-        asset_db_path: None,
+        asset_registry_url: None,
         #[cfg(feature = "liquid")]
         parent_network: bitcoin::Network::Regtest,
         db_block_cache_mb: 8,
