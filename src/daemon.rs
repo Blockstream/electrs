@@ -2,7 +2,7 @@ use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex};
@@ -753,6 +753,8 @@ impl Connection {
         }
     }
 
+    /// Open an additional connection to the same daemon. This connection stays open, so
+    /// use `replace` to swap out a broken one.
     #[trace]
     fn reconnect(&self) -> Result<Connection> {
         Connection::new(
@@ -765,14 +767,29 @@ impl Connection {
         )
     }
 
+    /// Replace this connection with a new one, retrying until it succeeds. The old socket
+    /// is shut down first: at bitcoind's -rpcmaxconnections cap the slot it holds is the
+    /// one the new socket needs, so keeping it open would leave the new handshake waiting
+    /// on ourselves until bitcoind closes the idle socket (-rpcservertimeout).
+    fn replace(&mut self) -> Result<()> {
+        let _ = self.tx.shutdown(Shutdown::Both);
+        *self = self.reconnect()?;
+        Ok(())
+    }
+
     /// Attempt a single reconnect for proactive max-age recycling. Unlike `reconnect`,
     /// this makes one bounded attempt (primary then fallback) and returns an error
     /// instead of looping, so the caller can keep using the existing healthy connection
     /// if no fresh socket is available.
+    ///
+    /// There is no handshake: at the -rpcmaxconnections cap the new socket can only be
+    /// served once the caller drops this one, so a handshake here would always time out.
+    /// If another client takes the freed slot first, the next request fails as a
+    /// connection error and `replace` recovers.
     #[trace]
     fn try_reconnect_once(&self) -> Result<Connection> {
         let (conn, active_addr) = tcp_connect_once(self.addr, self.fallback)?;
-        let mut connection = Connection::from_stream(
+        Connection::from_stream(
             conn,
             active_addr,
             self.addr,
@@ -781,9 +798,7 @@ impl Connection {
             self.signal.clone(),
             self.max_age,
             self.handshakes.clone(),
-        )?;
-        connection.handshake()?;
-        Ok(connection)
+        )
     }
 
     /// Whether this connection is due to be proactively recycled now: it has exceeded its
@@ -980,13 +995,16 @@ struct HttpResponse {
 }
 
 impl HttpResponse {
-    /// Whether this carries a JSON-RPC reply: bitcoind answers 200, or 500 for an RPC error.
+    /// Whether this carries a JSON-RPC reply: bitcoind answers 200, or 500 for an RPC error,
+    /// with a JSON object that has an `id` and a `result` or `error`.
     fn is_jsonrpc_reply(&self) -> bool {
-        self.content_length > 0
-            && matches!(
-                self.status.as_str(),
-                "HTTP/1.1 200 OK" | "HTTP/1.1 500 Internal Server Error"
-            )
+        matches!(
+            self.status.as_str(),
+            "HTTP/1.1 200 OK" | "HTTP/1.1 500 Internal Server Error"
+        ) && from_str::<Value>(&self.body).is_ok_and(|reply| {
+            reply.get("id").is_some()
+                && (reply.get("result").is_some() || reply.get("error").is_some())
+        })
     }
 
     fn into_jsonrpc_body(self) -> Result<String> {
@@ -1342,15 +1360,13 @@ impl Daemon {
                 Err(e @ Error(ErrorKind::Connection(_), _)) => {
                     warn!("reconnecting to bitcoind: {}", e.display_chain());
                     self.signal.wait(Duration::from_secs(3), false)?;
-                    let mut conn = self.conn.lock().unwrap();
-                    *conn = conn.reconnect()?;
+                    self.conn.lock().unwrap().replace()?;
                     continue;
                 }
                 Err(e @ Error(ErrorKind::RpcError(-28, _, _), _)) => {
                     warn!("bitcoind is warming up: {}", e.display_chain());
                     self.signal.wait(Duration::from_secs(3), false)?;
-                    let mut conn = self.conn.lock().unwrap();
-                    *conn = conn.reconnect()?;
+                    self.conn.lock().unwrap().replace()?;
                     continue;
                 }
                 result => return result,
@@ -2137,17 +2153,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = config_for(listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            for version in [310000, 320100, 310000] {
+            for (backend, version) in [310000, 320100, 310000].iter().copied().enumerate() {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(secs(5))).unwrap();
                 let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
-                // Capability is queried once per socket, even across multiple fee requests.
-                for method in [
-                    "uptime",
+                // Recycled sockets (the last backend) skip the handshake. Capability is
+                // queried once per socket, even across multiple fee requests.
+                let handshake = if backend == 2 { None } else { Some("uptime") };
+                for method in handshake.into_iter().chain([
                     "getnetworkinfo",
                     "estimatesmartfee",
                     "estimatesmartfee",
-                ] {
+                ]) {
                     let request = read_request(&mut reader).unwrap();
                     assert_eq!(request["method"], method);
                     let result = match method {
@@ -2338,6 +2355,127 @@ mod tests {
         drop(connection);
         server.join().unwrap();
         assert_eq!(handshake_count(&config, "ok"), 1);
+    }
+
+    /// A daemon with one slot, like bitcoind at -rpcmaxconnections: the next connection is
+    /// only served once the current one closes. A socket that stays open is dropped after
+    /// `idle`, like -rpcservertimeout, so a regression fails on timing instead of hanging.
+    /// Returns the methods each connection sent, in order.
+    fn single_slot_daemon(
+        listener: TcpListener,
+        connections: usize,
+        idle: Duration,
+    ) -> thread::JoinHandle<Vec<Vec<String>>> {
+        thread::spawn(move || {
+            (0..connections)
+                .map(|_| {
+                    let (socket, _) = listener.accept().unwrap();
+                    socket.set_read_timeout(Some(idle)).unwrap();
+                    serve_jsonrpc(
+                        socket,
+                        "200 OK",
+                        |method| json!({"result": method, "error": null, "id": 0}),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn assert_serves_getblockcount(connection: &mut Connection) {
+        connection
+            .send(&json!({"method": "getblockcount", "params": [], "id": 1}).to_string())
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&connection.recv().unwrap()).unwrap();
+        assert_eq!(reply["result"], "getblockcount");
+    }
+
+    #[test]
+    fn replace_frees_its_own_slot_before_the_new_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = single_slot_daemon(listener, 2, secs(4));
+
+        let mut connection = config.connect().unwrap();
+        let started = Instant::now();
+        connection.replace().unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < secs(2),
+            "the new handshake waited for our own old socket, took {:?}",
+            elapsed
+        );
+        assert_serves_getblockcount(&mut connection);
+        drop(connection);
+
+        assert_eq!(
+            server.join().unwrap(),
+            vec![vec!["uptime"], vec!["uptime", "getblockcount"]]
+        );
+        assert_eq!(handshake_count(&config, "ok"), 2);
+        assert_eq!(handshake_count(&config, "timeout"), 0);
+    }
+
+    #[test]
+    fn recycling_takes_over_the_slot_of_the_dropped_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = single_slot_daemon(listener, 2, secs(4));
+
+        let mut connection = config.connect().unwrap();
+        let started = Instant::now();
+        let recycled = connection.try_reconnect_once().unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < secs(2),
+            "recycling should not wait for a handshake, took {:?}",
+            elapsed
+        );
+        // As in call_jsonrpc_on_connection: the old socket is dropped by the assignment.
+        connection = recycled;
+        let started = Instant::now();
+        assert_serves_getblockcount(&mut connection);
+        assert!(
+            started.elapsed() < secs(2),
+            "the recycled socket should be served once the old one closed, took {:?}",
+            started.elapsed()
+        );
+        drop(connection);
+
+        assert_eq!(
+            server.join().unwrap(),
+            vec![vec!["uptime"], vec!["getblockcount"]]
+        );
+        assert_eq!(handshake_count(&config, "ok"), 1);
+    }
+
+    #[test]
+    fn handshake_counts_a_non_jsonrpc_200_as_rejected() {
+        // e.g. a proxy or another service answering on the RPC port.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(secs(5))).unwrap();
+            let mut writer = socket.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(socket);
+            assert_eq!(read_request(&mut reader).unwrap()["method"], "uptime");
+            let body = "<html>hello</html>";
+            write!(
+                writer,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            // Wait for the client to hang up.
+            let _ = read_request(&mut reader);
+        });
+
+        let connection = config.connect_once(secs(5)).unwrap();
+        drop(connection);
+        server.join().unwrap();
+        assert_eq!(handshake_count(&config, "rejected"), 1);
+        assert_eq!(handshake_count(&config, "ok"), 0);
     }
 
     #[test]
