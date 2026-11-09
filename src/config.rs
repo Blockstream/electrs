@@ -449,8 +449,6 @@ impl Config {
                     .takes_value(true),
             )
             .arg(
-                // Retained so upgraded deployments receive an actionable migration error
-                // instead of clap's generic unknown-argument message.
                 Arg::with_name("asset_db_path")
                     .long("asset-db-path")
                     .hidden(true)
@@ -491,15 +489,6 @@ impl Config {
                 Network::LiquidTestnet | Network::LiquidRegtest => BNetwork::Regtest,
             });
 
-        #[cfg(feature = "liquid")]
-        if m.value_of("asset_db_path").is_some() {
-            clap::Error::with_description(
-                "--asset-db-path is no longer supported; the on-disk asset registry has been \
-                 replaced by the v2 HTTP registry — configure it with --asset-registry-url",
-                clap::ErrorKind::InvalidValue,
-            )
-            .exit();
-        }
         #[cfg(feature = "liquid")]
         let asset_registry_url = m.value_of("asset_registry_url").map(|value| {
             parse_asset_registry_url(value).unwrap_or_else(|e| {
@@ -758,6 +747,18 @@ impl Config {
             stderrlog::Timestamp::Off
         });
         log.init().expect("logging initialization failed");
+
+        #[cfg(feature = "liquid")]
+        if m.value_of("asset_db_path").is_some() {
+            if asset_registry_url.is_some() {
+                log::warn!("--asset-db-path is deprecated and ignored");
+            } else {
+                log::warn!(
+                    "--asset-db-path is deprecated and ignored; asset registry lookups are \
+                     disabled until --asset-registry-url is configured"
+                );
+            }
+        }
 
         let config = Config {
             log,
