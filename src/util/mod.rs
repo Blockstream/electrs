@@ -94,10 +94,17 @@ where
     F: Send + 'static,
     T: Send + 'static,
 {
-    thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(f)
-        .unwrap()
+    try_spawn_thread(name, f).unwrap()
+}
+
+/// Like [`spawn_thread`], but returns the error instead of panicking.
+pub fn try_spawn_thread<F, T>(name: &str, f: F) -> std::io::Result<thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T,
+    F: Send + 'static,
+    T: Send + 'static,
+{
+    thread::Builder::new().name(name.to_owned()).spawn(f)
 }
 
 // Similar to https://doc.rust-lang.org/std/primitive.bool.html#method.then (nightly only),

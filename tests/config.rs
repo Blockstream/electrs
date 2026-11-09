@@ -147,6 +147,33 @@ fn utxos_checkpoint_limit_below_utxos_limit_is_rejected() {
 }
 
 #[test]
+fn fd_usage_percent_above_100_is_rejected() {
+    assert_rejected(
+        &["--electrum-rpc-max-fd-usage-percent", "101"],
+        "--electrum-rpc-max-fd-usage-percent must be between 0 and 100",
+    );
+}
+
+#[test]
+fn fd_usage_percent_bounds_are_accepted() {
+    for percent in ["0", "100"] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = run_electrs(
+            temp_dir.path(),
+            &["-vv", "--electrum-rpc-max-fd-usage-percent", percent],
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let expected = format!("electrum_rpc_max_fd_usage_percent: {}", percent);
+        assert!(
+            stderr.contains(&expected),
+            "{} should pass validation, stderr: {}",
+            percent,
+            stderr
+        );
+    }
+}
+
+#[test]
 fn disabled_write_timeout_requires_an_unlimited_budget_or_max_age() {
     assert_rejected(
         &["--electrum-rpc-write-timeout", "0"],

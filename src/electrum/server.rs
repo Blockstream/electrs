@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::io::{BufRead, BufReader};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
@@ -28,7 +29,10 @@ use crate::metrics::{
 };
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
-use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
+use crate::util::{
+    create_socket, spawn_thread, try_spawn_thread, BlockId, BoolThen, Channel, FullHash,
+    HeaderEntry,
+};
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::serialize_hex;
 #[cfg(feature = "liquid")]
@@ -37,6 +41,7 @@ use elements::encode::serialize_hex;
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 const MAX_HEADERS: usize = 2016;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 #[cfg(feature = "electrum-discovery")]
 use crate::electrum::DiscoveryManager;
 use crate::electrum::ServerFeatures;
@@ -895,16 +900,36 @@ impl Connection {
         result
     }
 
-    pub fn run(mut self, receiver: Receiver<Message>) {
+    fn start_reader(&self, reader: TcpStream) -> Option<thread::JoinHandle<Result<()>>> {
+        let reader = BufReader::new(reader);
+        let sender = self.sender.clone();
+        let max_request_bytes = self.max_request_bytes;
+        match try_spawn_thread("reader", move || {
+            Connection::reader_thread(reader, sender, max_request_bytes)
+        }) {
+            Ok(child) => Some(child),
+            Err(e) => {
+                warn!(
+                    "[{}] failed to spawn the connection reader: {}",
+                    self.addr, e
+                );
+                self.stats
+                    .connection_errors
+                    .with_label_values(&["spawn_error"])
+                    .inc();
+                None
+            }
+        }
+    }
+
+    pub fn run(mut self, receiver: Receiver<Message>, reader: TcpStream) {
+        let Some(child) = self.start_reader(reader) else {
+            let _ = self.stream.shutdown(Shutdown::Both);
+            return;
+        };
         self.stats.clients.inc();
         conditionally_log_rpc_event!(self, json!({ "event": "connection_established" }));
 
-        let reader = BufReader::new(self.stream.try_clone().expect("failed to clone TcpStream"));
-        let sender = self.sender.clone();
-        let max_request_bytes = self.max_request_bytes;
-        let child = spawn_thread("reader", move || {
-            Connection::reader_thread(reader, sender, max_request_bytes)
-        });
         if let Err(e) = self.handle_replies(receiver) {
             if matches!(e.kind(), ErrorKind::ClientWriteTimeout) {
                 warn!(
@@ -962,6 +987,85 @@ fn connection_lifetime(max_age: Option<Duration>) -> Option<Duration> {
 /// disabled, or it is so large that the deadline is not representable.
 fn connection_deadline(max_age: Option<Duration>) -> Option<Instant> {
     connection_lifetime(max_age).and_then(|lifetime| Instant::now().checked_add(lifetime))
+}
+
+struct Accepted {
+    stream: Arc<TcpStream>,
+    reader: TcpStream,
+    addr: SocketAddr,
+}
+
+/// Errors must not panic here or in the connection threads: release builds
+/// abort, taking down the whole process.
+fn accept_connection(
+    listener: &TcpListener,
+    connection_errors: &CounterVec,
+) -> Option<(TcpStream, TcpStream, SocketAddr)> {
+    let (stream, addr) = match listener.accept() {
+        Ok(accepted) => accepted,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            debug!("Electrum accept interrupted: {}", e);
+            return None;
+        }
+        Err(e) => {
+            warn!("failed to accept an Electrum connection: {}", e);
+            connection_errors.with_label_values(&["accept_error"]).inc();
+            thread::sleep(ACCEPT_ERROR_BACKOFF);
+            return None;
+        }
+    };
+    if let Err(e) = stream
+        .set_nonblocking(false)
+        .and_then(|_| stream.set_nodelay(true))
+    {
+        warn!(
+            "[{}] failed to configure the connection socket: {}",
+            addr, e
+        );
+        connection_errors.with_label_values(&["socket_error"]).inc();
+        return None;
+    }
+    match stream.try_clone() {
+        Ok(reader) => Some((stream, reader, addr)),
+        Err(e) => {
+            warn!("[{}] failed to clone the connection socket: {}", addr, e);
+            connection_errors.with_label_values(&["socket_error"]).inc();
+            drop(stream);
+            thread::sleep(ACCEPT_ERROR_BACKOFF);
+            None
+        }
+    }
+}
+
+fn electrum_fd_ceiling(percent: u8) -> Option<libc::rlim_t> {
+    if percent == 0 {
+        return None;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
+        || limit.rlim_cur == libc::RLIM_INFINITY
+    {
+        return None;
+    }
+    Some(limit.rlim_cur.saturating_mul(percent.into()) / 100)
+}
+
+/// The kernel hands out the lowest free fd number, so an fd at or above the
+/// ceiling means every fd below it is in use; the rest is left for RocksDB, the
+/// daemon connection and the REST server.
+fn exceeds_fd_ceiling(fds: &[&dyn AsRawFd], ceiling: Option<libc::rlim_t>) -> bool {
+    ceiling.is_some_and(|ceiling| {
+        fds.iter()
+            .any(|fd| fd.as_raw_fd() as libc::rlim_t >= ceiling)
+    })
 }
 
 /// A connection registered with the reaper: shut `stream` down at `expires_at`.
@@ -1151,13 +1255,14 @@ struct Stats {
     global_overflows: Counter,
     client_write_timeouts: Counter,
     checkpoint_proof_rejects: CounterVec,
+    connection_errors: CounterVec,
 }
 
 impl RPC {
     fn start_notifier(
         notification: Channel<Notification>,
         senders: Arc<Mutex<Vec<SyncSender<Message>>>>,
-        acceptor: Sender<Option<(Arc<TcpStream>, SocketAddr)>>,
+        acceptor: Sender<Option<Accepted>>,
     ) {
         spawn_thread("notification", move || {
             for msg in notification.receiver().iter() {
@@ -1188,7 +1293,9 @@ impl RPC {
         addr: SocketAddr,
         conn_max_age: Option<Duration>,
         reaper: Option<mpsc::Sender<ReaperMessage>>,
-    ) -> Channel<Option<(Arc<TcpStream>, SocketAddr)>> {
+        max_fd_usage_percent: u8,
+        connection_errors: CounterVec,
+    ) -> Channel<Option<Accepted>> {
         let chan = Channel::unbounded();
         let acceptor = chan.sender();
         spawn_thread("acceptor", move || {
@@ -1199,13 +1306,35 @@ impl RPC {
                 .expect("cannot set nonblocking to false");
             let listener = TcpListener::from(socket);
 
-            info!("Electrum RPC server running on {}", addr);
+            let fd_ceiling = electrum_fd_ceiling(max_fd_usage_percent);
+            match fd_ceiling {
+                Some(ceiling) => info!(
+                    "Electrum RPC server running on {} (refusing connections at fd {} and above)",
+                    addr, ceiling
+                ),
+                None => info!("Electrum RPC server running on {}", addr),
+            }
+            let mut refusing = false;
             loop {
-                let (stream, addr) = listener.accept().expect("accept failed");
-                stream
-                    .set_nonblocking(false)
-                    .expect("failed to set connection as blocking");
-                stream.set_nodelay(true).expect("failed to set TCP_NODELAY");
+                let Some((stream, reader, addr)) = accept_connection(&listener, &connection_errors)
+                else {
+                    continue;
+                };
+                if exceeds_fd_ceiling(&[&stream, &reader], fd_ceiling) {
+                    if !refusing {
+                        refusing = true;
+                        warn!(
+                            "refusing Electrum connections: over {}% of the fd limit is in use",
+                            max_fd_usage_percent
+                        );
+                    }
+                    connection_errors.with_label_values(&["fd_limit"]).inc();
+                    continue;
+                }
+                if refusing {
+                    refusing = false;
+                    info!("accepting Electrum connections again");
+                }
                 // Register with the reaper before enqueueing, so the deadline
                 // is anchored to the accept and enforced even while the socket
                 // waits behind other new connections during an accept burst.
@@ -1219,7 +1348,14 @@ impl RPC {
                         }));
                     }
                 }
-                if acceptor.send(Some((stream, addr))).is_err() {
+                if acceptor
+                    .send(Some(Accepted {
+                        stream,
+                        reader,
+                        addr,
+                    }))
+                    .is_err()
+                {
                     break; // receiver dropped, server is shutting down
                 }
             }
@@ -1259,6 +1395,14 @@ impl RPC {
                 MetricOpts::new(
                     "electrum_checkpoint_proof_rejections_total",
                     "Checkpoint Merkle proof rebuilds refused (by limit reached)",
+                ),
+                &["reason"],
+            ),
+            connection_errors: metrics.counter_vec(
+                MetricOpts::new(
+                    "electrum_connection_errors_total",
+                    "Electrum connections refused or dropped before being served, by reason \
+                     (fd_limit, accept_error, socket_error, spawn_error)",
                 ),
                 &["reason"],
             ),
@@ -1317,6 +1461,7 @@ impl RPC {
         let response_budget = ResponseBudget::new(config.electrum_rpc_global_response_budget_bytes);
         let checkpoint_proof_concurrency_limit = config.electrum_checkpoint_proof_concurrency_limit;
         let conn_max_age = config.electrum_rpc_conn_max_age;
+        let max_fd_usage_percent = config.electrum_rpc_max_fd_usage_percent;
 
         warn_limits(max_request_bytes, max_response_bytes, txs_limit);
 
@@ -1339,13 +1484,20 @@ impl RPC {
                     rpc_addr,
                     conn_max_age,
                     reaper.as_ref().map(|(sender, _)| sender.clone()),
+                    max_fd_usage_percent,
+                    stats.connection_errors.clone(),
                 );
                 RPC::start_notifier(notification, senders.clone(), acceptor.sender());
 
                 let mut threads = HashMap::new();
                 let (garbage_sender, garbage_receiver) = crossbeam_channel::unbounded();
 
-                while let Some((stream, addr)) = acceptor.receiver().recv().unwrap() {
+                while let Some(Accepted {
+                    stream,
+                    reader,
+                    addr,
+                }) = acceptor.receiver().recv().unwrap()
+                {
                     // explicitly scope the shadowed variables for the new thread
                     let query = Arc::clone(&query);
                     let response_budget = Arc::clone(&response_budget);
@@ -1357,11 +1509,12 @@ impl RPC {
                     let server_features = Arc::clone(&server_features);
 
                     let (sender, receiver) = mpsc::sync_channel(10);
-                    senders.lock().unwrap().push(sender.clone());
+                    let notifier_sender = sender.clone();
+                    let spawn_errors = stats.connection_errors.with_label_values(&["spawn_error"]);
 
                     let salt = salt_rwlock.read().unwrap().clone();
 
-                    let spawned = spawn_thread("peer", move || {
+                    let spawned = try_spawn_thread("peer", move || {
                         debug!("[{}] connected peer", addr);
                         let conn = Connection::new(
                             query,
@@ -1382,13 +1535,22 @@ impl RPC {
                             rpc_logging,
                             salt,
                         );
-                        conn.run(receiver);
+                        conn.run(receiver, reader);
                         debug!("[{}] disconnected peer", addr);
                         let _ = garbage_sender.send(std::thread::current().id());
                     });
 
-                    trace!("[{}] spawned {:?}", addr, spawned.thread().id());
-                    threads.insert(spawned.thread().id(), spawned);
+                    match spawned {
+                        Ok(spawned) => {
+                            senders.lock().unwrap().push(notifier_sender);
+                            trace!("[{}] spawned {:?}", addr, spawned.thread().id());
+                            threads.insert(spawned.thread().id(), spawned);
+                        }
+                        Err(e) => {
+                            warn!("[{}] failed to spawn a connection thread: {}", addr, e);
+                            spawn_errors.inc();
+                        }
+                    }
                     while let Ok(id) = garbage_receiver.try_recv() {
                         if let Some(thread) = threads.remove(&id) {
                             trace!("[{}] joining {:?}", addr, id);
@@ -1533,6 +1695,51 @@ mod tests {
         );
         assert_eq!(connection_deadline(None), None);
         assert!(connection_deadline(Some(Duration::from_secs(3_600))).is_some());
+    }
+
+    #[test]
+    fn fd_ceiling_is_disabled_by_zero_percent() {
+        assert_eq!(electrum_fd_ceiling(0), None);
+    }
+
+    #[test]
+    fn fd_ceiling_is_a_share_of_the_fd_limit() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        if limit.rlim_cur != libc::RLIM_INFINITY {
+            let limit = limit.rlim_cur;
+            assert_eq!(electrum_fd_ceiling(100), Some(limit));
+            assert_eq!(electrum_fd_ceiling(50), Some(limit / 2));
+        }
+    }
+
+    #[test]
+    fn connection_is_refused_when_either_fd_reaches_the_ceiling() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = listener.accept().unwrap().0;
+        let reader = stream.try_clone().unwrap();
+        let low = stream.as_raw_fd().min(reader.as_raw_fd());
+        let high = stream.as_raw_fd().max(reader.as_raw_fd());
+        let fds: [&dyn AsRawFd; 2] = [&stream, &reader];
+
+        assert!(!exceeds_fd_ceiling(&fds, None));
+        assert!(!exceeds_fd_ceiling(&fds, Some(high as libc::rlim_t + 1)));
+        assert!(
+            exceeds_fd_ceiling(&fds, Some(high as libc::rlim_t)),
+            "clone at the ceiling"
+        );
+        assert!(
+            exceeds_fd_ceiling(&fds, Some(low as libc::rlim_t)),
+            "both at or above"
+        );
+        drop(client);
     }
 
     /// Spawn a reaper and register `stream` to expire at `expires_at`.

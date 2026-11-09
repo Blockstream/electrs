@@ -66,6 +66,7 @@ pub struct Config {
     pub electrum_rpc_max_request_num_bytes: usize,
     pub electrum_rpc_max_response_num_bytes: usize,
     pub electrum_rpc_global_response_budget_bytes: usize,
+    pub electrum_rpc_max_fd_usage_percent: u8,
     pub http_addr: SocketAddr,
     pub http_socket_file: Option<PathBuf>,
     pub monitoring_addr: SocketAddr,
@@ -247,6 +248,13 @@ impl Config {
                 Arg::with_name("electrum_rpc_global_response_budget_bytes")
                     .long("electrum-rpc-global-response-budget-bytes")
                     .help("Aggregate cap (in bytes) on Electrum solicited-reply buffer memory retained across all connections at any instant, including batch replies held while later batch elements execute and replies held while writer threads block on non-reading clients. Subscription notifications and queued request lines are not counted. Small replies (< 16 KiB per connection) are exempt; above that floor each reply charges the budget in 64 KiB chunks (or a smaller final chunk) and releases on drop. Requests that would exceed the budget are rejected with a server error (code 2) instead of allocating. Must be >= --electrum-rpc-max-response-num-bytes so a single maximum-size reply can succeed, and requires a non-zero --electrum-rpc-write-timeout or --electrum-rpc-conn-max-age so stalled clients release their share. 0 = unlimited (default: 67108864, i.e. 64 MiB on Bitcoin; 268435456, i.e. 256 MiB on Liquid, keeping the same ratio to the per-line cap).")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("electrum_rpc_max_fd_usage_percent")
+                    .long("electrum-rpc-max-fd-usage-percent")
+                    .help("Refuse new Electrum RPC connections (accept and close them at once) once every file descriptor below this percentage of the open files limit (ulimit -n) is in use, keeping the rest for RocksDB, the daemon connection and the REST server. Each connection holds 2 file descriptors. 0 = disabled (default: 80)")
+                    .default_value("80")
                     .takes_value(true),
             )
             .arg(
@@ -660,6 +668,15 @@ impl Config {
             )
             .exit();
         }
+        let electrum_rpc_max_fd_usage_percent =
+            value_t_or_exit!(m, "electrum_rpc_max_fd_usage_percent", u8);
+        if electrum_rpc_max_fd_usage_percent > 100 {
+            clap::Error::with_description(
+                "--electrum-rpc-max-fd-usage-percent must be between 0 and 100",
+                clap::ErrorKind::ValueValidation,
+            )
+            .exit();
+        }
         let utxos_limit = value_t_or_exit!(m, "utxos_limit", usize);
         let history_scan_limit = value_t_or_exit!(m, "history_scan_limit", usize);
         if history_scan_limit == 0 {
@@ -762,6 +779,7 @@ impl Config {
             electrum_rpc_max_request_num_bytes,
             electrum_rpc_max_response_num_bytes,
             electrum_rpc_global_response_budget_bytes,
+            electrum_rpc_max_fd_usage_percent,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_subscription_limit: value_t_or_exit!(m, "electrum_subscription_limit", usize),
             electrum_checkpoint_proof_concurrency_limit: match m

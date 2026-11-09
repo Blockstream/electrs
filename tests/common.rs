@@ -693,6 +693,7 @@ pub fn test_config(
         electrum_rpc_global_response_budget_bytes: 67_108_864,
         #[cfg(feature = "liquid")]
         electrum_rpc_global_response_budget_bytes: 268_435_456,
+        electrum_rpc_max_fd_usage_percent: 0,
         http_addr: rand_available_addr(),
         http_socket_file: None,
         monitoring_addr: rand_available_addr(),

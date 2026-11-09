@@ -820,6 +820,7 @@ mod tests {
             electrum_rpc_max_request_num_bytes: 1_048_576,
             electrum_rpc_max_response_num_bytes: 8_388_608,
             electrum_rpc_global_response_budget_bytes: 67_108_864,
+            electrum_rpc_max_fd_usage_percent: 0,
             http_addr: unused_addr,
             http_socket_file: None,
             monitoring_addr: unused_addr,
