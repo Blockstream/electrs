@@ -210,17 +210,34 @@ fn disabled_write_timeout_requires_an_unlimited_budget_or_max_age() {
 
 #[cfg(feature = "liquid")]
 #[test]
-fn removed_asset_db_path_is_a_startup_error() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let output = run_electrs(
-        temp_dir.path(),
-        &["--asset-db-path", temp_dir.path().to_str().unwrap()],
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
+fn deprecated_asset_db_path_warns_and_continues_startup() {
+    for registry_url in [None, Some("http://127.0.0.1:1")] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut args = vec!["-v", "--asset-db-path", "/unused/asset-registry-db"];
+        if let Some(url) = registry_url {
+            args.extend(["--asset-registry-url", url]);
+        }
+        let output = run_electrs(temp_dir.path(), &args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
 
-    assert!(!output.status.success());
-    assert!(stderr.contains("--asset-db-path is no longer supported"));
-    assert!(stderr.contains("--asset-registry-url"));
+        assert!(
+            stderr.contains("--asset-db-path is deprecated and ignored"),
+            "deprecation warning missing from stderr: {}",
+            stderr
+        );
+        assert_eq!(
+            stderr.contains("asset registry lookups are disabled"),
+            registry_url.is_none(),
+            "registry status in the deprecation warning does not match {:?}: {}",
+            registry_url,
+            stderr
+        );
+        assert!(
+            stderr.contains("configuration: Config"),
+            "startup did not continue past argument parsing: {}",
+            stderr
+        );
+    }
 }
 
 #[cfg(feature = "liquid")]
