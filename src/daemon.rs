@@ -777,15 +777,40 @@ impl Connection {
         Ok(())
     }
 
-    /// Attempt a single reconnect for proactive max-age recycling. Unlike `reconnect`,
-    /// this makes one bounded attempt (primary then fallback) and returns an error
-    /// instead of looping, so the caller can keep using the existing healthy connection
-    /// if no fresh socket is available.
+    /// Swap in a fresh socket for proactive max-age recycling. Returns `Ok(false)` and keeps
+    /// this connection if no fresh socket could be opened, so a transient connect failure
+    /// does not block requests on a connection that is still healthy.
     ///
-    /// There is no handshake: at the -rpcmaxconnections cap the new socket can only be
-    /// served once the caller drops this one, so a handshake here would always time out.
-    /// If another client takes the freed slot first, the next request fails as a
-    /// connection error and `replace` recovers.
+    /// The handshake runs only after the swap: at the -rpcmaxconnections cap the fresh
+    /// socket can only be served once the old one closes. If another client takes the
+    /// freed slot first, the handshake times out within its short budget instead of the
+    /// next request waiting out DAEMON_READ_TIMEOUT, and the caller's retry replaces the
+    /// connection.
+    fn recycle(&mut self) -> Result<bool> {
+        let fresh = match self.try_reconnect_once() {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                // Rate-limit retries so we don't pay a connect timeout on every request.
+                self.last_recycle_attempt = Some(Instant::now());
+                warn!(
+                    "failed recycling expired daemon RPC connection, keeping existing connection: {}",
+                    e.display_chain()
+                );
+                return Ok(false);
+            }
+        };
+        let (old_addr, age) = (self.active_addr, self.established.elapsed());
+        *self = fresh;
+        self.handshake()?;
+        debug!(
+            "recycled expired daemon RPC connection addr='{}' age='{:?}'",
+            old_addr, age
+        );
+        Ok(true)
+    }
+
+    /// Open a fresh socket with a single bounded attempt (primary then fallback) and no
+    /// handshake. Used by `recycle`, which handshakes once this connection is dropped.
     #[trace]
     fn try_reconnect_once(&self) -> Result<Connection> {
         let (conn, active_addr) = tcp_connect_once(self.addr, self.fallback)?;
@@ -1235,12 +1260,15 @@ impl Daemon {
 
     #[trace]
     pub fn reconnect(&self) -> Result<Daemon> {
+        // Not through `self.conn`: connecting retries until a handshake succeeds, and
+        // holding that lock meanwhile would block requests on the healthy connection.
+        let conn = self.connection_config.connect()?;
         Ok(Daemon {
             daemon_dir: self.daemon_dir.clone(),
             blocks_dir: self.blocks_dir.clone(),
             network: self.network,
             connection_config: self.connection_config.clone(),
-            conn: Mutex::new(self.conn.lock().unwrap().reconnect()?),
+            conn: Mutex::new(conn),
             message_id: Counter::new(),
             signal: self.signal.clone(),
             rpc_threads: self.rpc_threads.clone(),
@@ -1300,30 +1328,14 @@ impl Daemon {
         // re-select a backend, so a long-lived connection does not stay pinned to a stale
         // endpoint after node rotations. No-op when no max age is configured (the default).
         if conn.should_recycle() {
-            match conn.try_reconnect_once() {
-                Ok(new_conn) => {
-                    debug!(
-                        "recycled expired daemon RPC connection to {} after {:?}",
-                        conn.active_addr,
-                        conn.established.elapsed()
-                    );
-                    *conn = new_conn;
-                    self.conn_recycle.with_label_values(&["ok"]).inc();
-                }
-                Err(err) => {
-                    // Recycling is best-effort: if no fresh socket is available (e.g. a
-                    // transient load-balancer hiccup), keep using the existing healthy
-                    // connection rather than blocking requests while it is still usable.
-                    // Record the failed attempt so we don't retry (and pay a connect timeout)
-                    // on every subsequent request; the next attempt waits out the cooldown.
-                    conn.last_recycle_attempt = Some(Instant::now());
-                    self.conn_recycle.with_label_values(&["failed"]).inc();
-                    warn!(
-                        "failed recycling expired daemon RPC connection, keeping existing connection: {}",
-                        err.display_chain()
-                    );
-                }
-            }
+            let recycled = conn.recycle();
+            let result = if matches!(recycled, Ok(true)) {
+                "ok"
+            } else {
+                "failed"
+            };
+            self.conn_recycle.with_label_values(&[result]).inc();
+            recycled?;
         }
         let timer = self.latency.with_label_values(&[method]).start_timer();
         let request = conn.encode_request(method, request)?;
@@ -1871,16 +1883,19 @@ impl Daemon {
 mod tests {
     use super::{
         parse_jsonrpc_reply, recycle_due, retry_reconnect_with_backoff, BlockingSemaphore,
-        Connection, ConnectionConfig, CookieGetter, DAEMON_MAX_BODY_BYTES,
+        Connection, ConnectionConfig, CookieGetter, Counter, Daemon, DAEMON_MAX_BODY_BYTES,
         DAEMON_MAX_HEADER_LINE_BYTES,
     };
+    use crate::chain::Network;
     use crate::errors::{Error, ErrorKind, Result};
-    use crate::metrics::{CounterVec, MetricOpts};
+    use crate::metrics::{CounterVec, HistogramOpts, HistogramVec, MetricOpts};
     use crate::signal::Waiter;
+    use error_chain::ChainedError;
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::Arc;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2153,18 +2168,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = config_for(listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            for (backend, version) in [310000, 320100, 310000].iter().copied().enumerate() {
+            for version in [310000, 320100, 310000] {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(secs(5))).unwrap();
                 let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
-                // Recycled sockets (the last backend) skip the handshake. Capability is
-                // queried once per socket, even across multiple fee requests.
-                let handshake = if backend == 2 { None } else { Some("uptime") };
-                for method in handshake.into_iter().chain([
+                // Capability is queried once per socket, even across multiple fee requests.
+                for method in [
+                    "uptime",
                     "getnetworkinfo",
                     "estimatesmartfee",
                     "estimatesmartfee",
-                ]) {
+                ] {
                     let request = read_request(&mut reader).unwrap();
                     assert_eq!(request["method"], method);
                     let result = match method {
@@ -2201,7 +2215,7 @@ mod tests {
             if backend == 1 {
                 connection = connection.reconnect().unwrap();
             } else if backend == 2 {
-                connection = connection.try_reconnect_once().unwrap();
+                assert!(connection.recycle().unwrap());
             }
             for id in 1..=2 {
                 let request =
@@ -2415,37 +2429,141 @@ mod tests {
         assert_eq!(handshake_count(&config, "timeout"), 0);
     }
 
+    /// A `Daemon` around a connection to `config`, without the startup RPCs of `Daemon::new`.
+    fn daemon_for(config: ConnectionConfig) -> Daemon {
+        #[cfg(not(feature = "liquid"))]
+        let network = Network::Regtest;
+        #[cfg(feature = "liquid")]
+        let network = Network::LiquidRegtest;
+        let conn = config.connect().unwrap();
+        Daemon {
+            daemon_dir: PathBuf::new(),
+            blocks_dir: PathBuf::new(),
+            network,
+            signal: config.signal.clone(),
+            connection_config: config,
+            conn: Mutex::new(conn),
+            message_id: Counter::new(),
+            rpc_threads: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
+            proxy_limit: Arc::new(BlockingSemaphore::new(1)),
+            latency: HistogramVec::new(HistogramOpts::new("test_latency", "test"), &["method"])
+                .unwrap(),
+            size: HistogramVec::new(HistogramOpts::new("test_size", "test"), &["method", "dir"])
+                .unwrap(),
+            conn_recycle: CounterVec::new(MetricOpts::new("test_recycle", "test"), &["result"])
+                .unwrap(),
+            proxy_rpc: CounterVec::new(MetricOpts::new("test_proxied", "test"), &["result"])
+                .unwrap(),
+        }
+    }
+
     #[test]
-    fn recycling_takes_over_the_slot_of_the_dropped_connection() {
+    fn recycling_handshakes_once_the_old_slot_is_free() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = config_for(listener.local_addr().unwrap());
         let server = single_slot_daemon(listener, 2, secs(4));
 
         let mut connection = config.connect().unwrap();
         let started = Instant::now();
-        let recycled = connection.try_reconnect_once().unwrap();
+        assert!(connection.recycle().unwrap());
         let elapsed = started.elapsed();
         assert!(
             elapsed < secs(2),
-            "recycling should not wait for a handshake, took {:?}",
+            "the handshake waited for our own old socket, took {:?}",
             elapsed
         );
-        // As in call_jsonrpc_on_connection: the old socket is dropped by the assignment.
-        connection = recycled;
-        let started = Instant::now();
         assert_serves_getblockcount(&mut connection);
-        assert!(
-            started.elapsed() < secs(2),
-            "the recycled socket should be served once the old one closed, took {:?}",
-            started.elapsed()
-        );
         drop(connection);
 
         assert_eq!(
             server.join().unwrap(),
-            vec![vec!["uptime"], vec!["getblockcount"]]
+            vec![vec!["uptime"], vec!["uptime", "getblockcount"]]
         );
-        assert_eq!(handshake_count(&config, "ok"), 1);
+        assert_eq!(handshake_count(&config, "ok"), 2);
+    }
+
+    #[test]
+    fn recycling_fails_fast_when_another_client_takes_the_freed_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = config_for(listener.local_addr().unwrap());
+        // Recycle on the first request.
+        config.max_age = Some(Duration::ZERO);
+        let server = single_slot_daemon(listener, 3, secs(60));
+
+        let daemon = daemon_for(config);
+        // Queued ahead of our fresh socket, so it gets the slot our old socket frees.
+        let other_client = TcpStream::connect(daemon.connection_config.addr).unwrap();
+
+        let started = Instant::now();
+        let request = json!({"method": "getblockcount", "params": [], "id": 1});
+        let err = daemon
+            .call_jsonrpc("getblockcount", &request)
+            .expect_err("the fresh socket should not be served while the slot is taken");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.iter()
+                .any(|e| e.to_string().contains("-rpcmaxconnections")),
+            "the error should point at the connection cap, got {}",
+            err.display_chain()
+        );
+        // The handshake budget, not DAEMON_READ_TIMEOUT.
+        assert!(
+            elapsed < secs(20),
+            "recycling should give up at the handshake deadline, took {:?}",
+            elapsed
+        );
+        assert_eq!(handshake_count(&daemon.connection_config, "timeout"), 1);
+        assert_eq!(
+            daemon.conn_recycle.with_label_values(&["failed"]).get() as u64,
+            1
+        );
+
+        drop(other_client);
+        drop(daemon);
+        let served = server.join().unwrap();
+        assert_eq!(served[0], vec!["uptime"]);
+        assert!(served[1].is_empty(), "{:?}", served);
+    }
+
+    #[test]
+    fn daemon_reconnect_does_not_take_the_shared_connection_lock() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = config_for(listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(secs(5))).unwrap();
+                thread::spawn(move || {
+                    serve_jsonrpc(
+                        socket,
+                        "200 OK",
+                        |method| json!({"result": method, "error": null, "id": 0}),
+                    )
+                });
+            }
+        });
+
+        let daemon = daemon_for(config);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            // As if a request were in flight on the shared connection.
+            let busy = daemon.conn.lock().unwrap();
+            scope.spawn(|| tx.send(daemon.reconnect().map(drop)).unwrap());
+            let reconnected = rx.recv_timeout(secs(5));
+            drop(busy);
+            assert!(
+                matches!(reconnected, Ok(Ok(()))),
+                "reconnect should not wait on the shared connection, got {:?}",
+                reconnected.map(|r| r.map_err(|e| e.to_string()))
+            );
+        });
+        server.join().unwrap();
     }
 
     #[test]
