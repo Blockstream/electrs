@@ -446,6 +446,7 @@ impl Config {
                 Arg::with_name("asset_registry_url")
                     .long("asset-registry-url")
                     .help("Base URL for the Liquid asset registry v2 service")
+                    .env("ELECTRS_ASSET_REGISTRY_URL")
                     .takes_value(true),
             )
             .arg(

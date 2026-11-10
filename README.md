@@ -83,7 +83,7 @@ In addition to electrs's original configuration options, a few new options are a
 
 Additional options with the `liquid` feature:
 - `--parent-network <network>` - the parent network this chain is pegged to.
-- `--asset-registry-url <url>` - base URL for the Liquid asset registry v2 service (see [Liquid asset registry](#liquid-asset-registry)).
+- `--asset-registry-url <url>` - base URL for the Liquid asset registry v2 service (see [Liquid asset registry](#liquid-asset-registry)). Can also be set with the `ELECTRS_ASSET_REGISTRY_URL` environment variable; the flag takes precedence.
 
 Additional options with the `electrum-discovery` feature:
 - `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features).
@@ -93,9 +93,9 @@ See `$ cargo run --release --bin electrs -- --help` for the full list of options
 
 ### Liquid asset registry
 
-With `--asset-registry-url`, electrs reads asset metadata from the registry v2
-HTTP service. The URL must use HTTP(S) and must not contain credentials, a query
-string, or a fragment.
+With `--asset-registry-url` (or `ELECTRS_ASSET_REGISTRY_URL`), electrs reads
+asset metadata from the registry v2 HTTP service. The URL must use HTTP(S) and
+must not contain credentials, a query string, or a fragment.
 
 Timeouts can be configured in milliseconds with the
 `ELECTRS_ASSET_REGISTRY_CONNECT_TIMEOUT_MS` and

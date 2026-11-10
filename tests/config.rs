@@ -3,6 +3,10 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn run_electrs(temp_dir: &Path, extra_args: &[&str]) -> Output {
+    run_electrs_with_env(temp_dir, extra_args, &[])
+}
+
+fn run_electrs_with_env(temp_dir: &Path, extra_args: &[&str], envs: &[(&str, &str)]) -> Output {
     let monitoring_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let monitoring_addr = monitoring_listener.local_addr().unwrap().to_string();
 
@@ -22,6 +26,8 @@ fn run_electrs(temp_dir: &Path, extra_args: &[&str]) -> Output {
     command.args(["--network", "liquidregtest"]);
 
     command
+        .env_remove("ELECTRS_ASSET_REGISTRY_URL")
+        .envs(envs.iter().copied())
         .args(extra_args)
         .output()
         .expect("failed to run electrs")
@@ -238,6 +244,52 @@ fn deprecated_asset_db_path_warns_and_continues_startup() {
             stderr
         );
     }
+}
+
+#[cfg(feature = "liquid")]
+#[test]
+fn asset_registry_url_env_enables_the_registry_alongside_deprecated_asset_db_path() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output = run_electrs_with_env(
+        temp_dir.path(),
+        &["-v", "--asset-db-path", "/unused/asset-registry-db"],
+        &[("ELECTRS_ASSET_REGISTRY_URL", "http://env-registry.invalid")],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(
+        stderr.contains("--asset-db-path is deprecated and ignored"),
+        "deprecation warning missing from stderr: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("asset registry lookups are disabled"),
+        "registry from the environment was not picked up: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("env-registry.invalid"),
+        "configuration does not use the registry from the environment: {}",
+        stderr
+    );
+}
+
+#[cfg(feature = "liquid")]
+#[test]
+fn asset_registry_url_flag_overrides_env() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output = run_electrs_with_env(
+        temp_dir.path(),
+        &["-v", "--asset-registry-url", "http://flag-registry.invalid"],
+        &[("ELECTRS_ASSET_REGISTRY_URL", "http://env-registry.invalid")],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(
+        stderr.contains("flag-registry.invalid") && !stderr.contains("env-registry.invalid"),
+        "configuration does not prefer the flag over the environment: {}",
+        stderr
+    );
 }
 
 #[cfg(feature = "liquid")]
