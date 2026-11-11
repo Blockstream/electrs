@@ -11,9 +11,9 @@ pub mod zmq;
 pub use self::db::{DBRow, DB};
 pub use self::fetch::{BlockEntry, FetchFrom};
 pub use self::mempool::{Mempool, MempoolSyncStatus};
-pub use self::query::Query;
 #[cfg(feature = "liquid")]
 pub use self::query::{AssetLookup, AssetRegistryStatus};
+pub use self::query::{Query, MAX_PACKAGE_TXS};
 pub use self::schema::{
     compute_script_hash, parse_hash, ChainQuery, FundingInfo, GetAmountVal, Indexer, ScriptStats,
     SpendingInfo, SpendingInput, Store, TxHistoryInfo, TxHistoryKey, TxHistoryRow, Utxo,
