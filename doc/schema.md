@@ -31,10 +31,13 @@ Each transaction results in the following new row:
 
  * `"T{txid}" → "{serialized-transaction}"`
 
-Each output results in the following new rows:
+Each spendable output (`OP_RETURN` outputs are skipped, and on Elements also fee outputs and other provably unspendable outputs) results in the following new row:
 
- * `"O{txid}{vout}" → "{scriptpubkey}{value}"`
- * `"a{funding-address-str}" → ""` (for prefix address search, only saved when `--address-search` is enabled)
+ * `"O{txid}{vout}" → "{serialized-txout}"`
+
+When `--address-search` is enabled, each output with an address also results in the following new row:
+
+ * `"a{funding-address-str}" → ""` (for prefix address search)
 
 When the indexer is synced up to the tip of the chain, the hash of the tip is saved as following:
 
