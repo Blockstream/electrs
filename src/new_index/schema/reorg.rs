@@ -1138,7 +1138,7 @@ mod tests {
             let mut indexer = test_indexer(&store, test_config());
             let common = test_block(0, BlockHash::all_zeros(), 0, vec![]);
             indexer.add(&[common.clone()]);
-            indexer.index(&[common.clone()]);
+            indexer.index(&[common.clone()]).unwrap();
             store
                 .advance_synced_tip(vec![common.entry.clone()])
                 .unwrap();
@@ -1207,7 +1207,7 @@ mod tests {
             let mut indexer = test_indexer(&store, test_config());
             let common = test_block(0, BlockHash::all_zeros(), 0, vec![]);
             indexer.add(&[common.clone()]);
-            indexer.index(&[common.clone()]);
+            indexer.index(&[common.clone()]).unwrap();
             store
                 .advance_synced_tip(vec![common.entry.clone()])
                 .unwrap();

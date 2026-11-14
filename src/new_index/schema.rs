@@ -643,6 +643,9 @@ impl Indexer {
         );
         let total = to_process.len();
         let mut count = 0;
+        let mut deferred = 0;
+        // Only the blk*.dat fetcher can deliver a block before the block that funds it.
+        let defer_missing = matches!(from, FetchFrom::BlkFiles);
         start_fetcher(
             from,
             daemon,
@@ -661,14 +664,33 @@ impl Indexer {
                 );
             }
             count += 1;
-            self.process_block_batch(&blocks, tip_height);
+            deferred += self.process_block_batch(&blocks, tip_height, defer_missing)?;
             Ok(())
-        })
+        })?;
+        if deferred > 0 {
+            // Every block has been added by now, so the RPC fallback (which only fetches
+            // blocks that are not both added and indexed) can index the deferred ones.
+            bail!(
+                "{} block(s) in blk*.dat spend outputs from blocks stored in a later file",
+                deferred
+            );
+        }
+        Ok(())
     }
 
     // Keep add and index adjacent: the output rows are still in RocksDB's write buffer
     // when history indexing looks up prevouts. Done-markers make retries idempotent.
-    fn process_block_batch(&self, blocks: &[BlockEntry], tip_height: usize) {
+    //
+    // blk*.dat files hold blocks in download order, so a block can spend an output from
+    // a block stored in a later file (#214). With `defer_missing`, such blocks are left
+    // added but unindexed instead of failing, and their count is returned.
+    fn process_block_batch(
+        &self,
+        blocks: &[BlockEntry],
+        tip_height: usize,
+        defer_missing: bool,
+    ) -> Result<usize> {
+        let mut deferred = 0;
         let to_add: Vec<_> = {
             let added = self.store.added_blockhashes.read().unwrap();
             blocks
@@ -691,7 +713,13 @@ impl Indexer {
                 self.add(&to_add);
             }
             if !to_index.is_empty() {
-                self.index(&to_index);
+                match self.index(&to_index) {
+                    Ok(()) => {}
+                    Err(e) if defer_missing && is_missing_txo(&e) => {
+                        deferred = self.index_each(&to_index)?;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         if let Some(last) = blocks.last() {
@@ -702,6 +730,28 @@ impl Indexer {
                     .set(height as f64 / tip_height as f64 * 100.0);
             }
         }
+        Ok(deferred)
+    }
+
+    // Index blocks one at a time, so one block with a prevout that is not added yet does
+    // not hold back the others. Returns how many blocks were left unindexed.
+    fn index_each(&self, blocks: &[BlockEntry]) -> Result<usize> {
+        let mut deferred = 0;
+        for block in blocks {
+            match self.index(std::slice::from_ref(block)) {
+                Ok(()) => {}
+                Err(e) if is_missing_txo(&e) => {
+                    debug!(
+                        "deferring block {} to the RPC fallback: {}",
+                        block.entry.hash(),
+                        e
+                    );
+                    deferred += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(deferred)
     }
 
     fn add(&self, blocks: &[BlockEntry]) {
@@ -722,9 +772,9 @@ impl Indexer {
             .extend(blocks.iter().map(|b| b.entry.hash()));
     }
 
-    fn index(&self, blocks: &[BlockEntry]) {
+    fn index(&self, blocks: &[BlockEntry]) -> Result<()> {
         let mut batch = rocksdb::WriteBatch::default();
-        let mut rows = self._index(blocks);
+        let mut rows = self._index(blocks)?;
         rows.par_sort_unstable_by(|a, b| a.key.cmp(&b.key));
         for row in rows {
             batch.put(row.key, row.value);
@@ -736,12 +786,13 @@ impl Indexer {
 
         let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
         indexed_blockhashes.extend(blocks.iter().map(|b| b.entry.hash()));
+        Ok(())
     }
 
-    fn _index(&self, blocks: &[BlockEntry]) -> Vec<DBRow> {
+    fn _index(&self, blocks: &[BlockEntry]) -> Result<Vec<DBRow>> {
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
+            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks))?
         };
         let rows = {
             let _timer = self.start_timer("index_process");
@@ -755,7 +806,7 @@ impl Indexer {
             }
             index_blocks(blocks, &previous_txos_map, &self.iconfig)
         };
-        rows
+        Ok(rows)
     }
 
     pub fn fetch_from(&mut self, from: FetchFrom) {
@@ -1709,6 +1760,10 @@ fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
                 .map(|txin| txin.previous_output)
         })
         .collect()
+}
+
+fn is_missing_txo(e: &Error) -> bool {
+    matches!(e.kind(), ErrorKind::MissingTxo(_))
 }
 
 fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
