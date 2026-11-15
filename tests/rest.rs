@@ -1219,6 +1219,42 @@ fn test_rest_tx_outspends() -> Result<()> {
 }
 
 #[test]
+fn test_rest_tx_outspend() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let txid = tester.send(&addr1, "0.5 BTC".parse().unwrap())?;
+    tester.mine()?;
+
+    let status_and_body = |path: String| -> Result<(u16, String)> {
+        let resp = ureq::get(&format!("http://{}{}", rest_addr, path))
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .call()?;
+        let status = resp.status().as_u16();
+        Ok((status, resp.into_body().read_to_string()?))
+    };
+
+    // An existing unspent output is reported as unspent
+    let res = get_json(rest_addr, &format!("/tx/{}/outspend/0", txid))?;
+    assert_eq!(res["spent"].as_bool(), Some(false));
+
+    // An unknown txid is a 404, like GET /tx/:txid
+    let (status, body) = status_and_body(format!("/tx/{}/outspend/0", "00".repeat(32)))?;
+    assert_eq!(status, 404);
+    assert_eq!(body, "Transaction not found");
+
+    // An out-of-range vout on an existing tx is a 404 too
+    let (status, body) = status_and_body(format!("/tx/{}/outspend/9999", txid))?;
+    assert_eq!(status, 404);
+    assert_eq!(body, "Output not found");
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[test]
 fn test_rest_tx_merkle_proof() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
 

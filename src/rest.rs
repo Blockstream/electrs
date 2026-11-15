@@ -1637,9 +1637,20 @@ fn handle_blocking_request(
                 txid: hash,
                 vout: index.parse::<u32>()?,
             };
-            let spend = query
-                .lookup_spend(&outpoint)
-                .map_or_else(SpendingValue::default, SpendingValue::from);
+            let spend = match query.lookup_spend(&outpoint) {
+                Some(spend) => SpendingValue::from(spend),
+                None => {
+                    // Not spent: make sure the output exists before reporting it unspent
+                    let tx = query
+                        .lookup_txn(&hash)
+                        .map_err(HttpError::lookup)?
+                        .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
+                    if outpoint.vout as usize >= tx.output.len() {
+                        return Err(HttpError::not_found("Output not found".to_string()));
+                    }
+                    SpendingValue::default()
+                }
+            };
             let ttl = ttl_by_depth(
                 spend
                     .status
