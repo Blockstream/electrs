@@ -45,6 +45,16 @@ fn get_plain(rest_addr: net::SocketAddr, path: &str) -> Result<String> {
     Ok(get(rest_addr, path)?.into_body().read_to_string()?)
 }
 
+fn get_status_and_body(rest_addr: net::SocketAddr, path: &str) -> Result<(u16, String)> {
+    let resp = ureq::get(&format!("http://{}{}", rest_addr, path))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    let status = resp.status().as_u16();
+    Ok((status, resp.into_body().read_to_string()?))
+}
+
 #[cfg(feature = "liquid")]
 fn registry_asset_response(asset_id: &str) -> Value {
     json!({
@@ -1224,31 +1234,90 @@ fn test_rest_tx_outspend() -> Result<()> {
 
     let addr1 = tester.newaddress()?;
     let txid = tester.send(&addr1, "0.5 BTC".parse().unwrap())?;
+
+    // An unconfirmed unspent output is reported as unspent
+    let res = get_json(rest_addr, &format!("/tx/{}/outspend/0", txid))?;
+    assert_eq!(res["spent"].as_bool(), Some(false));
+    // An out-of-range vout on a mempool tx is a 404
+    let (status, body) = get_status_and_body(rest_addr, &format!("/tx/{}/outspend/9999", txid))?;
+    assert_eq!(status, 404);
+    assert_eq!(body, "Output not found");
+
     tester.mine()?;
 
-    let status_and_body = |path: String| -> Result<(u16, String)> {
-        let resp = ureq::get(&format!("http://{}{}", rest_addr, path))
-            .config()
-            .http_status_as_error(false)
-            .build()
-            .call()?;
-        let status = resp.status().as_u16();
-        Ok((status, resp.into_body().read_to_string()?))
-    };
-
-    // An existing unspent output is reported as unspent
+    // A confirmed unspent output is reported as unspent
     let res = get_json(rest_addr, &format!("/tx/{}/outspend/0", txid))?;
     assert_eq!(res["spent"].as_bool(), Some(false));
 
     // An unknown txid is a 404, like GET /tx/:txid
-    let (status, body) = status_and_body(format!("/tx/{}/outspend/0", "00".repeat(32)))?;
+    let (status, body) =
+        get_status_and_body(rest_addr, &format!("/tx/{}/outspend/0", "00".repeat(32)))?;
     assert_eq!(status, 404);
     assert_eq!(body, "Transaction not found");
 
-    // An out-of-range vout on an existing tx is a 404 too
-    let (status, body) = status_and_body(format!("/tx/{}/outspend/9999", txid))?;
+    // An out-of-range vout on a confirmed tx is a 404 too
+    let (status, body) = get_status_and_body(rest_addr, &format!("/tx/{}/outspend/9999", txid))?;
     assert_eq!(status, 404);
     assert_eq!(body, "Output not found");
+
+    // Unspendable outputs have no TxOut row but still exist, matching /outspends
+    #[cfg(not(feature = "liquid"))]
+    {
+        let raw: String = tester.node_client().call(
+            "createrawtransaction",
+            &[
+                serde_json::json!([]),
+                serde_json::json!([{ "data": "deadbeef" }, { addr1.to_string(): 0.1 }]),
+            ],
+        )?;
+        let funded: Value = tester
+            .node_client()
+            .call("fundrawtransaction", &[serde_json::json!(raw)])?;
+        let signed: Value = tester
+            .node_client()
+            .call("signrawtransactionwithwallet", &[funded["hex"].clone()])?;
+        let txid: Txid = tester
+            .node_client()
+            .call("sendrawtransaction", &[signed["hex"].clone()])?;
+        let vout = tester
+            .get_raw_transaction(txid)?
+            .output
+            .iter()
+            .position(|txout| txout.script_pubkey.is_op_return())
+            .expect("OP_RETURN output");
+        tester.sync()?;
+
+        let path = format!("/tx/{}/outspend/{}", txid, vout);
+        assert_eq!(get_json(rest_addr, &path)?["spent"].as_bool(), Some(false));
+        tester.mine()?;
+        assert_eq!(get_json(rest_addr, &path)?["spent"].as_bool(), Some(false));
+    }
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[test]
+fn test_rest_tx_outspend_light_mode() -> Result<()> {
+    let (rest_handle, rest_addr, mut tester) =
+        common::init_rest_tester_with(|config| config.light_mode = true).unwrap();
+
+    let addr1 = tester.newaddress()?;
+    let txid = tester.send(&addr1, "0.5 BTC".parse().unwrap())?;
+    tester.mine()?;
+
+    // The existence check must not fetch the tx from bitcoind
+    let rpcs_before = tester.daemon_rpc_count("getrawtransaction");
+
+    let res = get_json(rest_addr, &format!("/tx/{}/outspend/0", txid))?;
+    assert_eq!(res["spent"].as_bool(), Some(false));
+
+    let (status, body) =
+        get_status_and_body(rest_addr, &format!("/tx/{}/outspend/0", "00".repeat(32)))?;
+    assert_eq!(status, 404);
+    assert_eq!(body, "Transaction not found");
+
+    assert_eq!(tester.daemon_rpc_count("getrawtransaction"), rpcs_before);
 
     rest_handle.stop();
     Ok(())
