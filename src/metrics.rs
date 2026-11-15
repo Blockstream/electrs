@@ -96,10 +96,13 @@ fn handle_request(
 ) -> io::Result<()> {
     let request = request?;
     let mut buffer = vec![];
-    prometheus::TextEncoder::new()
-        .encode(&reg.gather(), &mut buffer)
-        .unwrap();
-    let response = tiny_http::Response::from_data(buffer);
+    let encoder = prometheus::TextEncoder::new();
+    encoder.encode(&reg.gather(), &mut buffer).unwrap();
+    // Prometheus 3 rejects scrapes without a Content-Type it recognises.
+    let content_type =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], encoder.format_type().as_bytes())
+            .expect("valid Content-Type header");
+    let response = tiny_http::Response::from_data(buffer).with_header(content_type);
     request.respond(response)
 }
 
@@ -161,4 +164,35 @@ fn start_process_exporter(metrics: &Metrics) {
         }
         thread::sleep(Duration::from_secs(5));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_endpoint_sets_prometheus_content_type() {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let metrics = Metrics::new(addr);
+        metrics
+            .counter(prometheus::Opts::new("test_requests", "test counter"))
+            .inc();
+        metrics.start();
+
+        let response = ureq::get(&format!("http://{}/metrics", addr))
+            .call()
+            .unwrap();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(content_type, prometheus::TEXT_FORMAT);
+        let body = response.into_body().read_to_string().unwrap();
+        assert!(body.contains("test_requests 1"), "{}", body);
+    }
 }
