@@ -17,7 +17,7 @@ use electrs_macros::trace;
 use bitcoin::consensus::encode::serialize_hex;
 #[cfg(feature = "liquid")]
 use elements::encode::serialize_hex;
-use crate::chain::Txid;
+use crate::chain::{BlockHash, Txid};
 use crate::config::{Config, RpcLogging};
 use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
@@ -161,6 +161,9 @@ struct Connection {
     // Mempool touched-epoch snapshot from this connection's last periodic tick;
     // None forces a full subscription scan (first tick / after pruning).
     mempool_touched_epoch: Option<u64>,
+    // Chain tip at this connection's last periodic tick, tracked whether or not the
+    // client subscribed to headers: a new block forces the full subscription scan.
+    last_tick_tip: Option<BlockHash>,
     stream: TcpStream,
     addr: SocketAddr,
     sender: SyncSender<Message>,
@@ -196,6 +199,7 @@ impl Connection {
             last_header_entry: None, // disable header subscription for now
             status_hashes: HashMap::new(),
             mempool_touched_epoch: None,
+            last_tick_tip: None,
             stream,
             addr,
             sender,
@@ -634,6 +638,11 @@ impl Connection {
                     "method": "blockchain.headers.subscribe",
                     "params": [header]}));
             }
+        }
+        let tip = self.query.chain().best_hash();
+        if self.last_tick_tip != Some(tip) {
+            tip_changed = true;
+            self.last_tick_tip = Some(tip);
         }
         // Delta-driven fast path: on a mempool-only tick (no new block), only
         // re-check subscriptions whose scripthash the mempool actually touched

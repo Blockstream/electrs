@@ -462,3 +462,155 @@ fn write_and_read(stream: &mut TcpStream, write: &str) -> String {
     }
     std::str::from_utf8(&result).unwrap().to_string()
 }
+
+/// Electrum protocol script hash of an address: SHA256 of the scriptPubKey, reversed, as hex
+#[cfg(not(feature = "liquid"))]
+fn electrum_scripthash(addr: &bitcoin::Address) -> String {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::hex::DisplayHex;
+    let mut hash = sha256::Hash::hash(addr.script_pubkey().as_bytes()).to_byte_array();
+    hash.reverse();
+    hash.to_lower_hex_string()
+}
+
+/// Read one line, or None if nothing arrives within `timeout`
+#[cfg(not(feature = "liquid"))]
+fn read_line_within(stream: &mut TcpStream, timeout: std::time::Duration) -> Option<String> {
+    stream.set_read_timeout(Some(timeout)).unwrap();
+    let mut result = vec![];
+    loop {
+        let mut buf = [0u8];
+        match stream.read_exact(&mut buf) {
+            Ok(()) if buf[0] == b'\n' => break,
+            Ok(()) => result.push(buf[0]),
+            Err(e)
+                if result.is_empty()
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                return None
+            }
+            Err(e) => panic!("read failed: {}", e),
+        }
+    }
+    stream.set_read_timeout(None).unwrap();
+    Some(String::from_utf8(result).unwrap())
+}
+
+/// Subscribe to `scripthash` on a fresh connection and run one periodic tick, so the
+/// connection has a baseline for the next tick.
+#[cfg(not(feature = "liquid"))]
+fn subscribe_and_tick(
+    electrum_server: &ElectrumRPC,
+    electrum_addr: std::net::SocketAddr,
+    scripthash: &str,
+    headers: bool,
+) -> TcpStream {
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    if headers {
+        write_and_read(
+            &mut stream,
+            "{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.headers.subscribe\", \"id\": 1}",
+        );
+    }
+    let s = write_and_read(
+        &mut stream,
+        &format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.scripthash.subscribe\", \"params\": [\"{}\"], \"id\": 2}}",
+            scripthash
+        ),
+    );
+    assert_eq!(s, "{\"id\":2,\"jsonrpc\":\"2.0\",\"result\":null}");
+    electrum_server.notify();
+    // nothing changed, so the first tick sends nothing
+    assert_eq!(
+        read_line_within(&mut stream, std::time::Duration::from_secs(2)),
+        None
+    );
+    stream
+}
+
+#[cfg(not(feature = "liquid"))]
+fn expect_scripthash_notification(stream: &mut TcpStream, scripthash: &str) {
+    // A headers subscriber may get a header notification first; skip it.
+    loop {
+        let line = read_line_within(stream, std::time::Duration::from_secs(10))
+            .expect("no blockchain.scripthash.subscribe notification after the periodic tick");
+        let v: electrumd::jsonrpc::serde_json::Value =
+            electrumd::jsonrpc::serde_json::from_str(&line).unwrap();
+        if v["method"] == "blockchain.scripthash.subscribe" {
+            assert_eq!(v["params"][0].as_str(), Some(scripthash));
+            assert!(v["params"][1].is_string(), "status should be set: {}", line);
+            return;
+        }
+        assert_eq!(v["method"], "blockchain.headers.subscribe", "{}", line);
+    }
+}
+
+/// A subscriber is notified when a mempool tx touches its scripthash.
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_subscription_notified_on_mempool_tx() -> Result<()> {
+    let (electrum_server, electrum_addr, mut tester) = common::init_electrum_tester()?;
+    let addr = tester.newaddress()?;
+    let scripthash = electrum_scripthash(&addr);
+    let mut stream = subscribe_and_tick(&electrum_server, electrum_addr, &scripthash, false);
+
+    tester.send(&addr, "0.1 BTC".parse().unwrap())?;
+    electrum_server.notify();
+    expect_scripthash_notification(&mut stream, &scripthash);
+    Ok(())
+}
+
+/// A subscriber is notified when a block confirms a tx for its scripthash that electrs
+/// never saw in its mempool (e.g. mined between two mempool syncs, or never relayed).
+/// The connection did not subscribe to headers.
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_subscription_notified_on_block_without_mempool_tx() -> Result<()> {
+    let (electrum_server, electrum_addr, mut tester) = common::init_electrum_tester()?;
+    let addr = tester.newaddress()?;
+    let scripthash = electrum_scripthash(&addr);
+    let mut stream = subscribe_and_tick(&electrum_server, electrum_addr, &scripthash, false);
+
+    // Send and mine before electrs syncs, so the tx goes straight into the chain index.
+    let client = tester.node_client();
+    let _: bitcoin::Txid = client.call("sendtoaddress", &[addr.to_string().into(), 0.1.into()])?;
+    let miner: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
+        client.call("getnewaddress", &[])?;
+    let _: Vec<bitcoin::BlockHash> = client.call(
+        "generatetoaddress",
+        &[1.into(), miner.assume_checked().to_string().into()],
+    )?;
+    tester.sync()?;
+
+    electrum_server.notify();
+    expect_scripthash_notification(&mut stream, &scripthash);
+    Ok(())
+}
+
+/// Same as above for a connection that also subscribed to headers.
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_subscription_notified_on_block_with_headers_subscription() -> Result<()> {
+    let (electrum_server, electrum_addr, mut tester) = common::init_electrum_tester()?;
+    let addr = tester.newaddress()?;
+    let scripthash = electrum_scripthash(&addr);
+    let mut stream = subscribe_and_tick(&electrum_server, electrum_addr, &scripthash, true);
+
+    let client = tester.node_client();
+    let _: bitcoin::Txid = client.call("sendtoaddress", &[addr.to_string().into(), 0.1.into()])?;
+    let miner: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
+        client.call("getnewaddress", &[])?;
+    let _: Vec<bitcoin::BlockHash> = client.call(
+        "generatetoaddress",
+        &[1.into(), miner.assume_checked().to_string().into()],
+    )?;
+    tester.sync()?;
+
+    electrum_server.notify();
+    expect_scripthash_notification(&mut stream, &scripthash);
+    Ok(())
+}
