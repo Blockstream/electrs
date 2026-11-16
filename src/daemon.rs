@@ -1048,6 +1048,16 @@ impl HttpResponse {
                 debug!("RPC HTTP 500 error: {}", self.body);
                 Ok(self.body) // the body should have a JSONRPC error field
             }
+            // bitcoind answers 503 "Work queue depth exceeded" when its RPC work queue
+            // (-rpcworkqueue) is full. That clears once the queue drains, so treat it like a
+            // dropped connection: the singleton path waits, reconnects and retries, as it does
+            // during warmup, and the client path reports the daemon as unavailable. As a plain
+            // error it ended the main loop and stopped electrs.
+            "HTTP/1.1 503 Service Unavailable" => bail!(ErrorKind::Connection(format!(
+                "daemon is busy status='{}' body='{}'",
+                self.status,
+                self.body.trim()
+            ))),
             _ => bail!(
                 "request failed {:?}: {:?} = {:?}",
                 self.status,
@@ -2271,6 +2281,33 @@ mod tests {
         assert_eq!(handshake_count(&config, "rejected"), 1);
         assert_eq!(handshake_count(&config, "ok"), 0);
         assert_eq!(handshake_count(&config, "error"), 0);
+    }
+
+    #[test]
+    fn recv_treats_a_full_work_queue_as_a_connection_error() {
+        // What bitcoind sends when -rpcworkqueue is full. As a connection error, the singleton
+        // path waits and retries instead of ending the main loop.
+        let (mut connection, server) = fake_daemon(secs(5), |mut socket| {
+            let body = "Work queue depth exceeded";
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            );
+            thread::sleep(millis(200));
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("daemon is busy") && msg.contains("Work queue depth exceeded"),
+            "expected a busy daemon connection error, got {:?}",
+            msg
+        );
+        server.join().unwrap();
     }
 
     #[test]
