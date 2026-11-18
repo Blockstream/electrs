@@ -357,7 +357,7 @@ impl Config {
             ).arg(
                 Arg::with_name("electrum_subscription_limit")
                     .long("electrum-subscription-limit")
-                    .help("Maximum number of scripthash subscriptions a single Electrum connection may hold. Every subscription costs a history lookup on each new block, so an unbounded count lets one client impose unbounded recurring work. Re-subscribing to an already-tracked scripthash is always allowed. 0 = unlimited.")
+                    .help("Maximum number of scripthash subscriptions a single Electrum connection may hold. Every subscription is re-checked on each periodic update (about every 5 seconds, and after broadcasts), so the limit bounds the recurring work one connection can impose. The limit is per connection; there is no aggregate limit across connections. Re-subscribing to an already-tracked scripthash is always allowed. 0 = unlimited.")
                     .default_value("10000")
                     .takes_value(true)
             ).arg(
