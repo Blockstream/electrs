@@ -431,6 +431,23 @@ impl TestRunner {
             .sum()
     }
 
+    /// Number of daemon RPC calls made for `method`, from the `daemon_rpc` latency histogram.
+    pub fn daemon_rpc_count(&self, method: &str) -> u64 {
+        self.metrics
+            .gather()
+            .iter()
+            .filter(|family| family.name() == "daemon_rpc")
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "method" && label.value() == method)
+            })
+            .map(|metric| metric.get_histogram().get_sample_count())
+            .sum()
+    }
+
     pub fn counter_value(&self, name: &str) -> f64 {
         self.metrics
             .gather()

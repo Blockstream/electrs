@@ -1503,6 +1503,16 @@ impl ChainQuery {
         lookup_txo(&self.store.txstore_db, outpoint)
     }
 
+    /// Like `lookup_txo`, but surfaces DB errors. Only spendable outputs have a TxOut row.
+    pub fn try_lookup_txo(&self, outpoint: &OutPoint) -> Result<Option<TxOut>> {
+        let _timer = self.start_timer("lookup_txo");
+        self.store
+            .txstore_db
+            .try_get(&TxOutRow::key(outpoint))?
+            .map(|val| deserialize(&val).chain_err(|| "failed to parse TxOut"))
+            .transpose()
+    }
+
     pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self.start_timer("lookup_txos");
         lookup_txos(&self.store.txstore_db, outpoints)

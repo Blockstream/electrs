@@ -1637,9 +1637,14 @@ fn handle_blocking_request(
                 txid: hash,
                 vout: index.parse::<u32>()?,
             };
-            let spend = query
-                .lookup_spend(&outpoint)
-                .map_or_else(SpendingValue::default, SpendingValue::from);
+            let spend = match query.lookup_spend(&outpoint) {
+                Some(spend) => SpendingValue::from(spend),
+                None => {
+                    // Not spent: make sure the output exists before reporting it unspent
+                    ensure_output_exists(query, &outpoint)?;
+                    SpendingValue::default()
+                }
+            };
             let ttl = ttl_by_depth(
                 spend
                     .status
@@ -2068,6 +2073,53 @@ fn parse_scripthash(scripthash: &str) -> Result<FullHash, HttpError> {
 
 #[derive(Debug)]
 struct HttpError(StatusCode, String);
+
+/// Returns a 404 if `outpoint` is not a known output. Spendable outputs are found with a
+/// point lookup of their TxOut row. The full tx is only read from the local store on a miss
+/// (unknown txid, vout out of range, or an unspendable output), and the daemon is never
+/// queried, so a bitcoind failure in light mode cannot turn into a false 404.
+fn ensure_output_exists(query: &Query, outpoint: &OutPoint) -> Result<(), HttpError> {
+    // Check the mempool first: a tx is indexed in the chain before it leaves the mempool.
+    {
+        let mempool = query.mempool();
+        if mempool.lookup_txo(outpoint).is_some() {
+            return Ok(());
+        }
+        if mempool.lookup_raw_txn(&outpoint.txid).is_some() {
+            return Err(HttpError::not_found("Output not found".to_string()));
+        }
+    }
+
+    let chain = query.chain();
+    if chain
+        .try_lookup_txo(outpoint)
+        .map_err(HttpError::lookup)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    if query.config().light_mode {
+        // Without the tx we can't tell an unspendable output from an out-of-range vout,
+        // so only report a 404 when the txid itself is unknown.
+        return match chain
+            .try_tx_confirming_block(&outpoint.txid)
+            .map_err(HttpError::lookup)?
+        {
+            Some(_) => Ok(()),
+            None => Err(HttpError::not_found("Transaction not found".to_string())),
+        };
+    }
+
+    let tx = chain
+        .lookup_txn(&outpoint.txid, None)
+        .map_err(HttpError::lookup)?
+        .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
+    if outpoint.vout as usize >= tx.output.len() {
+        return Err(HttpError::not_found("Output not found".to_string()));
+    }
+    Ok(())
+}
 
 impl HttpError {
     fn not_found(msg: String) -> Self {
