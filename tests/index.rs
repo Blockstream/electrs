@@ -155,14 +155,25 @@ impl Fixture {
     }
 
     fn write_file(&self, heights: &[usize]) {
-        let mut data = Vec::new();
-        for &height in heights {
-            let raw = serialize(&self.chain.lock().unwrap().active[height]);
-            data.extend(self.config.network_type.magic().to_le_bytes());
-            data.extend((raw.len() as u32).to_le_bytes());
-            data.extend(raw);
+        self.write_files(&[heights]);
+    }
+
+    // One blk*.dat file per entry, each holding the blocks at the given heights in order.
+    fn write_files(&self, files: &[&[usize]]) {
+        for (n, heights) in files.iter().enumerate() {
+            let mut data = Vec::new();
+            for &height in heights.iter() {
+                let raw = serialize(&self.chain.lock().unwrap().active[height]);
+                data.extend(self.config.network_type.magic().to_le_bytes());
+                data.extend((raw.len() as u32).to_le_bytes());
+                data.extend(raw);
+            }
+            std::fs::write(
+                self.config.blocks_dir.join(format!("blk{:05}.dat", n)),
+                data,
+            )
+            .unwrap();
         }
-        std::fs::write(self.config.blocks_dir.join("blk00000.dat"), data).unwrap();
     }
 
     fn prepare_gap(&self) {
@@ -1180,4 +1191,55 @@ fn partial_file_import_fetches_only_the_gap_over_rpc() {
     let chain = fixture.chain.lock().unwrap();
     assert_eq!(tip, chain.active[3].block_hash());
     assert_eq!(chain.fetched, vec![chain.active[2].block_hash()]);
+}
+
+// bitcoind writes blocks to blk*.dat in download order, not height order, so a block can
+// be stored in an earlier file than the block that funds one of its inputs (#214). The file
+// import must not panic: it defers such blocks and the RPC fallback indexes them in order.
+#[test]
+fn file_import_defers_blocks_that_spend_outputs_stored_later() {
+    let fixture = Fixture::new();
+    let (funding, spending) = {
+        let mut chain = fixture.chain.lock().unwrap();
+        let mut active = chain.active.clone();
+        let funding = active[3].txdata[0].compute_txid();
+        let mut next = active[3].clone();
+        next.header.prev_blockhash = active[3].block_hash();
+        next.header.time += 1;
+        next.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(4);
+        let mut spend = next.txdata[0].clone();
+        spend.input[0].previous_output = bitcoin::OutPoint {
+            txid: funding,
+            vout: 0,
+        };
+        spend.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x54]);
+        let spending = spend.compute_txid();
+        next.txdata.push(spend);
+        next.header.merkle_root = next.compute_merkle_root().unwrap();
+        active.push(next);
+        chain.set_active(active);
+        (funding, spending)
+    };
+    // The fetcher sends one batch per file, so the funding block 3 must be in a later
+    // file than the spending block 4 for the spend to be indexed before it is added.
+    fixture.write_files(&[&[0, 1, 2, 4], &[3]]);
+    let (store, mut indexer, daemon, metrics) = fixture.open(FetchFrom::BlkFiles);
+
+    let tip = fixture.chain.lock().unwrap().active[4].block_hash();
+    assert_eq!(indexer.update(&daemon).unwrap(), tip);
+    assert_eq!(store.headers().len(), 5);
+    assert!(store.done_initial_sync());
+    // Only the deferred block goes over RPC; everything else came from the file.
+    assert_eq!(fixture.chain.lock().unwrap().fetched, vec![tip]);
+
+    let query = ChainQuery::new(Arc::clone(&store), daemon, &fixture.config, &metrics);
+    let spent = query
+        .lookup_spend(&bitcoin::OutPoint {
+            txid: funding,
+            vout: 0,
+        })
+        .unwrap();
+    assert_eq!(spent.txid, spending);
+    let hash = sha256::Hash::hash(&[0x54]).to_byte_array();
+    assert_eq!(query.stats(&hash).unwrap().tx_count, 1);
 }
