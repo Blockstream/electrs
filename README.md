@@ -62,7 +62,7 @@ but instead queried from bitcoind on demand.
 
 In addition to electrs's original configuration options, a few new options are also available:
 
-- `--http-addr <addr:port>` - HTTP server address/port to listen on (default: `127.0.0.1:3000`).
+- `--http-addr <addr:port>` - HTTP server address/port to listen on (default: `127.0.0.1:3000` on mainnet; testnet, regtest, signet and testnet4 default to ports `3001`, `3002`, `3003` and `3004`).
 - `--lightmode` - enable light mode (see above)
 - `--cors <origins>` - origins allowed to make cross-site request (optional, defaults to none).
 - `--address-search` - enables the by-prefix address search index. Best-effort: entries are
@@ -86,8 +86,9 @@ Additional options with the `liquid` feature:
 - `--asset-registry-url <url>` - base URL for the Liquid asset registry v2 service (see [Liquid asset registry](#liquid-asset-registry)). Can also be set with the `ELECTRS_ASSET_REGISTRY_URL` environment variable; the flag takes precedence.
 
 Additional options with the `electrum-discovery` feature:
-- `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features).
+- `--electrum-public-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features).
 - `--electrum-announce` - announce the electrum server on the electrum p2p server discovery network.
+- `--tor-proxy <ip:port>` - SOCKS proxy used to reach `.onion` servers during discovery.
 
 See `$ cargo run --release --bin electrs -- --help` for the full list of options.
 
